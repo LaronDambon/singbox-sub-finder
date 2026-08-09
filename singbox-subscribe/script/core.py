@@ -665,10 +665,10 @@ def build_singbox_config_from_nodes(base_template, nodes):
         if isinstance(outbound.get("outbounds"), list):
             if "{all}" in outbound["outbounds"]:
                 outbound["outbounds"] = tags
-                break
+                continue
             if any(isinstance(item, str) and item.startswith("{") and item.endswith("}") for item in outbound["outbounds"]):
                 outbound["outbounds"] = tags
-                break
+                continue
 
     for index, node in enumerate(nodes):
         if not isinstance(node, dict):
