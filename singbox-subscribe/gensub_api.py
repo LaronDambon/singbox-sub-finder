@@ -8,7 +8,7 @@ UTILS = ROOT / "utils"
 
 from flask import Flask, jsonify, request, render_template_string
 
-from config.settings import URLTEST_TEMPLATE, WHITELIST_FILE
+from config.settings import URLTEST_TEMPLATE, WHITELIST_FILE, FLASK_HOST, FLASK_PORT
 from script import core as core_mod
 
 app = Flask(__name__)
@@ -469,4 +469,4 @@ def gensub():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=False)
+    app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False)

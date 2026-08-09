@@ -17,3 +17,6 @@ SING_BOX_PORT = int(os.getenv("SING_BOX_PORT", "0"))
 URLTEST_URL = "https://speed.cloudflare.com/__down?bytes=500000"
 TIMEOUT = 10.0
 BATCH_SIZE = 100
+
+FLASK_HOST="0.0.0.0"
+FLASK_PORT=8000
