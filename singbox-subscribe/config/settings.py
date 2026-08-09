@@ -12,7 +12,7 @@ URLTEST_TEMPLATE = ROOT / "config" / "urltest_template.json"
 CONFIG_TEMPLATE_DIR = ROOT / "config_template"
 SING_BOX_PATH = ROOT / "sing-box" / ("sing-box.exe" if os.name == "nt" else "sing-box")
 SING_BOX_OUTPUT_DIR = ROOT / "sing-box"
-SING_BOX_PORT = int(os.getenv("SING_BOX_PORT", "0"))
+SING_BOX_PORT = int(os.getenv("SING_BOX_PORT", "7891"))
 #URLTEST_URL = "https://cp.cloudflare.com/gen_204"
 URLTEST_URL = "https://speed.cloudflare.com/__down?bytes=500000"
 TIMEOUT = 10.0

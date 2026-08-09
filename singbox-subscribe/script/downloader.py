@@ -474,7 +474,7 @@ def build_merge_from_urls(
     dedupe_blacklist_file(blacklist_path)
     dedupe_whitelist_file(whitelist_path)
 
-    merged_whitelist_path = output_path_path.parent / "merge_whitelist.txt"
+    merged_whitelist_path = output_path_path.parent / "last_whitelist.txt"
     merged_whitelist: list[str] = []
     if whitelist_path.exists():
         merged_whitelist.extend(

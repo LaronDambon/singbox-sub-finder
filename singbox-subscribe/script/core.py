@@ -851,7 +851,7 @@ def generate_debug_configs_with_singbox(
 
         config = build_singbox_config_from_nodes(template_data, parsed_nodes)
         # choose a single inbound port for the whole process (respect env/settings/template)
-        inbound_port = get_inbound_port(template_data)
+        inbound_port = 7891
         for inbound in config.get("inbounds", []):
             if inbound.get("type") == "mixed" and inbound.get("listen") == "127.0.0.1":
                 inbound["listen_port"] = inbound_port

@@ -269,9 +269,14 @@ HTML_PAGE = """
 
     generateBtn.addEventListener('click', async () => {
       const urls = urlsInput.value
-        .split(/\\r?\\n|,/) 
+        .split(/\\r?\\n/)
         .map((s) => s.trim())
-        .filter(Boolean);
+        .filter(Boolean)
+        .flatMap((line) =>
+          line.includes('://')
+            ? [line]
+            : line.split(',').map((s) => s.trim()).filter(Boolean)
+        );
 
       if (!urls.length) {
         setStatus('Добавьте хотя бы одну ссылку', 'error');
