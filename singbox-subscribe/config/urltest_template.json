@@ -1,0 +1,60 @@
+{
+  "log": {
+    "level": "debug",
+    "timestamp": false
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-google-v4",
+        "type": "udp",
+        "server": "8.8.8.8"
+      },
+      {
+        "tag": "dns-google-v6",
+        "type": "udp",
+        "server": "2001:4860:4860::8888"
+      }
+    ],
+    "final": "dns-google-v4",
+    "strategy": "prefer_ipv6",
+    "independent_cache": true
+  },
+  "inbounds": [
+    {
+      "tag": "testing-in",
+      "type": "mixed",
+      "listen": "127.0.0.1",
+      "listen_port": 7891
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "type": "urltest",
+      "outbounds": [
+        "{all}"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "5m",
+      "tolerance": 50
+    },
+    {
+      "tag": "direct",
+      "type": "direct"
+    }
+  ],
+  "route": {
+    "default_domain_resolver": {
+      "server": "dns-google-v4"
+    },
+    "auto_detect_interface": true,
+    "final": "direct",
+    "rules": [
+      {
+        "protocol": "dns",
+        "outbound": "direct"
+      }
+    ]
+  }
+}
