@@ -10,17 +10,20 @@
 1. Клонируйте репозиторий:
 
 ```bash
-git clone <repo-url>
-cd singbox-sub-src
+git clone https://github.com/LaronDambon/singbox-sub-finder
+cd singbox-sub-finder
 ```
 
 2. Создайте виртуальное окружение и активируйте его:
 
 ```bash
-python -m venv .venv
 # Windows
+python -m venv .venv
 .\.venv\Scripts\activate
+```
+```bash
 # Linux / macOS
+python3 -m venv .venv
 source .venv/bin/activate
 ```
 
