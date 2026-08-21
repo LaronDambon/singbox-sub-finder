@@ -145,7 +145,7 @@ def try_decode_base64(data: str) -> str:
     return data
 
 
-def build_clean_tag(raw_line: str, seq_counter: int | None = None, include_country: bool = False) -> str:
+def build_clean_tag(raw_line: str, seq_counter: int | None = None, include_country: bool = False, country_tag: str | None = None) -> str:
     line = raw_line.strip()
     if not line:
         return line
@@ -154,7 +154,11 @@ def build_clean_tag(raw_line: str, seq_counter: int | None = None, include_count
     protocol = tool.get_protocol(clean_url) or "proxy"
     protocol = protocol.lower()
 
-    country_tag = tool.get_proxy_country_emoji(clean_url) if include_country else None
+    # Страна определяется по имени/тэгу из исходной строки (быстро, без сети),
+    # а не по IP через внешний API. Если передан явный country_tag (например,
+    # определённый через скоростной тест), используем его.
+    if include_country:
+        country_tag = country_tag or tool.get_country_from_name(line)
 
     if seq_counter is not None:
         code = f"{seq_counter:06d}"
@@ -202,35 +206,6 @@ def load_urls(path: Path) -> list[str]:
     if isinstance(data, list):
         return [str(item) for item in data]
     raise ValueError(f"Неверный формат JSON в {path}")
-
-
-def setup_logging(log_file: Path) -> logging.Logger:
-    """Настраивает консольный и файловый логгер."""
-    logger = logging.getLogger("merge_configs")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-
-    for handler in list(logger.handlers):
-        logger.removeHandler(handler)
-        handler.close()
-
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)-8s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-    return logger
 
 
 def save_partial_file(path: Path, content: str) -> None:
@@ -341,6 +316,35 @@ def dedupe_whitelist_file(whitelist_path: Path) -> None:
         whitelist_path.write_text("\n".join(unique_lines), encoding="utf-8")
 
 
+def prune_whitelist_by_blacklist(whitelist_path: Path, blacklist_path: Path | None = None) -> int:
+    """Удаляет из whitelist серверы, которые попали в blacklist (не прошли повторную проверку).
+
+    Возвращает количество удалённых строк.
+    """
+    if not whitelist_path.exists():
+        return 0
+    blacklist_keys = load_blacklist_keys(blacklist_path) if blacklist_path and blacklist_path.exists() else set()
+    if not blacklist_keys:
+        return 0
+
+    original_lines = whitelist_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    kept: list[str] = []
+    removed = 0
+    for line in original_lines:
+        clean = line.strip()
+        if not clean:
+            continue
+        key = normalize_proxy_key(clean)
+        if key and key in blacklist_keys:
+            removed += 1
+            continue
+        kept.append(clean)
+
+    if removed:
+        whitelist_path.write_text("\n".join(kept), encoding="utf-8")
+    return removed
+
+
 def merge_files(
     file_paths: list[Path],
     output_path: Path,
@@ -397,20 +401,8 @@ def build_merge_from_urls(
     log_file_path = Path(log_file).resolve() if log_file else None
 
     if logger is None:
+        # Единый логгер проекта; файловые обработчики уже настроены в setup_project_logging.
         logger = get_project_logger("merge_configs")
-        if log_file_path is not None:
-            merge_handler = logging.handlers.RotatingFileHandler(
-                log_file_path,
-                maxBytes=10 * 1024 * 1024,
-                backupCount=5,
-                encoding="utf-8",
-            )
-            merge_handler.setLevel(logging.INFO)
-            merge_handler.setFormatter(logging.Formatter(
-                "%(asctime)s | %(levelname)-8s | %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S",
-            ))
-            logger.addHandler(merge_handler)
 
     logger.info("Старт сборки merge.txt")
     logger.info("URLs file: %s", urls_file_path)
@@ -473,6 +465,12 @@ def build_merge_from_urls(
     whitelist_path = output_path_path.parent / "whitelist.txt"
     dedupe_blacklist_file(blacklist_path)
     dedupe_whitelist_file(whitelist_path)
+
+    # Серверы, которые не прошли повторную проверку (попали в blacklist),
+    # убираем из whitelist, чтобы они не возвращались в merge.txt.
+    pruned = prune_whitelist_by_blacklist(whitelist_path, blacklist_path)
+    if pruned:
+        logger.info("Из whitelist удалено %d серверов, не прошедших повторную проверку", pruned)
 
     merged_whitelist_path = output_path_path.parent / "last_whitelist.txt"
     merged_whitelist: list[str] = []

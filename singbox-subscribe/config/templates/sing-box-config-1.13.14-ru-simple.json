@@ -119,50 +119,6 @@
       "tolerance": 50
     },
     {
-      "tag": "OpenrouterAI-ping",
-      "type": "urltest",
-      "outbounds": ["{all}"],
-      "filter": [
-        {
-          "action": "exclude",
-          "keywords": ["🇷🇺"]
-        }
-      ],
-      "url": "https://openrouter.ai",
-      "interval": "30m",
-      "tolerance": 50 
-    },
-    {
-      "tag": "OpenrouterAI",
-      "type": "urltest",
-      "outbounds": ["OpenrouterAI-ping", "proxy"],
-      "url": "https://openrouter.ai",
-      "interval": "5m",
-      "tolerance": 100 
-    },
-    {
-      "tag": "OpenAI-ping",
-      "type": "urltest",
-      "outbounds": ["{all}"],
-      "filter": [
-        {
-          "action": "exclude",
-          "keywords": ["🇷🇺"]
-        }
-      ],
-      "url": "https://api.openai.com/v1/",
-      "interval": "30m",
-      "tolerance": 50
-    },
-    {
-      "tag": "OpenAI",
-      "type": "urltest",
-      "outbounds": ["OpenAI-ping", "proxy"],
-      "url": "https://api.openai.com/v1/",
-      "interval": "5m",
-      "tolerance": 100
-    },
-    {
       "tag": "Youtube-ping",
       "type": "urltest",
       "outbounds": ["{all}"],
@@ -185,28 +141,6 @@
       "tolerance": 100
     },
     {
-      "tag": "Gemini-ping",
-      "type": "urltest",
-      "outbounds": ["{all}"],
-      "filter": [
-        {
-          "action": "exclude",
-          "keywords": ["🇷🇺"]
-        }
-      ],
-      "url": "https://gemini.google.com/",
-      "interval": "30m",
-      "tolerance": 50
-    },
-    {
-      "tag": "Gemini",
-      "type": "urltest",
-      "outbounds": ["Gemini-ping", "proxy"],
-      "url": "https://gemini.google.com/",
-      "interval": "5m",
-      "tolerance": 100
-    },
-    {
       "tag": "Telegram-ping",
       "type": "urltest",
       "outbounds": ["{all}"],
@@ -225,28 +159,6 @@
       "type": "urltest",
       "outbounds": ["Telegram-ping", "proxy"],
       "url": "https://api.telegram.org",
-      "interval": "5m",
-      "tolerance": 100
-    },
-    {
-      "tag": "Microsoft-ping",
-      "type": "urltest",
-      "outbounds": ["{all}"],
-      "filter": [
-        {
-          "action": "exclude",
-          "keywords": ["🇷🇺"]
-        }
-      ],
-      "url": "https://www.microsoft.com",
-      "interval": "30m",
-      "tolerance": 50
-    },
-    {
-      "tag": "Microsoft",
-      "type": "urltest",
-      "outbounds": ["Microsoft-ping", "proxy"],
-      "url": "https://www.microsoft.com",
       "interval": "5m",
       "tolerance": 100
     },
@@ -294,12 +206,6 @@
         "outbound": "direct"
       },
       {
-        "domain_suffix": [
-          "deepseek.com"
-        ],
-        "outbound": "direct"
-      },
-      {
         "rule_set": ["geosite-crypto"],
         "outbound": "direct"
       },
@@ -308,23 +214,11 @@
         "outbound": "direct"
       },
       {
-        "rule_set": ["geoip-ru", "geosite-ru", "geosite-riot", "geosite-category-games"],
+        "rule_set": ["geoip-ru", "geosite-ru"],
         "outbound": "direct"
       },
       {
-        "domain_suffix": ["openrouter.ai"],
-        "outbound": "OpenrouterAI"
-      },
-      {
-        "domain_suffix": ["gemini.google.com"],
-        "outbound": "Gemini"
-      },
-      {
-        "rule_set": ["geosite-openai"],
-        "outbound": "OpenAI"
-      },
-      {
-        "rule_set": ["geoip-google", "geosite-google", "geosite-github"],
+        "rule_set": ["geoip-google", "geosite-google"],
         "outbound": "proxy"
       },
       {
@@ -334,10 +228,6 @@
       {
         "rule_set": ["geoip-telegram", "geosite-telegram"],
         "outbound": "Telegram"
-      },
-      {
-        "rule_set": ["geosite-microsoft"],
-        "outbound": "Microsoft"
       }
     ],
     "rule_set": [
@@ -346,14 +236,6 @@
         "type": "remote",
         "format": "binary",
         "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-ads-all.srs",
-        "update_interval": "1d",
-        "download_detour": "direct"
-      },
-      {
-        "tag": "geosite-openai",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://testingcf.jsdelivr.net/gh/Toperlock/sing-box-geosite@main/rule/OpenAI.srs",
         "update_interval": "1d",
         "download_detour": "direct"
       },
@@ -382,14 +264,6 @@
         "download_detour": "direct"
       },
       {
-        "tag": "geosite-github",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/github.srs",
-        "update_interval": "1d",
-        "download_detour": "direct"
-      },
-      {
         "tag": "geoip-telegram",
         "type": "remote",
         "format": "binary",
@@ -406,22 +280,6 @@
         "download_detour": "direct"
       },
       {
-        "tag": "geosite-microsoft",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/microsoft.srs",
-        "update_interval": "1d",
-        "download_detour": "direct"
-      },
-      {
-        "tag": "geosite-category-games",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-games.srs",
-        "update_interval": "1d",
-        "download_detour": "direct"
-      },
-      {
         "tag": "geosite-ru",
         "type": "remote",
         "format": "binary",
@@ -434,14 +292,6 @@
         "type": "remote",
         "format": "binary",
         "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/ru.srs",
-        "update_interval": "1d",
-        "download_detour": "direct"
-      },
-      {
-        "tag": "geosite-riot",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-riot.srs",
         "update_interval": "1d",
         "download_detour": "direct"
       },

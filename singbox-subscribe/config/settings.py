@@ -18,5 +18,14 @@ URLTEST_URL = "https://speed.cloudflare.com/__down?bytes=500000"
 TIMEOUT = 10.0
 BATCH_SIZE = 100
 
+# Проверка страны через скоростной тест (аналог Throne).
+# Включает определение страны для whitelist-серверов через speedtest.net,
+# а не только по имени/тэгу.
+COUNTRY_CHECK_ENABLED = os.getenv("COUNTRY_CHECK_ENABLED", "1") == "1"
+# Сколько прокси проверять параллельно (аналог countryConcurrency в Throne).
+COUNTRY_CHECK_CONCURRENCY = int(os.getenv("COUNTRY_CHECK_CONCURRENCY", "4"))
+# Таймаут проверки одного прокси (сек).
+COUNTRY_CHECK_TIMEOUT = float(os.getenv("COUNTRY_CHECK_TIMEOUT", "25"))
+
 FLASK_HOST="0.0.0.0"
 FLASK_PORT=8000

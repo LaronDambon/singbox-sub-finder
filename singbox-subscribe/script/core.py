@@ -263,15 +263,22 @@ def parse_content(content):
             continue
         factory = get_parser(t)
         if not factory:
+            proto = tool.get_protocol(t)
+            if proto:
+                LOGGER.debug("parse_content: нет парсера для протокола '%s' (строка пропущена)", proto)
+            else:
+                LOGGER.debug("parse_content: не удалось определить протокол (строка пропущена): %s", t[:120])
             continue
         try:
             node = factory(t)
         except Exception as e:
             node = None
-            LOGGER.error("parse_content failed for line: %s", t)
-            LOGGER.error("exception: %s", e)
+            LOGGER.warning("parse_content: парсер '%s' не смог разобрать строку: %s", tool.get_protocol(t), t[:200])
+            LOGGER.debug("parse_content: исключение при разборе: %s", e)
         if node:
             nodelist.append(node)
+        else:
+            LOGGER.debug("parse_content: парсер '%s' вернул None (строка пропущена): %s", tool.get_protocol(t), t[:200])
     return nodelist
 
 
@@ -653,28 +660,52 @@ def build_singbox_config_from_nodes(base_template, nodes):
     config = deepcopy(base_template)
     outbounds = config.get("outbounds", [])
 
-    tags = []
+    # Собираем все теги узлов
+    all_tags = []
     for index, node in enumerate(nodes):
         if not isinstance(node, dict):
             continue
         tag = node.get("tag", f"node_{index}")
-        if tag not in tags:
-            tags.append(tag)
+        if tag not in all_tags:
+            all_tags.append(tag)
 
+    # Обрабатываем каждый outbound из шаблона: применяем фильтры, если они есть
     for outbound in outbounds:
-        if isinstance(outbound.get("outbounds"), list):
+        if not isinstance(outbound.get("outbounds"), list):
+            continue
+
+        # Если в outbound есть filter — фильтруем узлы перед вставкой
+        if outbound.get("filter"):
+            # nodes_filter ожидает список узлов (dict), а не теги.
+            # Преобразуем all_tags обратно в узлы для фильтрации.
+            node_map = {n.get("tag"): n for n in nodes if isinstance(n, dict) and n.get("tag")}
+            filtered_nodes = nodes_filter(list(node_map.values()), outbound["filter"], "")
+            filtered_tags = [n.get("tag") for n in filtered_nodes if n.get("tag")]
+            # Заменяем шаблоны на отфильтрованные теги
+            new_outbounds = []
+            for item in outbound["outbounds"]:
+                if item == "{all}" or (isinstance(item, str) and item.startswith("{") and item.endswith("}")):
+                    new_outbounds.extend(filtered_tags)
+                else:
+                    new_outbounds.append(item)
+            outbound["outbounds"] = new_outbounds
+            # Удаляем filter, чтобы не уйти в итоговый JSON
+            del outbound["filter"]
+        else:
+            # Старая логика: просто заменяем {all} и {...} на все теги
             if "{all}" in outbound["outbounds"]:
-                outbound["outbounds"] = tags
+                outbound["outbounds"] = all_tags
                 continue
             if any(isinstance(item, str) and item.startswith("{") and item.endswith("}") for item in outbound["outbounds"]):
-                outbound["outbounds"] = tags
+                outbound["outbounds"] = all_tags
                 continue
 
+    # Добавляем сами узлы в outbounds, если их там ещё нет
     for index, node in enumerate(nodes):
         if not isinstance(node, dict):
             continue
         tag = node.get("tag", f"node_{index}")
-        if not any(outbound.get("tag") == tag for outbound in outbounds):
+        if not any(ob.get("tag") == tag for ob in outbounds):
             outbounds.append(node)
 
     config["outbounds"] = outbounds
@@ -688,6 +719,9 @@ def find_free_port():
         return sock.getsockname()[1]
 
 
+_URLTEST_RESULT_RE = re.compile(r"outbound/urltest\[[^\]]+\]: outbound\s+.+?\s+(available|unavailable)")
+
+
 def run_singbox_admin(
     config_path,
     singbox_path=None,
@@ -696,7 +730,12 @@ def run_singbox_admin(
     timeout=60.0,
     debug_mode=True,
 ):
-    """Запускает sing-box и завершает его после нужного количества debug-логов или по таймауту."""
+    """Запускает sing-box и завершает его после нужного количества urltest-результатов или по таймауту.
+
+    Завершение отсчитывается по строкам `outbound/urltest ... (available|unavailable)`,
+    а не по любым `DEBUG[`-строкам, чтобы не останавливаться после первых нескольких узлов.
+    Все строки sing-box сохраняются в списке и возвращаются вызывающему для парсинга.
+    """
     executable = singbox_path or SING_BOX_PATH
     if not os.path.exists(executable):
         raise FileNotFoundError(f"Не найден sing-box по пути: {executable}")
@@ -719,13 +758,13 @@ def run_singbox_admin(
     try:
         process = subprocess.Popen(command_line, **kwargs)
     except OSError as exc:
-        return [f"failed to start sing-box: {exc}"]
+        return ([], [f"failed to start sing-box: {exc}"])
 
     output_lines = []
-    debug_count = 0
+    result_count = 0
 
     def _reader():
-        nonlocal debug_count
+        nonlocal result_count
         if process.stdout is None:
             return
         try:
@@ -734,17 +773,18 @@ def run_singbox_admin(
                     continue
                 text = line.rstrip("\n")
                 output_lines.append(text)
-                if "DEBUG[" in text:
-                    debug_count += 1
+                if _URLTEST_RESULT_RE.search(text):
+                    result_count += 1
         except Exception:
             pass
 
     reader = threading.Thread(target=_reader, daemon=True)
     reader.start()
 
-    deadline = time.monotonic() + timeout
+    started_at = time.monotonic()
+    deadline = started_at + timeout
     while time.monotonic() < deadline:
-        if expected_debug_count > 0 and debug_count >= expected_debug_count:
+        if expected_debug_count > 0 and result_count >= expected_debug_count:
             break
         if process.poll() is not None:
             break
@@ -759,20 +799,32 @@ def run_singbox_admin(
             process.wait(timeout=2)
 
     reader.join(timeout=1)
+    elapsed = time.monotonic() - started_at
     return_code = process.returncode
-    if expected_debug_count > 0 and debug_count == 0:
+
+    # urltest unavailable-строки — это нормальный результат проверки, не ошибка.
+    # Логируем только реальные проблемы: отсутствие результатов или аварийный выход.
+    if expected_debug_count > 0 and result_count == 0:
         LOGGER.error(
-            "sing-box run returned no DEBUG urltest lines. return_code=%s output_lines=%d timeout=%s expected_debug_count=%d",
+            "sing-box run returned no urltest results. return_code=%s output_lines=%d timeout=%.2fs expected=%d",
             return_code,
             len(output_lines),
-            timeout,
+            elapsed,
             expected_debug_count,
         )
         for line in output_lines:
-            LOGGER.error("sing-box output: %s", line)
+            LOGGER.debug("sing-box output: %s", line)
     if return_code != 0 and len(output_lines) == 0:
         LOGGER.error("sing-box process exited with return code %s and no output", return_code)
-    return [line for line in output_lines if line]
+
+    LOGGER.info(
+        "sing-box run finished: %d/%d urltest results in %.2fs (return_code=%s)",
+        result_count,
+        expected_debug_count,
+        elapsed,
+        return_code,
+    )
+    return (output_lines, [line for line in output_lines if line])
 
 
 def generate_debug_configs_with_singbox(
@@ -821,13 +873,16 @@ def generate_debug_configs_with_singbox(
 
         parsed_nodes = []
         parsed_node_lines = []
+        skipped_lines = 0
         for line_index, line in enumerate(lines, start=1):
             nodes = get_nodes(line)
             if not nodes:
+                skipped_lines += 1
                 continue
             node_index = 0
             for node in nodes:
                 if not isinstance(node, dict):
+                    skipped_lines += 1
                     continue
                 original_tag = node.get("tag")
                 if original_tag:
@@ -838,6 +893,14 @@ def generate_debug_configs_with_singbox(
                     node["tag"] = numbered_tag
                 parsed_nodes.append(node)
                 parsed_node_lines.append(line)
+
+        if skipped_lines:
+            LOGGER.info(
+                "Parsed %d/%d lines into nodes (%d lines skipped: unknown/unsupported protocol or empty)",
+                len(parsed_nodes),
+                len(lines),
+                skipped_lines,
+            )
 
         if not parsed_nodes:
             return {
@@ -863,7 +926,7 @@ def generate_debug_configs_with_singbox(
 
         LOGGER.info("Wrote merged config to %s", target_path)
         LOGGER.info("Starting sing-box with %d nodes", len(parsed_nodes))
-        output_lines = run_singbox_admin(
+        raw_lines, output_lines = run_singbox_admin(
             str(target_path),
             singbox_path=singbox_path,
             expected_debug_count=len(parsed_nodes),
@@ -875,6 +938,7 @@ def generate_debug_configs_with_singbox(
             "config_path": str(target_path),
             "command": ["sing-box", "run", "-c", str(target_path)],
             "output": output_lines,
+            "raw_output": raw_lines,
             "node_count": len(parsed_nodes),
             "parsed_nodes": parsed_nodes,
             "parsed_node_lines": parsed_node_lines,

@@ -30,9 +30,10 @@ GEOIP_DOWNLOAD_URLS = [
     "https://git.io/GeoLite2-Country.mmdb",
 ]
 GEOIP_API_ENDPOINTS = [
-    "https://ipwhois.app/json/{ip}",
-    "https://ip-api.com/json/{ip}?fields=countryCode",
-    "https://ipapi.co/{ip}/country/",
+    "https://ipmap-api.ripe.net/v1/locate/{ip}/best?client=singbox-sub-finder",
+    #"https://ipwhois.app/json/{ip}",
+    #"https://ip-api.com/json/{ip}?fields=countryCode",
+    #"https://ipapi.co/{ip}/country/",
 ]
 _geoip_reader = None
 
@@ -87,7 +88,18 @@ def _load_geoip_reader(db_path: Path | str | None = None, download_if_missing: b
         return None
 
 
+# Кэш определений страны по хосту/IP, чтобы не дёргать внешние API на каждый конфиг.
+# _SENTINEL — маркер "ещё не кэшировано" (т.к. None — тоже валидный результат кэша).
+_SENTINEL = object()
+_country_cache: dict[str, str | None] = {}
+
+
 def _resolve_country_code_by_ip_api(ip_address: str) -> str | None:
+    cached = _country_cache.get(ip_address, _SENTINEL)
+    if cached is not _SENTINEL:
+        return cached
+
+    result: str | None = None
     for endpoint in GEOIP_API_ENDPOINTS:
         try:
             url = endpoint.format(ip=ip_address)
@@ -99,16 +111,28 @@ def _resolve_country_code_by_ip_api(ip_address: str) -> str | None:
             if endpoint.endswith("/country/"):
                 country_code = data.strip().upper()
                 if len(country_code) == 2:
-                    return country_code
+                    result = country_code
+                    break
                 continue
             try:
                 payload = json.loads(data)
-                return payload.get("countryCode") or payload.get("country_code") or payload.get("countrycode")
+                # RIPE IPmap: {"location": {"countryCodeAlpha2": "JP", ...}}
+                location = payload.get("location") if isinstance(payload, dict) else None
+                if isinstance(location, dict):
+                    cc = location.get("countryCodeAlpha2")
+                    if cc and len(cc) == 2:
+                        result = cc.upper()
+                        break
+                result = payload.get("countryCode") or payload.get("country_code") or payload.get("countrycode")
+                if result:
+                    break
             except Exception:
                 continue
         except Exception:
             continue
-    return None
+
+    _country_cache[ip_address] = result
+    return result
 
 
 def country_code_to_emoji(country_code: str | None) -> str | None:
@@ -173,21 +197,20 @@ def get_proxy_country_emoji(raw_line: str, db_path: Path | str | None = None) ->
     except Exception:
         return None
 
-    reader = _load_geoip_reader(db_path, download_if_missing=False)
-    if reader is not None:
-        try:
-            country_code = reader.country(str(ip_obj)).country.iso_code
-            if country_code:
-                emoji = country_code_to_emoji(country_code)
-                if emoji:
-                    return emoji
-        except Exception:
-            pass
-
+    # Используем только онлайн API для определения страны
     country_code = _resolve_country_code_by_ip_api(str(ip_obj))
     if country_code:
         return country_code_to_emoji(country_code)
     return None
+
+
+def country_cache_stats() -> dict:
+    """Возвращает статистику кэша определений страны (для логирования)."""
+    return {
+        "cached_entries": len(_country_cache),
+        "resolved": sum(1 for v in _country_cache.values() if v),
+        "unresolved": sum(1 for v in _country_cache.values() if not v),
+    }
 
 
 def is_ip(str):
@@ -360,6 +383,54 @@ def rename(input_str):
             else:
                 return country_code + ' ' + input_str
     return input_str
+
+
+def extract_proxy_name(raw_line: str) -> str | None:
+    """Извлекает имя/тэг прокси из исходной строки (без сетевых запросов).
+
+    Для vmess имя лежит в base64-поле 'ps', для остальных — после '#'.
+    Возвращает None, если имя не удалось извлечь.
+    """
+    line = raw_line.strip()
+    if not line:
+        return None
+
+    lower = line.lower()
+    if lower.startswith('vmess://'):
+        try:
+            payload = line[8:]
+            padding = len(payload) % 4
+            if padding:
+                payload += '=' * (4 - padding)
+            decoded = base64.b64decode(payload, validate=False)
+            obj = json.loads(decoded.decode('utf-8', errors='ignore') or '{}')
+            name = (obj.get('ps') or obj.get('remarks') or '').strip()
+            return name or None
+        except Exception:
+            return None
+
+    if '#' in line:
+        name = line.split('#', 1)[1].strip()
+        return name or None
+
+    return None
+
+
+def get_country_from_name(raw_line: str) -> str | None:
+    """Определяет страну по имени/тэгу прокси из исходной строки.
+
+    Использует regex_patterns (как rename), без сетевых запросов.
+    Возвращает эмодзи страны или None, если страну не удалось определить.
+    """
+    name = extract_proxy_name(raw_line)
+    if not name:
+        return None
+    for country_code, pattern in regex_patterns.items():
+        if name.startswith(country_code):
+            return country_code
+        if pattern.search(name):
+            return country_code
+    return None
 
 def b64Decode(str):
     str = urllib.parse.unquote(str.strip())
