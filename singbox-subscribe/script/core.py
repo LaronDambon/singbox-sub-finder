@@ -619,29 +619,6 @@ def display_template(tl):
     print(print_str)
 
 
-def select_config_template(tl, selected_template_index=None):
-    if args.template_index is not None:
-        uip = args.template_index
-    else:
-        # print ('Введите номер для выбора соответствующего шаблона конфигурации (нажмите Enter для выбора первого по умолчанию): ')
-        uip = input('Введите номер, чтобы загрузить соответствующий шаблон config (нажмите Enter, чтобы выбрать первый шаблон по умолчанию): ')
-        try:
-            if uip == '':
-                return 0
-            uip = int(uip)
-            if uip < 1 or uip > len(tl):
-                print('Введена неверная информация! Введите ещё раз')
-                # print('Введена неверная информация! Введите повторно')
-                return select_config_template(tl)
-            else:
-                uip -= 1
-        except:
-            print('Введена неверная информация! Введите ещё раз')
-            # print('Введена неверная информация! Введите повторно')
-            return select_config_template(tl)
-    return uip
-
-
 # Пользовательская функция для парсинга аргумента в формат JSON
 def parse_json(value):
     try:
