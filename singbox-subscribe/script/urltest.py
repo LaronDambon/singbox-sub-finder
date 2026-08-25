@@ -12,14 +12,19 @@ import requests
 warnings.filterwarnings("ignore", category=Warning, module=r"requests")
 
 from script.core import generate_debug_configs_with_singbox
-from script.downloader import build_clean_tag, dedupe_blacklist_file, prune_whitelist_by_blacklist
+from script.downloader import build_clean_tag, normalize_proxy_key
 from script.logger_utils import get_project_logger, setup_project_logging
+from script.server_store import ServerStore, parse_stable_from_line  # noqa: F401 — re-export для совместимости
 from config.settings import (
     BATCH_SIZE,
     URLTEST_URL,
     TIMEOUT,
     WHITELIST_FILE,
     BLACKLIST_FILE,
+    SERVERS_DB_FILE,
+    WHITELIST_EXPORT_MIN_STABLE,
+    PURGE_STABLE_BELOW,
+    STABLE_MAX,
     COUNTRY_CHECK_ENABLED,
     COUNTRY_CHECK_CONCURRENCY,
     COUNTRY_CHECK_TIMEOUT,
@@ -56,34 +61,114 @@ def parse_ping_from_output(output_lines: List[str]) -> List[Tuple[str, int | Non
     return results
 
 
-def append_line(path: str | Path, line: str) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        if fh.tell() > 0:
-            fh.write("\n")
-        fh.write(line)
-
-
-def build_ping_result_line(proxy_line: str, seq_counter: int, ping_ms: int | None, include_country: bool = False, country_tag: str | None = None) -> str:
+def build_ping_result_line(proxy_line: str, seq_counter: int, ping_ms: int | None, include_country: bool = False, country_tag: str | None = None, stable: int | None = None) -> str:
     cleaned = build_clean_tag(proxy_line, seq_counter=seq_counter, include_country=include_country, country_tag=country_tag)
-    if ping_ms is None:
-        return cleaned
-    return f"{cleaned}-ping-{ping_ms}"
+    if ping_ms is not None:
+        cleaned = f"{cleaned}-ping-{ping_ms}"
+    if stable is not None:
+        cleaned = f"{cleaned}-stable-{stable}"
+    return cleaned
 
 
-def ensure_blacklist(path: Path, line: str) -> None:
-    """Просто дописывает строку в blacklist.txt.
+def _evaluate_nodes(
+    tag_to_line: dict[str, str],
+    parsed: list[tuple[str, int | None]],
+    stable_map: dict[str, int],
+    serial_start: int,
+    purge_below: int,
+    known_countries: dict[str, str] | None = None,
+) -> tuple[list[dict], set[str]]:
+    """Чистая функция: решение по каждому узлу батча.
 
-    Дедупликация выполняется один раз в конце цикла (dedupe_blacklist_file),
-    поэтому здесь НЕ читаем весь файл на каждую строку — это давало O(n²)
-    и превращало запись батча в десятки секунд.
+    Возвращает decisions — список словарей
+      {tag, key, raw_line, ping_ms, is_ok, serial, prev_stable, new_stable}
+    и country_check_lines — исходные строки ok-узлов, страну которых
+    не удалось определить дёшево.
+
+    Страна считается известной, если эмодзи есть в имени строки ИЛИ она
+    уже лежит в базе (known_countries: key -> эмодзи). Известная страна
+    идёт в decision["country_tag"] и НЕ отправляется на дорогой
+    скоростной тест — он нужен только для ok-узлов с полностью
+    неизвестной страной.
+    Узлы с new_stable < purge_below помечаются is_excluded=True:
+    их результат всё равно пишется в базу, а из пула проверки их
+    исключит purge_dead() в конце цикла.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        if fh.tell() > 0:
-            fh.write("\n")
-        fh.write(line)
+    known_countries = known_countries or {}
+    available_tags = {tag for tag, ping_ms in parsed if ping_ms is not None}
+    tag_to_ping = dict(parsed)
+    decisions: list[dict] = []
+    country_check_lines: set[str] = set()
+    serial = serial_start
+
+    for tag, raw_line in tag_to_line.items():
+        serial += 1
+        is_ok = tag in available_tags
+        ping_ms = tag_to_ping.get(tag)
+        key = normalize_proxy_key(raw_line)
+        prev_stable = stable_map.get(key, 0)
+        # Потолок стабильности: ограничивает "накопленный авторитет", иначе
+        # долго живший сервер после смерти слишком медленно вымывается из списков.
+        new_stable = min(prev_stable + (1 if is_ok else -1), STABLE_MAX)
+        stable_map[key] = new_stable
+
+        # Страна известна, если эмодзи уже есть в имени строки или в базе.
+        # В обоих случаях скоростной тест не нужен: эмодзи просто переносится
+        # в пересобранную строку (это чинит потерю эмодзи после цикла,
+        # где сервер не ответил и строка писалась без страны).
+        name_country = tool.get_country_from_name(raw_line)
+        db_country = known_countries.get(key)
+        known_country = name_country or db_country
+
+        decision = {
+            "tag": tag,
+            "key": key,
+            "raw_line": raw_line,
+            "ping_ms": ping_ms if is_ok else None,
+            "is_ok": is_ok,
+            "serial": serial,
+            "prev_stable": prev_stable,
+            "new_stable": new_stable,
+            "is_excluded": new_stable < purge_below,
+            "country_tag": known_country if is_ok else None,
+            # Страна из имени считается один раз здесь и переиспользуется
+            # в _finalize_rows — второй проход по 140+ регэкспам не нужен.
+            "name_country": name_country,
+        }
+        if is_ok and not known_country and COUNTRY_CHECK_ENABLED:
+            country_check_lines.add(raw_line)
+        decisions.append(decision)
+    return decisions, country_check_lines
+
+
+def _finalize_rows(decisions: list[dict], speedtest_country: dict[str, str]) -> list[dict]:
+    """Чистая функция: превращает решения в строки-записи для базы.
+
+    row: {key, available, line, ping_ms, country, protocol} — формат record_results.
+    """
+    rows: list[dict] = []
+    for d in decisions:
+        # Свежий результат скоростного теста приоритетнее; иначе — уже
+        # известная страна (из имени строки или из базы).
+        country_tag = speedtest_country.get(d["raw_line"]) or d.get("country_tag")
+        line_text = build_ping_result_line(
+            d["raw_line"],
+            seq_counter=d["serial"],
+            ping_ms=d["ping_ms"],
+            include_country=d["is_ok"],
+            country_tag=country_tag,
+            stable=d["new_stable"],
+        )
+        name_country = d.get("name_country")
+        rows.append({
+            "key": d["key"],
+            "available": d["is_ok"],
+            "line": line_text,
+            "ping_ms": d["ping_ms"],
+            "country": country_tag or name_country or "",
+            "protocol": (tool.get_protocol(d["raw_line"]) or "").lower(),
+        })
+    return rows
 
 
 def run_debug_ping_cycle(
@@ -94,24 +179,29 @@ def run_debug_ping_cycle(
     timeout: float = TIMEOUT,
     whitelist_path: str | Path | None = WHITELIST_FILE,
     blacklist_path: str | Path | None = BLACKLIST_FILE,
+    db_path: str | Path | None = SERVERS_DB_FILE,
+    export_lists: bool = True,
 ) -> dict:
+    """Проверяет серверы из merge.txt через sing-box urltest и пишет результаты
+    в центральную базу (ServerStore).
+
+    stable: +1 за успешный пинг, -1 за неудачу. По завершении цикла:
+      * серверы со stable < PURGE_STABLE_BELOW исключаются из проверочного пула;
+      * whitelist.txt экспортируется из базы по фильтру stable > порога;
+      * blacklist.txt — проекция мёртвой зоны (stable < 0) для наблюдения.
+    """
     merge_file = Path(merge_path).resolve()
     lines = load_merge_lines(merge_file)
 
-    whitelist_output = Path(whitelist_path) if whitelist_path else merge_file.with_suffix(".whitelist.txt")
-    blacklist_output = Path(blacklist_path) if blacklist_path else merge_file.with_suffix(".blacklist.txt")
-
-    # Whitelist НЕ удаляем: он накапливается между запусками, чтобы ранее найденные
-    # рабочие серверы не терялись, даже если их убрали из исходных списков.
-    # Серверы, не прошедшие повторную проверку, убираются в конце цикла по blacklist.
-    if whitelist_output.exists():
-        LOGGER.info("Whitelist сохранён и будет дополнен: %s", whitelist_output)
+    store = ServerStore(db_path)
+    stable_map = store.load_stable_map()
+    known_countries = store.load_country_map()
 
     total = len(lines)
     processed = 0
-    written = 0
-    whitelist_count = 0
-    blacklist_count = 0
+    checked = 0
+    available_count = 0
+    failed_count = 0
     cycle_started = time.monotonic()
 
     for start in range(0, total, batch_size):
@@ -128,7 +218,7 @@ def run_debug_ping_cycle(
                 ping_limit=500,
                 merge_lines=batch,
             )
-        except Exception as exc:
+        except Exception:
             LOGGER.exception(
                 "Batch %d-%d failed during sing-box generation; skipping this batch.",
                 start + 1,
@@ -136,199 +226,107 @@ def run_debug_ping_cycle(
             )
             continue
         batch_elapsed = time.monotonic() - batch_started
-
         LOGGER.info(
             "Batch %d-%d sing-box finished in %.2fs, captured %d output lines",
-            start + 1,
-            batch_end,
-            batch_elapsed,
-            len(result.get("output", [])),
+            start + 1, batch_end, batch_elapsed, len(result.get("output", [])),
         )
 
         output_lines = result.get("raw_output") or result.get("output", [])
         parsed = parse_ping_from_output(output_lines)
         parsed_nodes = result.get("parsed_nodes", [])
         parsed_node_lines = result.get("parsed_node_lines", [])
-        tag_to_line = {node.get("tag"): line for node, line in zip(parsed_nodes, parsed_node_lines) if isinstance(node, dict) and node.get("tag")}
-
-        available_tags = {tag for tag, ping_ms in parsed if ping_ms is not None}
-        batch_whitelist = 0
-        batch_blacklist = 0
-        output_serial = start
-
-        # Фаза 1: подготовка строк для записи.
-        # Страна определяется по имени/тэгу из исходной строки (быстро, без сети).
-        # Если по имени определить не удалось — для whitelist-серверов в последних
-        # батчах делаем проверку страны через скоростной тест (аналог Throne).
-        # По требованию: страна добавляется ТОЛЬКО для whitelist-серверов (прошедших
-        # проверку) и ТОЛЬКО в последних 100 батчах. Если страну не удалось
-        # определить — логируем и забываем (не блокируем запись).
-        prepared: list[tuple[str, str]] = []  # (target_file, line)
-        tag_to_ping = dict(parsed)
-        country_started = time.monotonic()
-
-        # Последние 100 батчей (по 100 строк) — только для них определяем страну.
-        last_batches = 100
-        is_last_batches = (total - start) <= last_batches * batch_size
-
-        # Собираем whitelist-строки, для которых нужно определить страну через
-        # скоростной тест (не удалось по имени).
-        country_check_lines: list[str] = []
-        # tag -> (original_line, ping_ms, is_whitelist, include_country, seq_counter)
-        tag_meta: dict[str, tuple] = {}
-
-        for tag, original_line in tag_to_line.items():
-            output_serial += 1
-            ping_ms = tag_to_ping.get(tag) if tag in available_tags else None
-            is_whitelist = tag in available_tags
-            # Страна только для whitelist-серверов в последних 100 батчах.
-            include_country = is_whitelist and is_last_batches
-            tag_meta[tag] = (original_line, ping_ms, is_whitelist, include_country, output_serial)
-            if include_country and not tool.get_country_from_name(original_line):
-                # По имени не определили — попробуем через скоростной тест.
-                if COUNTRY_CHECK_ENABLED:
-                    country_check_lines.append(original_line)
-                else:
-                    LOGGER.debug(
-                        "Не удалось определить страну по имени для whitelist-сервера: %s",
-                        original_line[:120],
-                    )
-            line_text = build_ping_result_line(
-                original_line,
-                seq_counter=output_serial,
-                ping_ms=ping_ms,
-                include_country=include_country,
-            )
-            if is_whitelist:
-                prepared.append((str(whitelist_output), line_text))
-            else:
-                prepared.append((str(blacklist_output), line_text))
-
-        # Проверка страны через скоростной тест для строк без имени-страны.
-        speedtest_country: dict[str, str] = {}  # original_line -> emoji
-        if country_check_lines:
-            from script.country_check import batch_country_check, country_to_emoji
-            LOGGER.info(
-                "Batch %d-%d: определяю страну через скоростной тест для %d whitelist-серверов (concurrency=%d)",
-                start + 1,
-                batch_end,
-                len(country_check_lines),
-                COUNTRY_CHECK_CONCURRENCY,
-            )
-            cc_results = batch_country_check(
-                country_check_lines,
-                concurrency=COUNTRY_CHECK_CONCURRENCY,
-            )
-            for line, res in cc_results.items():
-                emoji = country_to_emoji(res.get("country"))
-                if emoji:
-                    speedtest_country[line] = emoji
-                    LOGGER.info(
-                        "Скоростной тест: страна %s (сервер %s, %sms) для %s",
-                        res.get("country"),
-                        res.get("server_name"),
-                        res.get("latency_ms"),
-                        line[:80],
-                    )
-                else:
-                    LOGGER.debug(
-                        "Скоростной тест не дал страну для %s: %s",
-                        line[:80],
-                        res.get("error") or res.get("country"),
-                    )
-
-        # Пересобираем строки с учётом страны, определённой через скоростной тест.
-        if speedtest_country:
-            rebuilt: list[tuple[str, str]] = []
-            for tag, (original_line, ping_ms, is_whitelist, include_country, seq) in tag_meta.items():
-                country_tag = speedtest_country.get(original_line)
-                line_text = build_ping_result_line(
-                    original_line,
-                    seq_counter=seq,
-                    ping_ms=ping_ms,
-                    include_country=include_country,
-                    country_tag=country_tag,
-                )
-                if is_whitelist:
-                    rebuilt.append((str(whitelist_output), line_text))
-                else:
-                    rebuilt.append((str(blacklist_output), line_text))
-            prepared = rebuilt
-
-        country_elapsed = time.monotonic() - country_started
-        LOGGER.info(
-            "Batch %d-%d: tag build done for %d nodes in %.2fs (country for whitelist in last %d batches: %s, speedtest: %d)",
-            start + 1,
-            batch_end,
-            len(prepared),
-            country_elapsed,
-            last_batches,
-            is_last_batches,
-            len(speedtest_country),
-        )
-
-        # Фаза 2: запись строк в whitelist/blacklist.
-        write_started = time.monotonic()
-        for target_file, line_text in prepared:
-            if target_file == str(whitelist_output):
-                append_line(whitelist_output, line_text)
-                whitelist_count += 1
-                batch_whitelist += 1
-            else:
-                ensure_blacklist(blacklist_output, line_text)
-                blacklist_count += 1
-                batch_blacklist += 1
-            written += 1
-        write_elapsed = time.monotonic() - write_started
-        LOGGER.info(
-            "Batch %d-%d: wrote %d lines to whitelist/blacklist in %.2fs",
-            start + 1,
-            batch_end,
-            len(prepared),
-            write_elapsed,
-        )
-
+        tag_to_line = {
+            node.get("tag"): line
+            for node, line in zip(parsed_nodes, parsed_node_lines)
+            if isinstance(node, dict) and node.get("tag")
+        }
         missing_tags = [tag for tag, _ in parsed if tag not in tag_to_line]
         if missing_tags:
             LOGGER.warning(
                 "Batch %d-%d parsed %d tags not found in original batch: %s",
-                start + 1,
-                min(start + len(batch), total),
-                len(missing_tags),
-                missing_tags,
+                start + 1, batch_end, len(missing_tags), missing_tags[:10],
             )
 
-        LOGGER.info(
-            "Batch %d-%d result: %d available, %d blacklist (sing-box %.2fs + country/write %.2fs)",
-            start + 1,
-            min(start + len(batch), total),
-            batch_whitelist,
-            batch_blacklist,
-            batch_elapsed,
-            (time.monotonic() - batch_started) - batch_elapsed,
+        # Фаза 1: решение по узлам (stable +/-) — чистая функция над картой базы.
+        decisions, country_check_lines = _evaluate_nodes(
+            tag_to_line, parsed, stable_map,
+            serial_start=start, purge_below=PURGE_STABLE_BELOW,
+            known_countries=known_countries,
         )
+        resolved_from_cache = sum(
+            1 for d in decisions
+            if d["is_ok"] and d.get("country_tag") and d["raw_line"] not in country_check_lines
+        )
+
+        # Фаза 2: страна через скоростной тест для ok-серверов без страны в имени.
+        speedtest_country: dict[str, str] = {}
+        if country_check_lines:
+            from script.country_check import batch_country_check, country_to_emoji
+            LOGGER.info(
+                "Batch %d-%d: скоростной тест страны нужен для %d серверов "
+                "(пропущено благодаря имени/базе: %d, concurrency=%d)",
+                start + 1, batch_end, len(country_check_lines),
+                resolved_from_cache, COUNTRY_CHECK_CONCURRENCY,
+            )
+            cc_results = batch_country_check(
+                sorted(country_check_lines),
+                concurrency=COUNTRY_CHECK_CONCURRENCY,
+            )
+            for line, res in cc_results.items():
+                emoji = res.get("emoji") or country_to_emoji(res.get("country"))
+                if emoji:
+                    speedtest_country[line] = emoji
+                    LOGGER.info(
+                        "Скоростной тест: страна %s (%sms) для %s",
+                        res.get("country"), res.get("latency_ms"), line[:80],
+                    )
+
+        # Фаза 3: строки-записи и запись результатов в базу одним commit'ом.
+        rows = _finalize_rows(decisions, speedtest_country)
+        store.record_results(rows)
+
+        batch_ok = sum(1 for r in rows if r["available"])
+        batch_fail = len(rows) - batch_ok
+        checked += len(rows)
+        available_count += batch_ok
+        failed_count += batch_fail
+        LOGGER.info(
+            "Batch %d-%d result: %d available, %d failed, %d записано в базу "
+            "(sing-box %.2fs + country/write %.2fs)",
+            start + 1, batch_end, batch_ok, batch_fail, len(rows),
+            batch_elapsed, (time.monotonic() - batch_started) - batch_elapsed,
+        )
+
+    # --- Пост-обработка: исключение мёртвых из пула и экспорт списков из базы ---
+    purged = store.purge_dead(PURGE_STABLE_BELOW)
+    stats = store.stats()
+
+    whitelist_output = Path(whitelist_path) if whitelist_path else merge_file.with_suffix(".whitelist.txt")
+    blacklist_output = Path(blacklist_path) if blacklist_path else merge_file.with_suffix(".blacklist.txt")
+    exported_wl = exported_bl = 0
+    if export_lists:
+        exported_wl = store.export_to_file(whitelist_output, min_stable=WHITELIST_EXPORT_MIN_STABLE)
+        exported_bl = store.export_to_file(blacklist_output, max_stable=PURGE_STABLE_BELOW)
 
     total_elapsed = time.monotonic() - cycle_started
     LOGGER.info(
-        "Ping cycle finished: processed=%d written=%d whitelist=%d blacklist=%d in %.2fs",
-        processed,
-        written,
-        whitelist_count,
-        blacklist_count,
-        total_elapsed,
+        "Ping cycle finished in %.2fs: processed=%d checked=%d available=%d failed=%d | "
+        "db: total=%d active=%d excluded=%d proven=%d | excluded_now=%d wl_export=%d bl_export=%d",
+        total_elapsed, processed, checked, available_count, failed_count,
+        stats["total"], stats["active"], stats["excluded"], stats["zones"]["proven_gt_1"],
+        purged, exported_wl, exported_bl,
     )
-    dedupe_blacklist_file(Path(blacklist_output))
-    # Убираем из whitelist серверы, которые не прошли повторную проверку в этом цикле.
-    pruned = prune_whitelist_by_blacklist(Path(whitelist_output), Path(blacklist_output))
-    if pruned:
-        LOGGER.info("Из whitelist удалено %d серверов, не прошедших повторную проверку", pruned)
     return {
         "merge_path": str(merge_file),
         "batch_size": batch_size,
         "processed": processed,
-        "written": written,
-        "whitelist_count": whitelist_count,
-        "blacklist_count": blacklist_count,
+        "checked": checked,
+        "available": available_count,
+        "failed": failed_count,
+        "excluded_now": purged,
+        "whitelist_exported": exported_wl,
+        "blacklist_exported": exported_bl,
         "whitelist_path": str(whitelist_output),
         "blacklist_path": str(blacklist_output),
+        "db": stats,
     }

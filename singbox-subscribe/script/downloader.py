@@ -229,7 +229,7 @@ def normalize_proxy_key(raw: str) -> str:
             payload = base64.b64decode(encoded, validate=False)
             obj = json.loads(payload.decode("utf-8", errors="ignore") or "{}")
             if isinstance(obj, dict):
-                cleaned = {k: v for k, v in obj.items() if k not in {"ps", "name", "remark", "label"}}
+                cleaned = {k: v for k, v in obj.items() if k not in {"ps", "name", "remark", "label", "fp"}}
                 return "vmess:" + json.dumps(cleaned, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         except Exception:
             pass
@@ -241,7 +241,7 @@ def normalize_proxy_key(raw: str) -> str:
             query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
             filtered = []
             for key, val in query:
-                if key.lower() in {"remarks", "remark", "name", "label", "tag", "n"}:
+                if key.lower() in {"remarks", "remark", "name", "label", "tag", "n", "fp"}:
                     continue
                 filtered.append((key, val))
             cleaned_query = urllib.parse.urlencode(filtered)
@@ -251,141 +251,89 @@ def normalize_proxy_key(raw: str) -> str:
             # Для нестандартных строк с IPv6/другими неочевидными формами URL
             # достаточно безопасно нормализовать строку вручную.
             without_fragment = value.split("#", 1)[0]
-            return re.sub(r"(?i)([?&;](?:remarks|remark|name|label|tag|n)=)[^&;#]*", "", without_fragment).lower()
+            return re.sub(r"(?i)([?&;](?:remarks|remark|name|label|tag|n|fp)=)[^&;#]*", "", without_fragment).lower()
 
     return value.lower()
 
 
-def load_blacklist_keys(blacklist_path: Path) -> set[str]:
-    blacklist_keys: set[str] = set()
-    if not blacklist_path.exists():
-        return blacklist_keys
-    for line in blacklist_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        clean = line.strip()
-        if not clean:
-            continue
-        key = normalize_proxy_key(clean)
-        if key:
-            blacklist_keys.add(key)
-    return blacklist_keys
+def write_merge_from_pool(store, output_path: Path) -> int:
+    """Пишет merge.txt из пула проверки центральной базы.
 
-
-def dedupe_blacklist_file(blacklist_path: Path) -> None:
-    """Убирает дубликаты серверов из blacklist.txt без учёта тэга."""
-    if not blacklist_path.exists():
-        return
-
-    original_lines = blacklist_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    seen_keys: set[str] = set()
-    unique_lines: list[str] = []
-
-    for line in original_lines:
-        clean = line.strip()
-        if not clean:
-            continue
-        key = normalize_proxy_key(clean)
-        if not key or key in seen_keys:
-            continue
-        seen_keys.add(key)
-        unique_lines.append(clean)
-
-    if unique_lines != [line.strip() for line in original_lines if line.strip()]:
-        blacklist_path.write_text("\n".join(unique_lines), encoding="utf-8")
-
-
-def dedupe_whitelist_file(whitelist_path: Path) -> None:
-    """Убирает дубликаты серверов из whitelist.txt без учёта тэга."""
-    if not whitelist_path.exists():
-        return
-
-    original_lines = whitelist_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    seen_keys: set[str] = set()
-    unique_lines: list[str] = []
-
-    for line in original_lines:
-        clean = line.strip()
-        if not clean:
-            continue
-        key = normalize_proxy_key(clean)
-        if not key or key in seen_keys:
-            continue
-        seen_keys.add(key)
-        unique_lines.append(clean)
-
-    if unique_lines != [line.strip() for line in original_lines if line.strip()]:
-        whitelist_path.write_text("\n".join(unique_lines), encoding="utf-8")
-
-
-def prune_whitelist_by_blacklist(whitelist_path: Path, blacklist_path: Path | None = None) -> int:
-    """Удаляет из whitelist серверы, которые попали в blacklist (не прошли повторную проверку).
-
-    Возвращает количество удалённых строк.
+    Пул = все серверы с excluded=0 (stable < PURGE_STABLE_BELOW уже исключены
+    из базы проверки). Лучшие серверы (высокий stable) идут первыми.
     """
-    if not whitelist_path.exists():
-        return 0
-    blacklist_keys = load_blacklist_keys(blacklist_path) if blacklist_path and blacklist_path.exists() else set()
-    if not blacklist_keys:
-        return 0
-
-    original_lines = whitelist_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    kept: list[str] = []
-    removed = 0
-    for line in original_lines:
-        clean = line.strip()
-        if not clean:
-            continue
-        key = normalize_proxy_key(clean)
-        if key and key in blacklist_keys:
-            removed += 1
-            continue
-        kept.append(clean)
-
-    if removed:
-        whitelist_path.write_text("\n".join(kept), encoding="utf-8")
-    return removed
-
-
-def merge_files(
-    file_paths: list[Path],
-    output_path: Path,
-    blacklist_path: Path | None = None,
-    extra_lines: list[str] | None = None,
-) -> int:
-    """Объединяет все файлы в итоговый merge.txt и удаляет дубликаты только на финальном этапе."""
-    blacklist_keys = load_blacklist_keys(blacklist_path) if blacklist_path else set()
-    seen: set[str] = set()
-    merged: list[str] = []
-    seq_counter = 1
-
-    if extra_lines:
-        for line in extra_lines:
-            clean = str(line).strip()
-            if not clean:
-                continue
-            key = normalize_proxy_key(clean)
-            if not key or key in seen or key in blacklist_keys:
-                continue
-            seen.add(key)
-            merged.append(build_clean_tag(clean, seq_counter=seq_counter))
-            seq_counter += 1
-
-    for file_path in sorted(file_paths):
-        if not file_path.exists():
-            continue
-        for line in file_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            clean = line.strip()
-            if not clean:
-                continue
-            key = normalize_proxy_key(clean)
-            if not key or key in seen or key in blacklist_keys:
-                continue
-            seen.add(key)
-            merged.append(build_clean_tag(clean, seq_counter=seq_counter))
-            seq_counter += 1
-
+    pool = store.check_pool()
+    merged = [row["line"] for row in pool if row["line"]]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(merged), encoding="utf-8")
     return len(merged)
+
+
+def _download_source(idx: int, url: str, download_dir: Path) -> dict:
+    """Скачивает один источник (или пропускает по кэшу). Потокобезопасно.
+
+    Возвращает {idx, path, ok, cached, count, error} — логирование в главном потоке.
+    """
+    file_path = download_dir / f"{idx}.txt"
+    if not should_download(url, file_path):
+        return {"idx": idx, "path": file_path, "ok": True, "cached": True,
+                "count": None, "error": None}
+    try:
+        raw = fetch_text(url)
+        filtered = filter_insecure_configs(raw)
+        save_partial_file(file_path, filtered)
+        try:
+            request = urllib.request.Request(
+                url,
+                method="HEAD",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                    "Accept": "*/*",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=15, context=ssl.create_default_context()) as response:
+                write_cache_metadata(file_path, response.headers.get("ETag"), response.headers.get("Last-Modified"))
+        except Exception:
+            pass
+        return {"idx": idx, "path": file_path, "ok": True, "cached": False,
+                "count": len(filtered.splitlines()), "error": None}
+    except Exception as exc:  # noqa: BLE001
+        return {"idx": idx, "path": file_path, "ok": False, "cached": False,
+                "count": None, "error": exc}
+
+
+def _download_sources_parallel(urls: list[str], download_dir: Path,
+                               *, logger) -> list[Path]:
+    """Параллельно скачивает все источники; возвращает список существующих файлов."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from config.settings import SUB_DOWNLOAD_CONCURRENCY
+
+    results: list[dict] = []
+    workers = max(1, min(int(SUB_DOWNLOAD_CONCURRENCY), len(urls)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_download_source, idx, url, download_dir): idx
+            for idx, url in enumerate(urls, start=1)
+        }
+        for fut in as_completed(futures):
+            results.append(fut.result())
+    results.sort(key=lambda r: r["idx"])
+
+    partial_files: list[Path] = []
+    total = len(urls)
+    for r in results:
+        idx, url_idx = r["idx"], r["idx"]
+        url = urls[url_idx - 1]
+        if r["cached"]:
+            logger.info("[%d/%d] Пропуск: %s (локальный файл актуален)", idx, total, url)
+            partial_files.append(r["path"])
+        elif r["ok"]:
+            logger.info("[%d/%d] Успешно: %s -> %d конфигов", idx, total, url, r["count"])
+            partial_files.append(r["path"])
+        else:
+            logger.error("[%d/%d] Ошибка загрузки %s: %s", idx, total, url, r["error"])
+    return partial_files
 
 
 def build_merge_from_urls(
@@ -395,7 +343,9 @@ def build_merge_from_urls(
     *,
     logger: logging.Logger | None = None,
 ) -> dict[str, object]:
-    """Собирает merge.txt из URL-источников без TCP-проверки и whitelist/blacklist."""
+    """Скачивает подписки, регистрирует серверы в центральной базе (servers.db)
+    и собирает merge.txt из пула проверки базы. Списки экспортируются из базы
+    по фильтру stable (whitelist.txt = stable > порога)."""
     urls_file_path = Path(urls_file).resolve()
     output_path_path = Path(output_path).resolve()
     log_file_path = Path(log_file).resolve() if log_file else None
@@ -419,38 +369,8 @@ def build_merge_from_urls(
         logger.exception("Не удалось прочитать список URL из %s: %s", urls_file_path, exc)
         raise
 
-    logger.info("Загружено %d URL-источников", len(urls))
-    partial_files: list[Path] = []
-
-    for idx, url in enumerate(urls, start=1):
-        file_path = download_dir / f"{idx}.txt"
-        if not should_download(url, file_path):
-            logger.info("[%d/%d] Пропуск: %s (локальный файл актуален)", idx, len(urls), url)
-            partial_files.append(file_path)
-            continue
-
-        logger.info("[%d/%d] Загрузка: %s", idx, len(urls), url)
-        try:
-            raw = fetch_text(url)
-            filtered = filter_insecure_configs(raw)
-            save_partial_file(file_path, filtered)
-            try:
-                request = urllib.request.Request(
-                    url,
-                    method="HEAD",
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-                        "Accept": "*/*",
-                    },
-                )
-                with urllib.request.urlopen(request, timeout=15, context=ssl.create_default_context()) as response:
-                    write_cache_metadata(file_path, response.headers.get("ETag"), response.headers.get("Last-Modified"))
-            except Exception:
-                pass
-            partial_files.append(file_path)
-            logger.info("[%d/%d] Успешно: %s -> %d конфигов", idx, len(urls), url, len(filtered.splitlines()))
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("[%d/%d] Ошибка загрузки %s: %s", idx, len(urls), url, exc)
+    logger.info("Загружено %d URL-источников (параллельная загрузка)", len(urls))
+    partial_files: list[Path] = _download_sources_parallel(urls, download_dir, logger=logger)
 
     if not partial_files:
         logger.warning("Не найдено ни одного валидного промежуточного файла для объединения")
@@ -461,39 +381,59 @@ def build_merge_from_urls(
             "logger": logger,
         }
 
-    blacklist_path = output_path_path.parent / "blacklist.txt"
-    whitelist_path = output_path_path.parent / "whitelist.txt"
-    dedupe_blacklist_file(blacklist_path)
-    dedupe_whitelist_file(whitelist_path)
+    # --- Центральная база: регистрируем всё скачанное и собираем пул проверки ---
+    from config.settings import (
+        SERVERS_DB_FILE,
+        WHITELIST_FILE,
+        WHITELIST_EXPORT_MIN_STABLE,
+    )
+    from script.server_store import ServerStore
 
-    # Серверы, которые не прошли повторную проверку (попали в blacklist),
-    # убираем из whitelist, чтобы они не возвращались в merge.txt.
-    pruned = prune_whitelist_by_blacklist(whitelist_path, blacklist_path)
-    if pruned:
-        logger.info("Из whitelist удалено %d серверов, не прошедших повторную проверку", pruned)
+    store = ServerStore(SERVERS_DB_FILE)
 
-    merged_whitelist_path = output_path_path.parent / "last_whitelist.txt"
-    merged_whitelist: list[str] = []
-    if whitelist_path.exists():
-        merged_whitelist.extend(
-            [line.strip() for line in whitelist_path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
-        )
+    source_lines: list[str] = []
+    seen_keys: set[str] = set()
+    for file_path in sorted(partial_files):
+        if not file_path.exists():
+            continue
+        for line in file_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            clean = line.strip()
+            if not clean:
+                continue
+            key = normalize_proxy_key(clean)
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            source_lines.append(clean)
 
-    logger.info("Начало объединения %d файлов в %s", len(partial_files), output_path_path)
-    merged_count = merge_files(partial_files, output_path_path, blacklist_path=blacklist_path, extra_lines=merged_whitelist)
+    upsert_res = store.upsert_lines(source_lines)
+    logger.info(
+        "База серверов: добавлено %d новых, обновлено %d известных (источников строк: %d)",
+        upsert_res["added"], upsert_res["updated"], len(source_lines),
+    )
 
-    if merged_whitelist:
-        merged_whitelist_path.write_text("\n".join(merged_whitelist), encoding="utf-8")
-        logger.info("Whitelist загружен в %s и очищен от дубликатов", merged_whitelist_path)
+    logger.info("Сборка %s из пула проверки базы", output_path_path)
+    merged_count = write_merge_from_pool(store, output_path_path)
 
-    if blacklist_path.exists():
-        logger.info("Черный список учтён: %d запрещённых прокси удалено из итогового файла", len(load_blacklist_keys(blacklist_path)))
-    logger.info("Итог: объединено %d уникальных конфигов в %s", merged_count, output_path_path)
+    # Экспорт подтверждённых серверов (stable > порога) в whitelist.txt —
+    # файловая проекция базы для внешних потребителей.
+    exported = store.export_to_file(WHITELIST_FILE, min_stable=WHITELIST_EXPORT_MIN_STABLE)
+    logger.info(
+        "Экспорт whitelist.txt из базы: %d серверов со stable > %d",
+        exported, WHITELIST_EXPORT_MIN_STABLE,
+    )
+    db_stats = store.stats()
+    logger.info(
+        "Итог: пул проверки %d конфигов (база: %d всего, %d исключено) в %s",
+        merged_count, db_stats["total"], db_stats["excluded"], output_path_path,
+    )
     logger.info("Завершено успешно")
     return {
         "output_path": str(output_path_path),
         "merged_count": merged_count,
+        "db": db_stats,
+        "upsert": upsert_res,
+        "whitelist_exported": exported,
         "partial_files": [str(path) for path in partial_files],
         "logger": logger,
     }
-

@@ -8,10 +8,26 @@ UTILS = ROOT / "utils"
 
 from flask import Flask, jsonify, request, render_template_string
 
-from config.settings import URLTEST_TEMPLATE, WHITELIST_FILE, FLASK_HOST, FLASK_PORT
+from config.settings import (
+    URLTEST_TEMPLATE,
+    WHITELIST_FILE,
+    FLASK_HOST,
+    FLASK_PORT,
+    SERVERS_DB_FILE,
+    WHITELIST_EXPORT_MIN_STABLE,
+)
+from functools import lru_cache
+
+from script.server_store import ServerStore
 from script import core as core_mod
 
 app = Flask(__name__)
+
+
+@lru_cache(maxsize=1)
+def _get_store() -> ServerStore:
+    """Один экземпляр хранилища на процесс: schema/clamp выполняются однократно."""
+    return ServerStore(SERVERS_DB_FILE)
 
 HTML_PAGE = """
 <!doctype html>
@@ -427,10 +443,50 @@ def api_template(name):
 
 @app.route("/api/whitelist")
 def api_whitelist():
+    """Подтверждённые серверы из центральной базы (stable > порога).
+
+    Формат ответа прежний — построчный URI-список; сортировка по stable DESC.
+    """
+    try:
+        store = _get_store()
+        lines = store.export_lines(min_stable=WHITELIST_EXPORT_MIN_STABLE)
+        if lines:
+            return "\n".join(lines), 200, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception:
+        app.logger.exception("server store read failed; falling back to file")
     whitelist_path = Path(WHITELIST_FILE)
     if not whitelist_path.exists():
         return jsonify({"error": "Whitelist not found"}), 404
     return whitelist_path.read_text(encoding="utf-8")
+
+
+@app.route("/api/servers/stats")
+def api_servers_stats():
+    """Статистика центральной базы: зоны stable, активные/исключённые."""
+    try:
+        store = _get_store()
+        return jsonify(store.stats())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/servers")
+def api_servers():
+    """Выборка из базы по фильтру stable: ?min_stable=&max_stable=&limit=.
+
+    Примеры:
+      /api/servers?min_stable=1  -> stable > 1  (рабочие серверы для списков)
+      /api/servers?max_stable=0  -> stable < 0  (мёртвые — удалены из проверки)
+    """
+    try:
+        store = _get_store()
+        min_stable = request.args.get("min_stable", type=int)
+        max_stable = request.args.get("max_stable", type=int)
+        limit = request.args.get("limit", type=int)
+        lines = store.export_lines(min_stable=min_stable, max_stable=max_stable, limit=limit)
+        return jsonify({"count": len(lines), "servers": lines})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/gensub", methods=["GET", "POST"])

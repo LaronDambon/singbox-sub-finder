@@ -39,10 +39,11 @@ def run_debug_generation(merge_lines, *, template=URLTEST_TEMPLATE, output_dir=S
 
 def orchestrate_default_run():
     """Default no-argument run:
-    1) Download sources and build `source/merge.txt`
-    2) Ensure blacklist is applied during merge
-    3) Parse servers into temporary config using settings.URLTEST_TEMPLATE
-    4) Run urltest ping cycles and produce whitelist/blacklist outputs
+    1) Скачать источники и зарегистрировать серверы в центральной базе (source/servers.db)
+    2) Собрать source/merge.txt из пула проверки базы (excluded-серверы не входят)
+    3) Прогнать urltest-циклы: stable +/- пишется в базу
+    4) Экспорт списков из базы: whitelist.txt = stable > порога;
+       серверы со stable < PURGE_STABLE_BELOW исключаются из проверочного списка
     """
     urls_file = URLS_FILE
     output_merge = MERGE_FILE
