@@ -1,27 +1,46 @@
-"""Проверка страны через скоростной тест (аналог Throne).
+"""Определение страны сервера через локальный sing-box (по мотивам Throne).
 
-Механизм (как в Throne/core/server/test_utils/speedtest_utils.go + common.go):
-  1. Для каждого прокси строится sing-box конфиг с ОДНИМ outbound (сам прокси)
-     и локальным mixed-inbound на свободном порту.
-  2. sing-box запускается, и весь трафик через этот локальный inbound идёт
-     через проверяемый прокси (аналог dialer'а в Go).
-  3. Через прокси запрашивается список серверов speedtest.net
-     (https://www.speedtest.net/api/js/servers) и каждый сервер "пингуется"
-     HTTP-запросом к <url_dir>/latency.txt (как speedtest-go HTTPPing).
-  4. Выбирается сервер с наименьшей latency — его страна считается страной
-     исходящего соединения прокси (res.ServerCountry в Throne).
+Исследование Throne (throneproj/Throne, core/server/test_utils/{common,speedtest_utils}.go):
+  * страна для списка конфигов определяется методом countryTest: это ТОЛЬКО
+    getSpeedtestServer — получить список серверов speedtest через прокси и
+    выбрать ближайший по HTTP-латентности; download/upload не выполняются;
+  * ключ к скорости: используется ОДИН уже запущенный sing-box со всеми
+    outbound'ами, и HTTP-client каждого теста дозванивается напрямую через
+    объект outbound (DialContext), без процесса на конфиг и без локального
+    HTTP-proxy хопа;
+  * параллелизм — горутины с семафором (countryConcurrency, по умолчанию 5).
 
-Это косвенный метод геолокации: страна определяется не по IP, а по тому,
-к какому ближайшему/самому быстрому серверу speedtest можно достучаться
-через данный прокси.
+Почему прежняя версия здесь была медленной и давала ~60% успеха:
+  * отдельный процесс sing-box на КАЖДЫЙ прокси (старт до 8с + teardown);
+  * traffic шёл через mixed-inbound как через HTTP-прокси (лишний слой);
+  * список серверов тянулся с www.speedtest.net, который агрессивно
+    блокирует датацентровые IP (403) — источник большинства отказов.
+
+Реализация здесь повторяет семантику Throne средствами Python:
+  * ОДИН процесс sing-box на батч: N mixed-inbound'ов (127.0.0.1:порт_i),
+    N outbound'ов и правило маршрутизации inbound_i -> outbound_i,
+    т.е. каждый локальный порт жёстко привязан к своему прокси;
+  * потоки Python одновременно стучатся в свои порты — эквивалент
+    параллельных DialContext из Throne;
+  * вместо speedtest.net страна определяется одним лёгким запросом через
+    цепочку geo-эндпоинтов: Cloudflare cdn-cgi/trace -> api.ip.sb/geoip ->
+    ipinfo.io/json. Это крошечные ответы на anycast-инфраструктуре,
+    почти не дающие отказов; ISO-код сразу превращается в эмодзи флага.
+
+CLI:
+  python -m script.country_check '<proxy_line>'
 """
+
+from __future__ import annotations
 
 import json
 import os
 import re
+import socket
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -29,46 +48,109 @@ import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 
-from config.settings import SING_BOX_PATH, URLTEST_TEMPLATE
+from config.settings import (
+    SING_BOX_PATH,
+    COUNTRYTEST_TEMPLATE,
+    COUNTRY_CHECK_TIMEOUT,
+)
+
 from script.logger_utils import get_project_logger
 
 LOGGER = get_project_logger("country_check")
 
-# Таймаут получения списка серверов (аналог FetchServersTimeout = 8s в Throne).
-FETCH_SERVERS_TIMEOUT = 8.0
-# Таймаут одного HTTP-пинга до сервера speedtest.
-PING_TIMEOUT = 4.0
-# Сколько серверов пинговать (берём первые N по расстоянию, как в speedtest-go).
-MAX_PING_SERVERS = 20
-# Таймаут работы sing-box для одного прокси.
-SINGBOX_TIMEOUT = 25.0
+# --- Параметры probing -------------------------------------------------------
+# Таймауты одного geo-запроса: (connect, read), сек.
+PROBE_CONNECT_TIMEOUT = 4.0
+PROBE_READ_TIMEOUT = float(COUNTRY_CHECK_TIMEOUT) if COUNTRY_CHECK_TIMEOUT else 6.0
+# Ожидание готовности inbound-портов при старте sing-box, сек.
+STARTUP_WAIT_SECONDS = 10.0
+# Максимум inbound'ов (и прокси) в одном процессе sing-box.
+MAX_BATCH_INBOUNDS = 100
 
-# Кэш: страна по "нормализованному ключу" прокси, чтобы не перепроверять
-# одинаковые серверы в рамках одного запуска.
-_country_cache: dict[str, str | None] = {}
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 
-def _find_free_port() -> int:
-    import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+# --- Geo-эндпоинты -----------------------------------------------------------
+# Каждый возвращает ISO-код страны (2 буквы) или None. Пробуются по порядку.
+def _parse_cloudflare_trace(resp: requests.Response) -> str | None:
+    # Текст вида "fl=...\nloc=DE\n..."
+    m = re.search(r"^loc=([A-Za-z]{2})\s*$", resp.text, re.MULTILINE)
+    return m.group(1).upper() if m else None
+
+
+def _parse_ip_sb(resp: requests.Response) -> str | None:
+    data = resp.json()
+    code = data.get("country_code") if isinstance(data, dict) else None
+    return str(code).upper() if isinstance(code, str) and len(code) == 2 else None
+
+
+def _parse_ipinfo(resp: requests.Response) -> str | None:
+    data = resp.json()
+    code = data.get("country") if isinstance(data, dict) else None
+    return str(code).upper() if isinstance(code, str) and len(code) == 2 else None
+
+
+GEO_PROBES: list[tuple[str, str, object]] = [
+    ("cloudflare-trace", "https://www.cloudflare.com/cdn-cgi/trace", _parse_cloudflare_trace),
+    ("ip.sb", "https://api.ip.sb/geoip", _parse_ip_sb),
+    ("ipinfo.io", "https://ipinfo.io/json", _parse_ipinfo),
+]
+
+_ISO_RE = re.compile(r"^[A-Za-z]{2}$")
+
+
+def iso_to_emoji(code: str | None) -> str | None:
+    """ISO-3166 alpha-2 -> эмодзи флага (regional indicator symbols)."""
+    if not code or not _ISO_RE.match(code):
+        return None
+    base = ord("A")
+    return "".join(chr(0x1F1E6 + ord(ch) - base) for ch in code.upper())
+
+
+def country_to_emoji(country_name: str | None) -> str | None:
+    """Эмодзи флага по ISO-коду ИЛИ текстовому названию страны.
+
+    Совместимость со старым API: новые geo-пробы возвращают ISO-код
+    (срабатывает быстрый путь), а для текстовых названий, как и раньше,
+    ищем совпадение в regex_patterns из utils.tool.
+    """
+    if not country_name:
+        return None
+    stripped = country_name.strip()
+    if _ISO_RE.match(stripped):
+        return iso_to_emoji(stripped)
+    try:
+        from utils import tool
+
+        for country_code, pattern in tool.regex_patterns.items():
+            if pattern.search(country_name):
+                return country_code
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+# --- Кэш в рамках одного запуска --------------------------------------------
+_country_cache: dict[str, dict | None] = {}
+_cache_lock = threading.Lock()
 
 
 def _normalize_key(raw_line: str) -> str:
     """Стабильный ключ прокси без учёта имени/тэга (для кэша)."""
-    line = raw_line.strip()
-    if "#" in line:
-        line = line.split("#", 1)[0].strip()
-    return line.lower()
+    from script.downloader import normalize_proxy_key
+
+    return normalize_proxy_key(raw_line)
 
 
-def _build_single_config(proxy_line: str, inbound_port: int) -> dict | None:
-    """Строит sing-box конфиг с одним outbound (прокси) и mixed-inbound.
+# --- Разбор прокси и сборка батч-конфига -------------------------------------
+def _parse_outbound(proxy_line: str, index: int, used_tags: set[str]):
+    """Парсит строку прокси в outbound-dict sing-box (через парсеры core).
 
-    Переиспользует парсеры и сборку конфига из script.core.
-    Возвращает dict конфига или None, если прокси не удалось распарсить.
+    Возвращает (outbound|None, error|None). WireGuard выносится отдельно:
+    новые версии sing-box требуют его в "endpoints".
     """
     from script import core
 
@@ -81,276 +163,339 @@ def _build_single_config(proxy_line: str, inbound_port: int) -> dict | None:
 
         nodes = core.get_nodes(proxy_line)
         if not nodes:
-            return None
+            return None, "не удалось распарсить прокси"
         node = nodes[0]
         if not isinstance(node, dict):
-            return None
+            return None, "не удалось распарсить прокси"
 
-        template_path = ROOT / URLTEST_TEMPLATE
-        template_data = core.load_template(str(template_path))
-        config = core.build_singbox_config_from_nodes(template_data, [node])
-
-        # Единый inbound на заданном порту.
-        for inbound in config.get("inbounds", []):
-            if inbound.get("type") == "mixed" and inbound.get("listen") == "127.0.0.1":
-                inbound["listen_port"] = inbound_port
-                break
-        return config
+        tag = str(node.get("tag") or "").strip() or f"c{index}"
+        base_tag = tag
+        n = 0
+        while tag in used_tags:
+            n += 1
+            tag = f"{base_tag}~{n}"
+        used_tags.add(tag)
+        node["tag"] = tag
+        return node, None
+    except Exception as exc:  # noqa: BLE001
+        return None, f"ошибка разбора: {exc}"
     finally:
         os.chdir(old_cwd)
         core.providers = previous_providers
 
 
-def _run_singbox(config: dict, inbound_port: int, timeout: float = SINGBOX_TIMEOUT) -> bool:
-    """Запускает sing-box с данным конфигом и держит его, пока жив.
+def _build_batch_config(entries: list[dict], template_path: Path) -> dict:
+    """Собирает конфиг: N inbound->N outbound c правилами маршрутизации.
 
-    Возвращает True, если процесс успешно стартовал (порт слушается).
+    entries: [{index, port, outbound}]
     """
-    executable = SING_BOX_PATH
-    if not os.path.exists(executable):
-        raise FileNotFoundError(f"Не найден sing-box по пути: {executable}")
+    base = json.loads(Path(template_path).read_text(encoding="utf-8"))
 
-    config_path = ROOT / "source" / "tests" / f"country_{inbound_port}.json"
+    inbounds: list[dict] = []
+    outbounds: list[dict] = []
+    endpoints: list[dict] = []
+    rules: list[dict] = []
+
+    for e in entries:
+        inbound_tag = f"cin-{e['index']}"
+        inbounds.append({
+            "tag": inbound_tag,
+            "type": "mixed",
+            "listen": "127.0.0.1",
+            "listen_port": e["port"],
+        })
+        ob = e["outbound"]
+        target_tag = ob["tag"]
+        if ob.get("type") == "wireguard":
+            endpoints.append(ob)
+        else:
+            outbounds.append(ob)
+        rules.append({"inbound": [inbound_tag], "outbound": target_tag})
+
+    outbounds.append({"tag": "direct", "type": "direct"})
+    rules.append({"protocol": "dns", "outbound": "direct"})
+
+    route = {
+        "default_domain_resolver": (base.get("route") or {}).get(
+            "default_domain_resolver", {"server": "dns-google-v4"}
+        ),
+        "auto_detect_interface": True,
+        "final": "direct",
+        "rules": rules,
+    }
+
+    config: dict = {
+        "log": {"level": "error", "timestamp": False},
+        "dns": base.get("dns"),
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "route": route,
+    }
+    if endpoints:
+        config["endpoints"] = endpoints
+    return config
+
+
+def _reserve_ports(count: int) -> list[int]:
+    """Подбирает count свободных TCP-портов на 127.0.0.1."""
+    ports: list[int] = []
+    # Берём базовый свободный порт и проверяем соседей связыванием.
+    base_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    base_sock.bind(("127.0.0.1", 0))
+    candidate = base_sock.getsockname()[1]
+    base_sock.close()
+    used: set[int] = set()
+    while len(ports) < count:
+        if candidate not in used:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                s.bind(("127.0.0.1", candidate))
+                ports.append(candidate)
+                used.add(candidate)
+            except OSError:
+                pass
+            finally:
+                s.close()
+        candidate += 1
+    return ports
+
+
+def _start_singbox(config: dict, config_path: Path):
+    """Запускает sing-box с батч-конфигом. Возвращает процесс или None."""
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with config_path.open("w", encoding="utf-8") as fh:
-        json.dump(config, fh, ensure_ascii=False, indent=2)
-
+        json.dump(config, fh, ensure_ascii=False)
     kwargs = {
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
         "stdin": subprocess.DEVNULL,
-        "text": True,
     }
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-    proc = subprocess.Popen([executable, "run", "-c", str(config_path)], **kwargs)
-
-    # Ждём, пока inbound-порт начнёт слушаться.
-    import socket
-    deadline = time.monotonic() + 8.0
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            return False
-        try:
-            with socket.create_connection(("127.0.0.1", inbound_port), timeout=0.5):
-                return True
-        except OSError:
-            time.sleep(0.2)
-    proc.terminate()
     try:
-        proc.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-    return False
-
-
-def _fetch_servers(proxy_url: str, timeout: float = FETCH_SERVERS_TIMEOUT) -> list[dict]:
-    """Запрашивает список серверов speedtest.net через прокси.
-
-    Аналог getSpeedtestServer -> FetchServerListContext в Throne.
-    """
-    proxies = {"http": proxy_url, "https": proxy_url}
-    resp = requests.get(
-        "https://www.speedtest.net/api/js/servers",
-        proxies=proxies,
-        timeout=timeout,
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if not isinstance(data, list):
-        return []
-    return [s for s in data if isinstance(s, dict) and s.get("url")]
-
-
-def _ping_server(proxy_url: str, server: dict, timeout: float = PING_TIMEOUT) -> float | None:
-    """HTTP-пинг сервера speedtest через прокси (аналог HTTPPing в speedtest-go).
-
-    Пингуем <url_dir>/latency.txt и возвращаем latency в мс.
-    """
-    url = server.get("url", "")
-    try:
-        parsed = urlparse(url)
-        base = f"{parsed.scheme}://{parsed.netloc}"
-        ping_url = base + "/latency.txt"
-    except Exception:
-        return None
-
-    proxies = {"http": proxy_url, "https": proxy_url}
-    start = time.monotonic()
-    try:
-        resp = requests.get(
-            ping_url,
-            proxies=proxies,
-            timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        if resp.status_code != 200:
-            return None
-        return (time.monotonic() - start) * 1000.0
-    except Exception:
-        return None
-
-
-def check_country(proxy_line: str, *, timeout: float = SINGBOX_TIMEOUT) -> dict:
-    """Проверяет страну прокси через скоростной тест (аналог countryTest в Throne).
-
-    Returns:
-        dict с ключами: 'country' (название страны), 'country_code' (2-буквенный код),
-        'server_name', 'latency_ms', 'error'.
-    """
-    result = {
-        "country": None,
-        "country_code": None,
-        "server_name": None,
-        "latency_ms": None,
-        "error": None,
-    }
-
-    key = _normalize_key(proxy_line)
-    if key in _country_cache:
-        cached = _country_cache[key]
-        if cached:
-            result["country"] = cached
-        return result
-
-    inbound_port = _find_free_port()
-    proxy_url = f"http://127.0.0.1:{inbound_port}"
-
-    config = _build_single_config(proxy_line, inbound_port)
-    if config is None:
-        result["error"] = "не удалось распарсить прокси"
-        _country_cache[key] = None
-        return result
-
-    proc = None
-    try:
-        executable = SING_BOX_PATH
-        config_path = ROOT / "source" / "tests" / f"country_{inbound_port}.json"
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        with config_path.open("w", encoding="utf-8") as fh:
-            json.dump(config, fh, ensure_ascii=False, indent=2)
-
-        kwargs = {
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
-            "stdin": subprocess.DEVNULL,
-        }
-        if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-        proc = subprocess.Popen([executable, "run", "-c", str(config_path)], **kwargs)
-
-        # Ждём готовности inbound-порта.
-        import socket
-        ready = False
-        deadline = time.monotonic() + 8.0
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                result["error"] = "sing-box завершился при старте"
-                _country_cache[key] = None
-                return result
-            try:
-                with socket.create_connection(("127.0.0.1", inbound_port), timeout=0.5):
-                    ready = True
-                    break
-            except OSError:
-                time.sleep(0.2)
-        if not ready:
-            result["error"] = "таймаут ожидания inbound-порта"
-            _country_cache[key] = None
-            return result
-
-        # 1) Получаем список серверов через прокси.
-        servers = _fetch_servers(proxy_url)
-        if not servers:
-            result["error"] = "не удалось получить список серверов speedtest"
-            _country_cache[key] = None
-            return result
-
-        # 2) Пингуем серверы через прокси, выбираем лучший (мин. latency).
-        best_server = None
-        best_latency = None
-        for server in servers[:MAX_PING_SERVERS]:
-            latency = _ping_server(proxy_url, server)
-            if latency is None:
-                continue
-            if best_latency is None or latency < best_latency:
-                best_latency = latency
-                best_server = server
-
-        if best_server is None:
-            result["error"] = "ни один сервер speedtest не ответил через прокси"
-            _country_cache[key] = None
-            return result
-
-        result["country"] = best_server.get("country")
-        result["server_name"] = best_server.get("name")
-        result["latency_ms"] = round(best_latency, 1) if best_latency is not None else None
-        _country_cache[key] = result["country"]
-        return result
+        return subprocess.Popen([str(SING_BOX_PATH), "run", "-c", str(config_path)], **kwargs)
     except Exception as exc:  # noqa: BLE001
-        result["error"] = str(exc)
-        _country_cache[key] = None
-        return result
-    finally:
-        if proc is not None and proc.poll() is None:
+        LOGGER.error("Не удалось запустить sing-box: %s", exc)
+        return None
+
+
+def _ports_ready(ports: list[int], deadline_seconds: float) -> bool:
+    import time as _time
+
+    deadline = _time.monotonic() + deadline_seconds
+    remaining = set(ports)
+    while _time.monotonic() < deadline and remaining:
+        for p in list(remaining):
+            try:
+                with socket.create_connection(("127.0.0.1", p), timeout=0.35):
+                    remaining.discard(p)
+            except OSError:
+                pass
+        if remaining:
+            time.sleep(0.15)
+    return not remaining
+
+
+# --- Geo-probe через конкретный локальный порт -------------------------------
+def _probe_port(port: int) -> dict:
+    """Определяет страну выхода через локальный порт-прокси одного outbound'а."""
+    result = {"country": None, "country_code": None, "emoji": None,
+              "server_name": None, "latency_ms": None, "error": None}
+    proxies = {"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"}
+    session = requests.Session()
+    session.trust_env = False  # игнорировать системные HTTP(S)_PROXY
+    last_error = "неизвестная ошибка"
+    for name, url, parser in GEO_PROBES:
+        start = time.monotonic()
+        try:
+            resp = session.get(
+                url,
+                proxies=proxies,
+                timeout=(PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT),
+                headers={"User-Agent": BROWSER_UA},
+            )
+            if resp.status_code != 200:
+                last_error = f"{name}: HTTP {resp.status_code}"
+                continue
+            code = parser(resp)
+            if not code:
+                last_error = f"{name}: код страны не найден в ответе"
+                continue
+            elapsed = round((time.monotonic() - start) * 1000.0, 1)
+            result.update({
+                "country": code,
+                "country_code": code,
+                "emoji": iso_to_emoji(code),
+                "server_name": name,
+                "latency_ms": elapsed,
+            })
+            return result
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"{name}: {exc}"
+    result["error"] = last_error
+    return result
+
+
+# --- Батч-исполнение ----------------------------------------------------------
+def _run_batch(items: list[tuple[str, int]], results: dict[str, dict],
+               concurrency: int, depth: int = 0) -> None:
+    """items: [(line, index)] — проверяет батч одним процессом sing-box.
+
+    При инфраструктурном сбое старта делит батч пополам (рекурсия), чтобы
+    один «ядовитый» конфиг не валил остальные.
+    """
+    if not items:
+        return
+
+    used_tags: set[str] = set()
+    entries: list[dict] = []
+    for line, idx in items:
+        outbound, err = _parse_outbound(line, idx, used_tags)
+        if err:
+            results[line] = {"country": None, "country_code": None, "emoji": None,
+                             "server_name": None, "latency_ms": None, "error": err}
+            continue
+        entries.append({"index": idx, "port": 0, "outbound": outbound})
+
+    active = [e for e in entries]
+    if not active:
+        return
+
+    ports = _reserve_ports(len(active))
+    for e, p in zip(active, ports):
+        e["port"] = p
+
+    config = _build_batch_config(active, ROOT / COUNTRYTEST_TEMPLATE)
+    config_path = ROOT / "source" / "tests" / f"country_batch_{items[0][1]}_{len(items)}.json"
+    proc = _start_singbox(config, config_path)
+
+    started_ok = False
+    if proc is not None and proc.poll() is None:
+        started_ok = _ports_ready([e["port"] for e in active], STARTUP_WAIT_SECONDS)
+
+    if not started_ok:
+        if proc is not None:
             proc.terminate()
             try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
+                proc.wait(timeout=3)
+            except Exception:  # noqa: BLE001
                 proc.kill()
+        try:
+            config_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if len(items) > 1 and depth < 8:
+            mid = len(items) // 2
+            LOGGER.warning(
+                "Батч из %d прокси не стартовал, делю пополам (%d + %d)",
+                len(items), mid, len(items) - mid,
+            )
+            _run_batch(items[:mid], results, concurrency, depth + 1)
+            _run_batch(items[mid:], results, concurrency, depth + 1)
+        else:
+            for line, _ in items:
+                if line not in results:
+                    results[line] = {"country": None, "country_code": None, "emoji": None,
+                                     "server_name": None, "latency_ms": None,
+                                     "error": "sing-box не смог обработать этот конфиг"}
+        return
+
+    try:
+        # Соответствие line<->port по индексу из items.
+        port_by_index = {e["index"]: e["port"] for e in active}
+        pairs = [(line, port_by_index[idx]) for line, idx in items if idx in port_by_index]
+
+        workers = max(1, min(concurrency, len(pairs)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_probe_port, p): line for line, p in pairs}
+            for fut in as_completed(futures):
+                line = futures[fut]
+                results[line] = fut.result()
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except Exception:  # noqa: BLE001
+            proc.kill()
+        try:
+            config_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
-def country_to_emoji(country_name: str | None) -> str | None:
-    """Преобразует название страны в эмодзи-флаг через regex_patterns из tool.
+def batch_country_check(proxy_lines: list[str], *, concurrency: int | None = None,
+                        batch_size: int = MAX_BATCH_INBOUNDS) -> dict[str, dict]:
+    """Определяет страну для списка прокси.
 
-    Возвращает эмодзи страны или None, если не удалось сопоставить.
+    Возвращает dict {proxy_line: результат-словарь} с ключами:
+    country, country_code, emoji, server_name, latency_ms, error.
     """
-    if not country_name:
-        return None
-    from utils import tool
-    for country_code, pattern in tool.regex_patterns.items():
-        if pattern.search(country_name):
-            return country_code
-    return None
+    from config.settings import COUNTRY_CHECK_CONCURRENCY
 
+    if concurrency is None:
+        concurrency = COUNTRY_CHECK_CONCURRENCY
+    concurrency = max(1, int(concurrency))
 
-def batch_country_check(proxy_lines: list[str], *, concurrency: int = 4) -> dict[str, dict]:
-    """Проверяет страну для списка прокси параллельно.
-
-    Returns:
-        dict {proxy_line: result_dict}
-    """
     results: dict[str, dict] = {}
-    lock = threading.Lock()
-    index = 0
-    index_lock = threading.Lock()
+    pending: list[str] = []
+    seen_keys: set[str] = set()
 
-    def worker():
-        nonlocal index
-        while True:
-            with index_lock:
-                if index >= len(proxy_lines):
-                    return
-                i = index
-                index += 1
-            line = proxy_lines[i]
-            res = check_country(line)
-            with lock:
-                results[line] = res
+    with _cache_lock:
+        for raw in proxy_lines:
+            line = str(raw).strip()
+            if not line:
+                continue
+            key = _normalize_key(line)
+            if key in _country_cache:
+                cached = _country_cache[key]
+                if cached is not None:
+                    results[line] = dict(cached)
+                else:
+                    results[line] = {"country": None, "country_code": None, "emoji": None,
+                                     "server_name": None, "latency_ms": None,
+                                     "error": "нет результата (кэш запуска)"}
+                continue
+            seen_keys.add(key)
+            pending.append(line)
 
-    threads = [threading.Thread(target=worker, daemon=True) for _ in range(max(1, concurrency))]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    if not pending:
+        return results
+
+    indexed = [(line, i) for i, line in enumerate(pending)]
+    total_batches = (len(indexed) + batch_size - 1) // batch_size
+    for bi, start in enumerate(range(0, len(indexed), batch_size)):
+        chunk = indexed[start:start + batch_size]
+        LOGGER.info(
+            "Country batch %d/%d: %d прокси в одном процессе sing-box (concurrency=%d)",
+            bi + 1, total_batches, len(chunk), concurrency,
+        )
+        batch_started = time.monotonic()
+        _run_batch(chunk, results, concurrency)
+        LOGGER.info("Country batch %d/%d завершён за %.2fs", bi + 1, total_batches, time.monotonic() - batch_started)
+
+    # Наполняем кэш успешными результатами.
+    with _cache_lock:
+        for line in pending:
+            res = results.get(line)
+            key = _normalize_key(line)
+            if res and res.get("country"):
+                _country_cache[key] = dict(res)
+
     return results
+
+
+def check_country(proxy_line: str) -> dict:
+    """Совместимость: страна одного прокси (обёртка над батчем из 1)."""
+    res_map = batch_country_check([proxy_line])
+    return res_map.get(proxy_line.strip()) or {
+        "country": None, "country_code": None, "emoji": None,
+        "server_name": None, "latency_ms": None, "error": "нет результата",
+    }
 
 
 if __name__ == "__main__":
     import sys
+
     if len(sys.argv) < 2:
         print("Использование: python -m script.country_check '<proxy_line>'")
         sys.exit(1)
