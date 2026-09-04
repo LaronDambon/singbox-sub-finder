@@ -30,6 +30,48 @@ INSECURE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Значения finger-print, при которых sing-box отвергает весь батч конфигов.
+# В Xray/v2rayN 'unsafe' отключает проверку отпечатка, но в sing-box uTLS
+# принимает только конкретные имена ('chrome', 'firefox', ...). 'unsafe' не
+# валиден -> sing-box падает с ошибкой и выбрасывает ВСЕ конфиги в батче,
+# включая рабочие. Такие серверы вырезаем на этапе скачивания/объединения.
+FP_UNSAFE_PATTERN = re.compile(
+    r'(?:^|[?&;])(?:fp|fingerprint)=(?:unsafe|none|disabled)(?:[&;#]|[?#]|$)',
+    re.IGNORECASE,
+)
+
+
+def has_unsafe_fingerprint(line: str) -> bool:
+    """True, если конфиг задаёт TLS-отпечаток 'unsafe'/'none'/'disabled'.
+
+    Проверяет query-параметры (fp, fingerprint) в URI, включая URL-кодировку,
+    и поле 'fp'/'client-fingerprint' внутри base64-конфига vmess://.
+    """
+    decoded = urllib.parse.unquote(html.unescape(line))
+
+    # 1) Query-параметр fp / fingerprint с unsafe-значением.
+    if FP_UNSAFE_PATTERN.search(decoded):
+        return True
+
+    # 2) vmess:// — fingerprint лежит внутри base64-закодированного JSON.
+    if decoded.lower().startswith("vmess://"):
+        try:
+            encoded = decoded[8:].split("#", 1)[0].split("?", 1)[0]
+            rem = len(encoded) % 4
+            if rem:
+                encoded += "=" * (4 - rem)
+            payload = base64.b64decode(encoded, validate=False).decode("utf-8", errors="ignore")
+            obj = json.loads(payload or "{}")
+            if isinstance(obj, dict):
+                for key in ("fp", "fingerprint", "client-fingerprint", "client_fingerprint"):
+                    val = obj.get(key)
+                    if isinstance(val, str) and val.strip().lower() in {"unsafe", "none", "disabled"}:
+                        return True
+        except Exception:
+            pass
+
+    return False
+
 
 def fetch_text(url: str, timeout: int = 15, retries: int = 3) -> str:
     """Скачивает текст по URL с небольшими повторами."""
@@ -191,8 +233,9 @@ def filter_insecure_configs(data: str) -> str:
         if not clean.lower().startswith(PROTOCOL_PREFIXES):
             continue
         decoded = urllib.parse.unquote(html.unescape(clean))
-        if not INSECURE_PATTERN.search(decoded):
-            result.append(clean)
+        if INSECURE_PATTERN.search(decoded) or has_unsafe_fingerprint(decoded):
+            continue
+        result.append(clean)
     return "\n".join(result)
 
 
@@ -263,7 +306,12 @@ def write_merge_from_pool(store, output_path: Path) -> int:
     из базы проверки). Лучшие серверы (высокий stable) идут первыми.
     """
     pool = store.check_pool()
-    merged = [row["line"] for row in pool if row["line"]]
+    # Дополнительно вырезаем серверы с insecure-fingerprint (fp=unsafe и т.п.),
+    # которые могли попасть в базу из старых кешей/до этого фикса.
+    merged = [
+        row["line"] for row in pool
+        if row["line"] and not has_unsafe_fingerprint(row["line"])
+    ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(merged), encoding="utf-8")
     return len(merged)
@@ -399,6 +447,10 @@ def build_merge_from_urls(
         for line in file_path.read_text(encoding="utf-8", errors="replace").splitlines():
             clean = line.strip()
             if not clean:
+                continue
+            # Пропускаем серверы с insecure-fingerprint (fp=unsafe и т.п.) —
+            # они ломают батч проверки, потому что sing-box их не принимает.
+            if has_unsafe_fingerprint(clean):
                 continue
             key = normalize_proxy_key(clean)
             if not key or key in seen_keys:

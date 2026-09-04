@@ -5,6 +5,13 @@ def parse(data):
     param = data[5:]
     if not param or param.isspace():
         return None
+    # Строки ss://...?security=reality&pbk=...&flow=...&sid=... — это на самом
+    # деле VLESS-Reality с ошибочным префиксом ss:// (у shadowsocks таких
+    # параметров нет). Строить из них ложный shadowsocks-узел нельзя:
+    # пропускаем как невалидные.
+    _lower = data.lower()
+    if 'reality' in _lower or 'pbk=' in _lower or 'sid=' in _lower or 'flow=' in _lower:
+        return None
     node = {
         'tag':tool.genName()+'_shadowsocks',
         'type':'shadowsocks',

@@ -28,6 +28,10 @@ from config.settings import (
     COUNTRY_CHECK_ENABLED,
     COUNTRY_CHECK_CONCURRENCY,
     COUNTRY_CHECK_TIMEOUT,
+    DEPLOY_ENABLED,
+    GH_DEPLOY_REPO,
+    DEPLOY_TEMPLATE,
+    DEPLOY_PATH,
 )
 
 from utils import tool
@@ -316,6 +320,12 @@ def run_debug_ping_cycle(
         stats["total"], stats["active"], stats["excluded"], stats["zones"]["proven_gt_1"],
         purged, exported_wl, exported_bl,
     )
+
+    # --- Авто-деплой собранного конфига в GitHub (если включён) ---
+    deploy_result = None
+    if DEPLOY_ENABLED:
+        deploy_result = _auto_deploy()
+
     return {
         "merge_path": str(merge_file),
         "batch_size": batch_size,
@@ -329,4 +339,40 @@ def run_debug_ping_cycle(
         "whitelist_path": str(whitelist_output),
         "blacklist_path": str(blacklist_output),
         "db": stats,
+        "deploy": deploy_result,
     }
+
+
+def _auto_deploy():
+    """Авто-деплой собранного конфига в GitHub после цикла проверки.
+
+    Вызывается в конце run_debug_ping_cycle, когда whitelist уже обновлён.
+    Никогда не бросает исключений наружу — при любой ошибке логирует и
+    возвращает None, чтобы сбой деплоя не ломал основной цикл проверки.
+    """
+    try:
+        from deploy_config import deploy
+
+        LOGGER.info(
+            "Авто-деплой конфига в GitHub: repo=%s template=%s path=%s",
+            GH_DEPLOY_REPO, DEPLOY_TEMPLATE, DEPLOY_PATH,
+        )
+        res = deploy(
+            repo=GH_DEPLOY_REPO,
+            template=DEPLOY_TEMPLATE,
+            path=DEPLOY_PATH,
+            silent=True,
+        )
+        if res.get("ok"):
+            LOGGER.info("Авто-деплой выполнен: %s (commit %s)", res.get("url"), res.get("commit_sha"))
+            if res.get("url_uses_write_token"):
+                LOGGER.warning(
+                    "GH_READ_TOKEN не задан: ссылка на скачивание содержит ДЕПЛОЙ-токен "
+                    "(write). Задайте GH_READ_TOKEN и не раздавайте эту ссылку наружу."
+                )
+        else:
+            LOGGER.warning("Авто-деплой не выполнен: %s", res.get("error"))
+        return res
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Авто-деплой упал: %s", exc)
+        return None

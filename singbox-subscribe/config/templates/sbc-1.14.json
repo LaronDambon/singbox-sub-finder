@@ -1,0 +1,574 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "store_fakeip": true,
+      "store_dns": true
+    }
+  },
+  "http_clients": [
+    {
+      "tag": "my-http-client",
+      "detour": ""
+    }
+  ],
+  "services": [
+    {
+      "type": "api",
+      "listen": "0.0.0.0",
+      "listen_port": 9090,
+      "secret": "",
+      "access_control_allow_private_network": true,
+      "dashboard": {
+        "enabled": true,
+        "download_url": "https://gh-proxy.com/https://github.com/SagerNet/sing-box-dashboard/archive/refs/heads/gh-pages.zip",
+        "http_client": "my-http-client",
+        "update_interval": "1d"
+      }
+    }
+  ],
+  "dns": {
+    "servers": [
+      {
+        "tag": "hosts_fix",
+        "type": "hosts",
+        "predefined": {
+          "dns.yandex.ru": ["77.88.8.8", "77.88.8.1"],
+          "dns.google": ["8.8.8.8", "8.8.4.4"],
+          "cloudflare-dns.com": ["104.16.248.249", "104.16.249.249"]
+        }
+      },
+      {
+        "tag": "yandex-fast",
+        "type": "udp",
+        "server": "dns.yandex.ru",
+        "server_port": 53,
+        "domain_resolver": "hosts_fix"
+      },
+      {
+        "tag": "cf-doh",
+        "type": "https",
+        "server": "cloudflare-dns.com",
+        "path": "/dns-query",
+        "domain_resolver": "hosts_fix"
+      },
+      {
+        "tag": "gg-doh",
+        "type": "https",
+        "server": "dns.google",
+        "path": "/dns-query",
+        "domain_resolver": "hosts_fix"
+      },
+      {
+        "tag": "remote",
+        "type": "fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [
+      {
+        "rule_set": [
+          "whitelist-ru",
+          "geo-direct"
+        ],
+        "action": "route",
+        "server": "yandex-fast"
+      },
+      {
+        "rule_set": [
+          "geosite-google",
+          "geoip-google"
+        ],
+        "action": "route",
+        "server": "gg-doh"
+      },
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "action": "evaluate",
+        "server": "cf-doh",
+        "tag": "global-cf",
+        "timeout": "1s"
+      },
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "action": "evaluate",
+        "server": "gg-doh",
+        "tag": "global-gg",
+        "timeout": "1s"
+      },
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "action": "evaluate",
+        "server": "yandex-fast",
+        "tag": "global-ya",
+        "timeout": "1s"
+      },
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "match_response": "global-cf",
+        "ip_accept_any": true,
+        "action": "respond",
+        "race": true
+      },
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "match_response": "global-gg",
+        "ip_accept_any": true,
+        "action": "respond",
+        "race": true
+      },
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "match_response": "global-ya",
+        "ip_accept_any": true,
+        "action": "respond",
+        "race": true
+      },
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "action": "route",
+        "server": "remote",
+        "rewrite_ttl": 1
+      }
+    ],
+    "optimistic": true,
+    "strategy": "prefer_ipv4",
+    "final": "yandex-fast"
+  },
+  "inbounds": [
+    {
+      "tag": "tun-in",
+      "type": "tun",
+      "address": [
+        "172.19.0.1/30"
+      ],
+      "route_address": [
+        "0.0.0.0/0",
+        "198.18.0.0/15"
+      ],
+      "stack": "mixed",
+      "auto_route": true,
+      "strict_route": true
+    },
+    {
+      "tag": "mixed-in",
+      "type": "mixed",
+      "listen": "127.0.0.1",
+      "listen_port": 7890
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "type": "urltest",
+      "outbounds": ["{all}"],
+      "filter": [
+        {
+          "action": "exclude",
+          "keywords": ["nonono"]
+        }
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "1m",
+      "tolerance": 50
+    },
+    {
+      "tag": "OpenrouterAI-ping",
+      "type": "urltest",
+      "outbounds": ["{all}"],
+      "filter": [
+        {
+          "action": "exclude",
+          "keywords": ["nonono"]
+        }
+      ],
+      "url": "https://openrouter.ai",
+      "interval": "10m",
+      "tolerance": 50 
+    },
+    {
+      "tag": "OpenrouterAI",
+      "type": "urltest",
+      "outbounds": ["OpenrouterAI-ping", "proxy"],
+      "url": "https://openrouter.ai",
+      "interval": "1m",
+      "tolerance": 100 
+    },
+    {
+      "tag": "OpenAI-ping",
+      "type": "urltest",
+      "outbounds": ["{all}"],
+      "filter": [
+        {
+          "action": "exclude",
+          "keywords": ["nonono"]
+        }
+      ],
+      "url": "https://api.openai.com/v1/",
+      "interval": "10m",
+      "tolerance": 50
+    },
+    {
+      "tag": "OpenAI",
+      "type": "urltest",
+      "outbounds": ["OpenAI-ping", "proxy"],
+      "url": "https://api.openai.com/v1/",
+      "interval": "1m",
+      "tolerance": 100
+    },
+    {
+      "tag": "Youtube-ping",
+      "type": "urltest",
+      "outbounds": ["{all}"],
+      "filter": [
+        {
+          "action": "exclude",
+          "keywords": ["nonono"]
+        }
+      ],
+      "url": "https://www.youtube.com/generate_204",
+      "interval": "10m",
+      "tolerance": 50
+    },
+    {
+      "tag": "Youtube",
+      "type": "urltest",
+      "outbounds": ["Youtube-ping", "proxy"],
+      "url": "https://www.youtube.com/generate_204",
+      "interval": "1m",
+      "tolerance": 100
+    },
+    {
+      "tag": "Gemini-ping",
+      "type": "urltest",
+      "outbounds": ["{all}"],
+      "filter": [
+        {
+          "action": "exclude",
+          "keywords": ["nonono"]
+        }
+      ],
+      "url": "https://gemini.google.com/",
+      "interval": "10m",
+      "tolerance": 50
+    },
+    {
+      "tag": "Gemini",
+      "type": "urltest",
+      "outbounds": ["Gemini-ping", "proxy"],
+      "url": "https://gemini.google.com/",
+      "interval": "1m",
+      "tolerance": 100
+    },
+    {
+      "tag": "Telegram-ping",
+      "type": "urltest",
+      "outbounds": ["{all}"],
+      "filter": [
+        {
+          "action": "exclude",
+          "keywords": ["nonono"]
+        }
+      ],
+      "url": "https://api.telegram.org",
+      "interval": "10m",
+      "tolerance": 50
+    },
+    {
+      "tag": "Telegram",
+      "type": "urltest",
+      "outbounds": ["Telegram-ping", "proxy"],
+      "url": "https://api.telegram.org",
+      "interval": "1m",
+      "tolerance": 100
+    },
+    {
+      "tag": "Github-ping",
+      "type": "urltest",
+      "outbounds": ["{all}"],
+      "filter": [
+        {
+          "action": "exclude",
+          "keywords": ["nonono"]
+        }
+      ],
+      "url": "https://www.github.com",
+      "interval": "10m",
+      "tolerance": 50
+    },
+    {
+      "tag": "Github",
+      "type": "urltest",
+      "outbounds": ["Github-ping", "proxy"],
+      "url": "https://www.github.com",
+      "interval": "1m",
+      "tolerance": 100
+    },
+    {
+      "tag": "Microsoft-ping",
+      "type": "urltest",
+      "outbounds": ["{all}"],
+      "filter": [
+        {
+          "action": "exclude",
+          "keywords": ["nonono"]
+        }
+      ],
+      "url": "https://www.microsoft.com",
+      "interval": "10m",
+      "tolerance": 50
+    },
+    {
+      "tag": "Microsoft",
+      "type": "urltest",
+      "outbounds": ["Microsoft-ping", "proxy"],
+      "url": "https://www.microsoft.com",
+      "interval": "1m",
+      "tolerance": 100
+    },
+    {
+      "tag": "direct",
+      "type": "direct"
+    }
+  ],
+  "route": {
+    "default_domain_resolver": {
+      "server": "local"
+    },
+    "auto_detect_interface": true,
+    "final": "proxy",
+    "rules": [
+      {
+        "inbound": [
+          "tun-in",
+          "mixed-in"
+        ],
+        "action": "sniff"
+      },
+      {
+        "type": "logical",
+        "mode": "or",
+        "rules": [
+          {
+            "port": 53
+          },
+          {
+            "protocol": "dns"
+          }
+        ],
+        "action": "hijack-dns"
+      },
+      {
+        "rule_set": [
+          "geosite-category-ads-all"
+        ],
+        "action": "reject",
+        "method": "default"
+      },
+      {
+        "rule_set": ["whitelist-ru" , "ipwhitelist-ru", "geosite-crypto", "geo-direct"],
+        "outbound": "direct"
+      },
+      {
+        "rule_set": [
+          "geosite-github"
+        ],
+        "outbound": "Github"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "openrouter.ai"
+        ],
+        "outbound": "OpenrouterAI"
+      },
+      {
+        "domain_suffix": [
+          "gemini.google.com",
+          "gemini.gstatic.com"
+        ],
+        "outbound": "Gemini"
+      },
+      {
+        "rule_set": [
+          "geosite-openai"
+        ],
+        "outbound": "OpenAI"
+      },
+      {
+        "rule_set": [
+          "geosite-youtube"
+        ],
+        "outbound": "Youtube"
+      },
+      {
+        "rule_set": [
+          "geoip-telegram",
+          "geosite-telegram"
+        ],
+        "outbound": "Telegram"
+      },
+      {
+        "rule_set": [
+          "geosite-microsoft"
+        ],
+        "outbound": "Microsoft"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "inline",
+        "tag": "geo-direct",
+        "rules": [
+          {
+            "domain_suffix": [
+              "vk.ru",
+              "vkuserphoto.ru"
+            ]
+          }
+        ]
+      },
+      {
+        "tag": "geosite-category-ads-all",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-ads-all.srs",
+        "update_interval": "1d",
+        "http_client": "my-http-client"
+      },
+      {
+        "tag": "geosite-openai",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/Toperlock/sing-box-geosite@main/rule/OpenAI.srs",
+        "update_interval": "1d",
+        "http_client": "my-http-client"
+      },
+      {
+        "tag": "geosite-youtube",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/youtube.srs",
+        "update_interval": "1d",
+        "http_client": "my-http-client"
+      },
+      {
+        "tag": "geoip-google",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/google.srs",
+        "update_interval": "1d",
+        "http_client": "my-http-client"
+      },
+      {
+        "tag": "geosite-google",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/google.srs",
+        "update_interval": "1d",
+        "http_client": "my-http-client"
+      },
+      {
+        "tag": "geosite-github",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/github.srs",
+        "update_interval": "1d",
+        "http_client": "my-http-client"
+      },
+      {
+        "tag": "geoip-telegram",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/telegram.srs",
+        "update_interval": "1d",
+        "http_client": "my-http-client"
+      },
+      {
+        "tag": "geosite-telegram",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/telegram.srs",
+        "update_interval": "1d",
+        "http_client": "my-http-client"
+      },
+      {
+        "tag": "geosite-microsoft",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/microsoft.srs",
+        "update_interval": "1d",
+        "http_client": "my-http-client"
+      },
+      {
+        "tag": "geosite-category-games",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-games.srs",
+        "update_interval": "1d",
+        "http_client": "my-http-client"
+      },
+      {
+        "tag": "ipwhitelist-ru",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://github.com/LaronDambon/sing-box-src/raw/refs/heads/main/rulesets/ipwhitelist-ru.srs",
+        "update_interval": "1d",
+        "http_client": "my-http-client"
+      },
+      {
+        "tag": "whitelist-ru",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://github.com/LaronDambon/sing-box-src/raw/refs/heads/main/rulesets/whitelist-ru.srs",
+        "update_interval": "1d",
+        "http_client": "my-http-client"
+      },
+      {
+        "tag": "geosite-riot",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-riot.srs",
+        "update_interval": "1d",
+        "http_client": "my-http-client"
+      },
+      {
+        "tag": "geosite-crypto",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://github.com/QuixoticHeart/rule-set/raw/refs/heads/ruleset/singbox/version1/crypto.srs",
+        "update_interval": "1d",
+        "http_client": "my-http-client"
+      }
+    ]
+  }
+}

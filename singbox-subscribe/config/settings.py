@@ -1,7 +1,14 @@
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Поднимаем локальные секреты/настройки из .env (файл в .gitignore) до чтения
+# любых os.getenv ниже. Файл лежит в корне репозитория (на уровень выше папки
+# пакета singbox-subscribe). override=False: уже заданные в окружении переменные
+# (setx/системно) имеют приоритет.
 ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT.parent / ".env", override=False)
 URLS_FILE = ROOT / "config" / "subs" / "urls.json"
 MERGE_FILE = ROOT / "source" / "merge.txt"
 WHITELIST_FILE = ROOT / "source" / "whitelist.txt"
@@ -26,8 +33,8 @@ CONFIG_TEMPLATE_DIR = ROOT / "config_template"
 SING_BOX_PATH = ROOT / "sing-box" / ("sing-box.exe" if os.name == "nt" else "sing-box")
 SING_BOX_OUTPUT_DIR = ROOT / "sing-box"
 SING_BOX_PORT = int(os.getenv("SING_BOX_PORT", "7891"))
-#URLTEST_URL = "https://cp.cloudflare.com/gen_204"
-URLTEST_URL = "https://speed.cloudflare.com/__down?bytes=500000"
+URLTEST_URL = "https://cp.cloudflare.com/gen_204"
+#URLTEST_URL = "https://speed.cloudflare.com/__down?bytes=5000000"
 TIMEOUT = 10.0
 BATCH_SIZE = 100
 
@@ -43,3 +50,15 @@ COUNTRY_CHECK_TIMEOUT = float(os.getenv("COUNTRY_CHECK_TIMEOUT", "6"))
 
 FLASK_HOST="0.0.0.0"
 FLASK_PORT=8000
+
+# --- Авто-деплой собранного конфига в GitHub (private) ---
+# Включить деплой после каждого цикла проверки: DEPLOY_ENABLED=1
+DEPLOY_ENABLED = os.getenv("DEPLOY_ENABLED", "0") == "1"
+# Репозиторий owner/repo; токен — GH_DEPLOY_TOKEN (или GH_TOKEN)
+GH_DEPLOY_REPO = os.getenv("GH_DEPLOY_REPO", "LaronDambon/sing-box-config")
+# Какой шаблон из config/templates использовать для сборки деплоя
+DEPLOY_TEMPLATE = os.getenv("DEPLOY_TEMPLATE", "sbc-1.14.json")
+# Путь файла внутри репозитория
+DEPLOY_PATH = os.getenv("DEPLOY_PATH", "config.json")
+# Создавать репозиторий автоматически, если его нет (0/1)
+DEPLOY_CREATE_REPO = os.getenv("DEPLOY_CREATE_REPO", "0") == "1"

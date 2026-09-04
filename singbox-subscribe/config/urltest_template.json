@@ -17,8 +17,7 @@
       }
     ],
     "final": "dns-google-v4",
-    "strategy": "prefer_ipv6",
-    "independent_cache": true
+    "strategy": "prefer_ipv6"
   },
   "inbounds": [
     {

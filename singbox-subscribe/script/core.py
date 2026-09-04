@@ -696,7 +696,79 @@ def find_free_port():
         return sock.getsockname()[1]
 
 
+def fresh_inbound_port() -> int:
+    """Свободный inbound-порт для ОДНОГО запуска sing-box.
+
+    Приоритет: переменная окружения SING_BOX_PORT (если пользователь явно задал
+    фиксированный порт). Иначе — каждый раз выбирается НОВЫЙ эфемерный порт.
+
+    Почему не один порт на весь процесс: если предыдущий sing-box не успел
+    освободить порт (завис после таймаута, остался дочерний процесс), следующий
+    батч с тем же портом упадёт с "bind: address already in use" и целиком
+    потеряет свой батч. Свежий порт на каждый запуск делает батчи независимыми.
+    """
+    try:
+        env_val = os.getenv("SING_BOX_PORT")
+        if env_val:
+            port = int(env_val)
+            if port > 0:
+                return port
+    except Exception:
+        pass
+    return find_free_port()
+
+
 _URLTEST_RESULT_RE = re.compile(r"outbound/urltest\[[^\]]+\]: outbound\s+.+?\s+(available|unavailable)")
+
+
+def _terminate_process_tree(process) -> None:
+    """Надёжно завершает sing-box и все его дочерние процессы.
+
+    Popen.terminate()/kill() на Windows (TerminateProcess) убивает только сам
+    процесс и НЕ трогает детей — из-за этого после остановленного по таймауту
+    sing-box может остаться жить ещё один экземпляр, который держит inbound-порт.
+    Следующий батч тогда падает с "bind: address already in use" -> return_code=1
+    -> все 100 конфигов батча помечаются как недоступные.
+    """
+    try:
+        if os.name == "nt":
+            # taskkill /T /F убивает дерево процессов, включая детей.
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        else:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+    except Exception:  # noqa: BLE001
+        try:
+            process.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        process.wait(timeout=3)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _clean_log_line(line: str) -> str:
+    """Делает строку вывода sing-box безопасной для логов.
+
+    Вывод sing-box содержит ANSI-escape (цвета) и emoji (флаги стран),
+    которые ломают консольный файловый обработчик в cp1251 — кодировка не
+    может закодировать такие символы, и logging роняет UnicodeEncodeError.
+    Убираем escape-последовательности и заменяем остальное на ASCII.
+    """
+    text = _ANSI_ESCAPE_RE.sub("", line)
+    return text.encode("ascii", "replace").decode("ascii")
 
 
 def run_singbox_admin(
@@ -768,12 +840,7 @@ def run_singbox_admin(
         time.sleep(0.1)
 
     if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=2)
+        _terminate_process_tree(process)
 
     reader.join(timeout=1)
     elapsed = time.monotonic() - started_at
@@ -789,10 +856,24 @@ def run_singbox_admin(
             elapsed,
             expected_debug_count,
         )
+    # Любой ненулевой (или отсутствующий — процесс был убит) exit-код означает,
+    # что sing-box НЕ смог нормально завершиться (например, порт занят, невалидный
+    # конфиг, нехватка прав). Показываем его реальный вывод, иначе ошибка остаётся
+    # незаметной (как в случае 0.2-секундных батчей с return_code=1).
+    if return_code is None or return_code != 0:
+        LOGGER.error(
+            "sing-box exited with return_code=%s (captured %d lines):",
+            return_code,
+            len(output_lines),
+        )
+        shown = 0
         for line in output_lines:
-            LOGGER.debug("sing-box output: %s", line)
-    if return_code != 0 and len(output_lines) == 0:
-        LOGGER.error("sing-box process exited with return code %s and no output", return_code)
+            if shown >= 80:
+                break
+            shown += 1
+            LOGGER.error("sing-box output: %s", _clean_log_line(line))
+        if len(output_lines) > shown:
+            LOGGER.error("sing-box output: ... (%d more lines)", len(output_lines) - shown)
 
     LOGGER.info(
         "sing-box run finished: %d/%d urltest results in %.2fs (return_code=%s)",
@@ -890,8 +971,9 @@ def generate_debug_configs_with_singbox(
             }
 
         config = build_singbox_config_from_nodes(template_data, parsed_nodes)
-        # choose a single inbound port for the whole process (respect env/settings/template)
-        inbound_port = 7891
+        # Свежий свободный порт на каждый запуск: если предыдущий sing-box
+        # завис и держит старый порт, следующий батч всё равно стартует.
+        inbound_port = fresh_inbound_port()
         for inbound in config.get("inbounds", []):
             if inbound.get("type") == "mixed" and inbound.get("listen") == "127.0.0.1":
                 inbound["listen_port"] = inbound_port

@@ -4,6 +4,47 @@
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версионирование — [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [2.1.0] - 2026-09-03
+
+### Added
+- Авто-деплой собранного конфига в (private) GitHub-репозиторий после каждого цикла
+  проверки: `deploy_config.py` (REST API без локального git).
+  - Разделение ключей: деплой-токен (write) только для пуша, отдельный read-only
+    токен вшивается в итоговую ссылку на скачивание из приватного репо.
+  - Включение: `DEPLOY_ENABLED=1` в `.env`; настройки — `GH_DEPLOY_REPO`,
+    `DEPLOY_TEMPLATE`, `DEPLOY_PATH`, `DEPLOY_CREATE_REPO`.
+  - Новый шаблон сборки `config/templates/sbc-1.14.json` (под sing-box 1.14).
+- Поддержка `python-dotenv` + `load_dotenv` в `start.py` и `settings.py`
+  (`.env`) в корне; приоритет системных переменных окружения сохранён.
+- Фильтр конфигов с insecure TLS-fingerprint (`fp=/fingerprint=unsafe|none|disabled`)
+  на этапе скачивания и при сборке merge — такие узлы sing-box отвергает и
+  роняют весь батч проверки: `has_unsafe_fingerprint()` учитывает и query-параметры,
+  и поле внутри base64-конфига `vmess://`.
+
+### Changed
+- `socks.py`: надёжный разбор адреса/порта (любые нецифровые хвосты у порта
+  отрезаются); битые строки (`host:port&security=...`) пропускаются, парсер больше
+  не роняет разбор и не создаёт ложных узлов.
+- `ss.py`: строки `ss://...?security=reality&pbk=...&sid=...&flow=...` (на деле VLESS-Reality
+  с ошибочным префиксом) распознаются и отбрасываются вместо ложного shadowsocks-узла.
+- `urltest_template.json`/`countrytest_template.json`: убран `independent_cache`
+  (не совместим с актуальным sing-box).
+- Проверка URL по умолчанию возвращена на лёгкий `https://cp.cloudflare.com/gen_204`
+  (тяжёлый speed.cloudflare.com остался закомментирован).
+
+### Fixed
+- Зависшие sing-box после таймаута больше не «съедают» следующий батч:
+  свежий эфемерный inbound-порт на каждый запуск (`fresh_inbound_port()`).
+- Надёжное завершение sing-box вместе с дочерними процессами на Windows
+  (`taskkill /F /T`) — `_terminate_process_tree()`.
+- Любой ненулевой/отсутствующий exit-код sing-box теперь пишется в ошибку с реальным
+  выводом (до 80 строк, перекодировано в ASCII), а не теряется молча.
+- Вывод sing-box с ANSI-escape и emoji больше не роняет файловый логгер в cp1251
+  (`_clean_log_line()`).
+
+### Removed
+- `tests/` (тесты `test_server_store.py` и `__init__.py`) — вынесены из репозитория.
+
 ## [2.0.0] - 2026-08-25
 
 ### Breaking changes

@@ -1,4 +1,5 @@
 Flask
+python-dotenv
 PyYAML
 ruamel.yaml
 requests

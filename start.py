@@ -3,8 +3,14 @@ import sys
 import time
 import subprocess
 from pathlib import Path
+from dotenv import load_dotenv
 
+# Локальные секреты/настройки из .env (в .gitignore). Загружаем ДО запуска
+# дочерних процессов, чтобы main.py и gensub_api.py унаследовали переменные
+# (GH_DEPLOY_TOKEN, GH_READ_TOKEN, DEPLOY_ENABLED, ...) из окружения.
+# override=False: уже заданные в окружении переменные не перезаписываются.
 ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env", override=False)
 API_SCRIPT = ROOT / "singbox-subscribe" / "gensub_api.py"
 MAIN_SCRIPT = ROOT / "singbox-subscribe" / "main.py"
 CHECK_INTERVAL_SECONDS = 30 * 60
