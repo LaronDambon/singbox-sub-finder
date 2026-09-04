@@ -74,7 +74,8 @@
       {
         "rule_set": [
           "whitelist-ru",
-          "geo-direct"
+          "geo-direct",
+          "geosite-ru"
         ],
         "action": "route",
         "server": "yandex-fast"
@@ -392,7 +393,7 @@
         "method": "default"
       },
       {
-        "rule_set": ["whitelist-ru" , "ipwhitelist-ru", "geosite-crypto", "geo-direct"],
+        "rule_set": ["whitelist-ru" , "ipwhitelist-ru", "geosite-crypto", "geo-direct", "geosite-ru", "geoip-ru"],
         "outbound": "direct"
       },
       {
@@ -550,6 +551,22 @@
         "type": "remote",
         "format": "binary",
         "url": "https://github.com/LaronDambon/sing-box-src/raw/refs/heads/main/rulesets/whitelist-ru.srs",
+        "update_interval": "1d",
+        "http_client": "my-http-client"
+      },
+      {
+        "tag": "geosite-ru",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-ru.srs",
+        "update_interval": "1d",
+        "http_client": "my-http-client"
+      },
+      {
+        "tag": "geoip-ru",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/ru.srs",
         "update_interval": "1d",
         "http_client": "my-http-client"
       },

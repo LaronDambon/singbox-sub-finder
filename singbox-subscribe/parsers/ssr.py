@@ -3,6 +3,9 @@ def parse(data):
     info = data[6:]
     if not info or info.isspace():
         return None
+    # Фрагмент URI (#тэг) с не-ASCII символами (эмодзи-страны) ломал b64Decode;
+    # отрезаем его как не принадлежащий base64-телу.
+    info = info.split('#', 1)[0]
     try:
         proxy_str = tool.b64Decode(info).decode('utf-8')
     except:

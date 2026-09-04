@@ -5,6 +5,10 @@ def parse(data):
     info = data[8:]
     if not info or info.isspace():
         return None
+    # Фрагмент URI (#тэг) не является частью base64/query-тела vmess: он содержит
+    # имя с эмодзи-страны и прочими не-ASCII символами, которые ломали b64Decode
+    # (ValueError) и роняли разбор — такие конфиги уходили в None и чернели.
+    info = info.split('#', 1)[0]
     try:
         if info.find('?') > -1: #fuck странный формат URI
             server_info = urlparse(info)

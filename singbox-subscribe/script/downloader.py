@@ -265,7 +265,10 @@ def normalize_proxy_key(raw: str) -> str:
     lower = value.lower()
     if lower.startswith("vmess://"):
         try:
-            encoded = value[8:]
+            # Фрагмент (#тэг) не является base64-телом и содержит не-ASCII
+            # (эмодзи-страны и т.п.), которые ломали b64decode и роняли канонический
+            # ключ в fallback, из-за чего один и тот же сервер получал разные ключи.
+            encoded = value[8:].split("#", 1)[0]
             rem = len(encoded) % 4
             if rem:
                 encoded += "=" * (4 - rem)
