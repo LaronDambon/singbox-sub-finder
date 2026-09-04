@@ -48,6 +48,27 @@ COUNTRY_CHECK_CONCURRENCY = int(os.getenv("COUNTRY_CHECK_CONCURRENCY", "8"))
 # Таймаут чтения одного geo-запроса (сек); всего пробуется до 3 эндпоинта.
 COUNTRY_CHECK_TIMEOUT = float(os.getenv("COUNTRY_CHECK_TIMEOUT", "6"))
 
+# --- Профилирование достижимости до целевых сайтов (reachability check) ---
+# По аналогии с countrytest: для ok-серверов (после ping-цикла) проверяется,
+# до каких целевых сайтов прокси реально дозванивается и с каким пингом.
+# Профиль хранится в БД (колонка capabilities); тэги [name] добавляются
+# только при экспорте в whitelist для генерации конфига.
+# Файл с целевыми сайтами (url/tag/пороги) — config/reachability_targets.json
+REACHABILITY_TARGETS_FILE = ROOT / "config" / "reachability_targets.json"
+# Включает профилирование достижимости после ping-цикла.
+REACHABILITY_ENABLED = os.getenv("REACHABILITY_ENABLED", "1") == "1"
+# Сколько прокси обрабатывать параллельно в одном процессе sing-box.
+REACHABILITY_CONCURRENCY = int(os.getenv("REACHABILITY_CONCURRENCY", "8"))
+# Таймаут (сек) на один целевой запрос внутри reachability-пробы.
+REACHABILITY_TIMEOUT = float(os.getenv("REACHABILITY_TIMEOUT", "6"))
+# Максимальный пинг до цели (ms) для попадания в capabilities.
+REACHABILITY_MAX_PING_MS = int(os.getenv("REACHABILITY_MAX_PING_MS", "500"))
+# С какого stable начинать профилировать (ок-серверы ниже не трогаем).
+REACHABILITY_MIN_STABLE = int(os.getenv("REACHABILITY_MIN_STABLE", "0"))
+# Тэг цели, которой помечается сервер, прошедший ВСЕ проверки этой категории.
+REACHABILITY_GLOBAL_TAG = os.getenv("REACHABILITY_GLOBAL_TAG", "Global")
+
+
 FLASK_HOST="0.0.0.0"
 FLASK_PORT=8000
 

@@ -190,8 +190,8 @@
       "outbounds": ["{all}"],
       "filter": [
         {
-          "action": "include",
-          "keywords": ["Global"]
+          "action": "exclude",
+          "keywords": ["nonono"]
         }
       ],
       "url": "https://www.gstatic.com/generate_204",
@@ -204,8 +204,8 @@
       "outbounds": ["{all}"],
       "filter": [
         {
-          "action": "include",
-          "keywords": ["openrouter"]
+          "action": "exclude",
+          "keywords": ["nonono"]
         }
       ],
       "url": "https://openrouter.ai",
@@ -226,8 +226,8 @@
       "outbounds": ["{all}"],
       "filter": [
         {
-          "action": "include",
-          "keywords": ["openai"]
+          "action": "exclude",
+          "keywords": ["nonono"]
         }
       ],
       "url": "https://api.openai.com/v1/",
@@ -248,8 +248,8 @@
       "outbounds": ["{all}"],
       "filter": [
         {
-          "action": "include",
-          "keywords": ["youtube"]
+          "action": "exclude",
+          "keywords": ["nonono"]
         }
       ],
       "url": "https://www.youtube.com/generate_204",
@@ -270,8 +270,8 @@
       "outbounds": ["{all}"],
       "filter": [
         {
-          "action": "include",
-          "keywords": ["gemini"]
+          "action": "exclude",
+          "keywords": ["nonono"]
         }
       ],
       "url": "https://gemini.google.com/",
@@ -292,8 +292,8 @@
       "outbounds": ["{all}"],
       "filter": [
         {
-          "action": "include",
-          "keywords": ["telegram"]
+          "action": "exclude",
+          "keywords": ["nonono"]
         }
       ],
       "url": "https://api.telegram.org",
@@ -314,8 +314,8 @@
       "outbounds": ["{all}"],
       "filter": [
         {
-          "action": "include",
-          "keywords": ["github"]
+          "action": "exclude",
+          "keywords": ["nonono"]
         }
       ],
       "url": "https://www.github.com",
@@ -336,8 +336,8 @@
       "outbounds": ["{all}"],
       "filter": [
         {
-          "action": "include",
-          "keywords": ["microsoft"]
+          "action": "exclude",
+          "keywords": ["nonono"]
         }
       ],
       "url": "https://www.microsoft.com",
@@ -349,28 +349,6 @@
       "type": "urltest",
       "outbounds": ["Microsoft-ping", "proxy"],
       "url": "https://www.microsoft.com",
-      "interval": "1m",
-      "tolerance": 100
-    },
-    {
-      "tag": "Aniliberty-ping",
-      "type": "urltest",
-      "outbounds": ["{all}"],
-      "filter": [
-        {
-          "action": "include",
-          "keywords": ["aniliberty"]
-        }
-      ],
-      "url": "https://www.aniliberty.top",
-      "interval": "10m",
-      "tolerance": 50
-    },
-    {
-      "tag": "Aniliberty",
-      "type": "urltest",
-      "outbounds": ["Aniliberty-ping", "proxy"],
-      "url": "https://www.anilibria.top",
       "interval": "1m",
       "tolerance": 100
     },

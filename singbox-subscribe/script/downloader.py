@@ -472,7 +472,12 @@ def build_merge_from_urls(
 
     # Экспорт подтверждённых серверов (stable > порога) в whitelist.txt —
     # файловая проекция базы для внешних потребителей.
-    exported = store.export_to_file(WHITELIST_FILE, min_stable=WHITELIST_EXPORT_MIN_STABLE)
+    from config.settings import REACHABILITY_GLOBAL_TAG
+    exported = store.export_tagged_to_file(
+        WHITELIST_FILE,
+        min_stable=WHITELIST_EXPORT_MIN_STABLE,
+        global_tag=REACHABILITY_GLOBAL_TAG,
+    )
     logger.info(
         "Экспорт whitelist.txt из базы: %d серверов со stable > %d",
         exported, WHITELIST_EXPORT_MIN_STABLE,

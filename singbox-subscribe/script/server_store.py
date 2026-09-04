@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS servers (
     available    INTEGER,
     checks       INTEGER NOT NULL DEFAULT 0,
     fails        INTEGER NOT NULL DEFAULT 0,
+    capabilities TEXT NOT NULL DEFAULT '',
     excluded     INTEGER NOT NULL DEFAULT 0,
     first_seen   TEXT NOT NULL,
     last_seen    TEXT NOT NULL,
@@ -88,6 +89,7 @@ class ServerStore:
                 conn.execute("UPDATE servers SET stable = ? WHERE stable > ?", (cap, cap))
             except Exception:  # noqa: BLE001 — база должна открываться даже без settings
                 pass
+        self._ensure_capabilities_column()
         self._maybe_migrate_legacy()
 
     # ------------------------------------------------------------------ util
@@ -123,6 +125,50 @@ class ServerStore:
                 "SELECT key, country FROM servers WHERE country != ''"
             ).fetchall()
         return {row["key"]: row["country"] for row in rows}
+
+    def load_capabilities_map(self) -> dict[str, str]:
+        """Карта ключ -> профиль достижимости (capabilities строка).
+
+        Профиль — упорядоченный список тэгов целей, например
+        "openrouter,gemini,youtube". Пустой/отсутствующий профиль означает,
+        что сервер ещё не профилирован (или не проходил reachability-проверку).
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT key, capabilities FROM servers WHERE capabilities != ''"
+            ).fetchall()
+        return {row["key"]: row["capabilities"] for row in rows}
+
+    def record_capabilities(self, rows: Sequence[dict]) -> int:
+        """Обновляет только профиль достижимости для ключей.
+
+        row: {key, capabilities: str} — перезаписывает профиль целиком.
+        Возвращает количество обновлённых записей.
+        """
+        if not rows:
+            return 0
+        now = _now()
+        updated = 0
+        with self._connect() as conn:
+            for row in rows:
+                caps = str(row.get("capabilities") or "").strip()
+                cur = conn.execute(
+                    """
+                    UPDATE servers SET capabilities = ?, last_checked = ?, last_seen = ?
+                    WHERE key = ?
+                    """,
+                    (caps, now, now, row["key"]),
+                )
+                updated += cur.rowcount
+        return updated
+
+    def get_capabilities(self, key: str) -> str:
+        """Профиль достижимости одного сервера по ключу ('' если нет)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT capabilities FROM servers WHERE key = ?", (key,)
+            ).fetchone()
+        return (row["capabilities"] if row else "") or ""
 
     # ----------------------------------------------------------- регистрация
     def upsert_lines(self, lines: Iterable[str]) -> dict[str, int]:
@@ -170,7 +216,7 @@ class ServerStore:
         """Записывает результаты проверки пачкой (один commit на batch).
 
         row: {key, available: bool, line?: str, ping_ms?: int|None,
-              country?: str, protocol?: str}
+              country?: str, protocol?: str, capabilities?: str}
         stable: +1 при успехе, -1 при неудаче.
         """
         if not rows:
@@ -186,13 +232,14 @@ class ServerStore:
                 conn.execute(
                     """
                     INSERT INTO servers (key, line, stable, ping_ms, protocol, country,
-                                         available, checks, fails, first_seen, last_seen, last_checked)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                                         capabilities, available, checks, fails, first_seen, last_seen, last_checked)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
                     ON CONFLICT(key) DO UPDATE SET
                         stable = MIN(stable + ?, ?),
                         ping_ms = COALESCE(?, servers.ping_ms),
                         protocol = CASE WHEN ? != '' THEN ? ELSE servers.protocol END,
                         country = CASE WHEN ? != '' THEN ? ELSE servers.country END,
+                        capabilities = CASE WHEN ? != '' THEN ? ELSE servers.capabilities END,
                         available = ?,
                         checks = checks + 1,
                         fails = fails + ?,
@@ -207,6 +254,7 @@ class ServerStore:
                         row.get("ping_ms"),
                         row.get("protocol") or "",
                         row.get("country") or "",
+                        row.get("capabilities") or "",
                         1 if ok else 0,
                         0 if ok else 1,
                         now, now, now,
@@ -215,6 +263,7 @@ class ServerStore:
                         row.get("ping_ms"),
                         row.get("protocol") or "", row.get("protocol") or "",
                         row.get("country") or "", row.get("country") or "",
+                        row.get("capabilities") or "", row.get("capabilities") or "",
                         1 if ok else 0,
                         0 if ok else 1,
                         row.get("line"),
@@ -247,7 +296,7 @@ class ServerStore:
         max_stable=0 -> только stable < 0 (строго меньше).
         Сортировка: stable DESC, затем пинг по возрастанию (без пинга — в конце).
         """
-        query = "SELECT line, stable, ping_ms FROM servers WHERE line != ''"
+        query = "SELECT line, stable, ping_ms, capabilities FROM servers WHERE line != ''"
         params: list[object] = []
         if min_stable is not None:
             query += " AND stable > ?"
@@ -263,6 +312,60 @@ class ServerStore:
             rows = conn.execute(query, params).fetchall()
         return [row["line"] for row in rows]
 
+    def _capability_tags(self, caps: str, global_tag: str) -> str:
+        """Превращает профиль (список тэгов через запятую) в суффикс тэгов.
+
+        Соглашение хранения в БД (колонка capabilities):
+          * "Global"              — сервер достиг ВСЕХ целевых сайтов
+                                     -> экспортируется одним тэгом [Global];
+          * "openrouter,gemini"   — сервер достиг этих целей
+                                     -> экспортируется как [openrouter][gemini].
+        Тэг Global НЕ дублируется, если он среди разложенных тэгов.
+        """
+        if not caps:
+            return ""
+        tags = [t.strip() for t in caps.split(",") if t.strip()]
+        if any(t == global_tag for t in tags):
+            return f"[{global_tag}]"
+        return "".join(f"[{t}]" for t in tags)
+
+    def export_tagged_lines(self, *,
+                            min_stable: int | None = None,
+                            max_stable: int | None = None,
+                            global_tag: str = "Global") -> list[str]:
+        """Строки серверов по фильтру stable с добавленными capability-тэгами.
+
+        ВАЖНО: capability-профиль ХРАНИТСЯ в БД, тэги [name] добавляются
+        только здесь, на этапе экспорта для генерации итогового конфига.
+        Сервер, у которого профиль полностью состоит из global_tag (достиг
+        всех целей), получает ровно один тэг [Global].
+        """
+        query = "SELECT line, stable, ping_ms, capabilities FROM servers WHERE line != ''"
+        params: list[object] = []
+        if min_stable is not None:
+            query += " AND stable > ?"
+            params.append(min_stable)
+        if max_stable is not None:
+            query += " AND stable < ?"
+            params.append(max_stable)
+        query += " ORDER BY stable DESC, ping_ms IS NULL, ping_ms ASC, key ASC"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        out = []
+        for row in rows:
+            base = row["line"]
+            caps = row["capabilities"] or ""
+            # Если в профиле уже есть Global-метка храним её как global_tag;
+            # иначе — обычный профиль целей.
+            if caps:
+                # Сервер, прошедший все проверки, помечен в БД ровно global_tag.
+                suffix = self._capability_tags(caps, global_tag)
+                # Не добавляем Global повторно, если он уже в строке.
+                if suffix and f"[{global_tag}]" not in base:
+                    base = base + suffix
+            out.append(base)
+        return out
+
     def export_to_file(
         self,
         path: str | Path,
@@ -271,6 +374,28 @@ class ServerStore:
         max_stable: int | None = None,
     ) -> int:
         lines = self.export_lines(min_stable=min_stable, max_stable=max_stable)
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("\n".join(lines), encoding="utf-8")
+        return len(lines)
+
+    def export_tagged_to_file(
+        self,
+        path: str | Path,
+        *,
+        min_stable: int | None = None,
+        max_stable: int | None = None,
+        global_tag: str = "Global",
+    ) -> int:
+        """Экспорт whitelist-строк С capability-тэгами ([name] / [Global]).
+
+        Это «whitelist для генерации»: тэги добавляются только здесь, на этапе
+        выгрузки строк, чтобы итоговый sing-box конфиг мог фильтровать outbound'ы
+        по достижимости целей. Профиль при этом остаётся в БД, а не в merge-пуле.
+        """
+        lines = self.export_tagged_lines(
+            min_stable=min_stable, max_stable=max_stable, global_tag=global_tag,
+        )
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("\n".join(lines), encoding="utf-8")
@@ -328,6 +453,17 @@ class ServerStore:
     # ------------------------------------------------------- миграция legacy
     LEGACY_WHITELIST = ROOT / "source" / "whitelist.txt"
     LEGACY_BLACKLIST = ROOT / "source" / "blacklist.txt"
+
+    def _ensure_capabilities_column(self) -> None:
+        """Добавляет колонку capabilities в существующую базу (один раз).
+
+        Вызывается при открытии экземпляра, чтобы старые БД без этой колонки
+        не падали. SQLite: PRAGMA table_info -> если колонки нет, ALTER TABLE.
+        """
+        with self._connect() as conn:
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(servers)").fetchall()]
+            if "capabilities" not in cols:
+                conn.execute("ALTER TABLE servers ADD COLUMN capabilities TEXT NOT NULL DEFAULT ''")
 
     def _maybe_migrate_legacy(self) -> None:
         """Однократный импорт старых whitelist.txt/blacklist.txt в пустую базу."""

@@ -91,7 +91,13 @@ def _load_source_uris(args) -> list[str]:
     from script.server_store import ServerStore
 
     store = ServerStore(SERVERS_DB_FILE)
-    lines = store.export_lines(min_stable=WHITELIST_EXPORT_MIN_STABLE)
+    # export_tagged_lines добавляет capability-тэги ([name] / [Global]) к строкам
+    # на этапе экспорта для генерации итогового конфига.
+    from config.settings import REACHABILITY_GLOBAL_TAG
+    lines = store.export_tagged_lines(
+        min_stable=WHITELIST_EXPORT_MIN_STABLE,
+        global_tag=REACHABILITY_GLOBAL_TAG,
+    )
     if not lines:
         raise RuntimeError("В whitelist базы нет серверов (stable > порога). Нечего собирать.")
     return lines

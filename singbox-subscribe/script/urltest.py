@@ -28,6 +28,11 @@ from config.settings import (
     COUNTRY_CHECK_ENABLED,
     COUNTRY_CHECK_CONCURRENCY,
     COUNTRY_CHECK_TIMEOUT,
+    REACHABILITY_ENABLED,
+    REACHABILITY_CONCURRENCY,
+    REACHABILITY_TIMEOUT,
+    REACHABILITY_MIN_STABLE,
+    REACHABILITY_GLOBAL_TAG,
     DEPLOY_ENABLED,
     GH_DEPLOY_REPO,
     DEPLOY_TEMPLATE,
@@ -171,6 +176,7 @@ def _finalize_rows(decisions: list[dict], speedtest_country: dict[str, str]) -> 
             "ping_ms": d["ping_ms"],
             "country": country_tag or name_country or "",
             "protocol": (tool.get_protocol(d["raw_line"]) or "").lower(),
+            "capabilities": d.get("capabilities", ""),
         })
     return rows
 
@@ -285,7 +291,55 @@ def run_debug_ping_cycle(
                         res.get("country"), res.get("latency_ms"), line[:80],
                     )
 
+        # Фаза 2.5: профиль достижимости до целевых сайтов (reachability).
+        # Для ok-серверов батча со stable >= порога проверяем, до каких целей
+        # прокси реально дозванивается. Профиль пишется в БД (capabilities),
+        # тэги [name] / [Global] добавляются только при экспорте в whitelist.
+        capabilities_map: dict[str, str] = {}
+        if REACHABILITY_ENABLED:
+            from script.reachability_check import (
+                load_targets,
+                batch_reachability_check,
+                profile_to_tags,
+                profile_is_global,
+            )
+            reach_targets = load_targets()
+            # Пул для профилирования: ok-серверы батча с достаточным stable.
+            reach_lines = sorted({
+                d["raw_line"] for d in decisions
+                if d["is_ok"] and d["new_stable"] >= REACHABILITY_MIN_STABLE
+            })
+            if reach_lines and reach_targets:
+                LOGGER.info(
+                    "Batch %d-%d: reachability-профиль для %d ok-серверов "
+                    "(целей: %d, concurrency=%d)",
+                    start + 1, batch_end, len(reach_lines),
+                    len(reach_targets), REACHABILITY_CONCURRENCY,
+                )
+                rr = batch_reachability_check(
+                    reach_lines,
+                    concurrency=REACHABILITY_CONCURRENCY,
+                    targets=reach_targets,
+                )
+                for line, res in rr.items():
+                    targets_res = res.get("targets")
+                    if not targets_res:
+                        continue
+                    if profile_is_global(reach_targets, targets_res):
+                        # Прошёл ВСЕ проверки -> в БД ровно глобальный тэг,
+                        # на экспорте превратится в [Global].
+                        capabilities_map[line] = REACHABILITY_GLOBAL_TAG
+                        LOGGER.info("Reachability: %s -> [%s] (все цели)", line[:60], REACHABILITY_GLOBAL_TAG)
+                    else:
+                        reached = profile_to_tags(reach_targets, targets_res)
+                        if reached:
+                            capabilities_map[line] = ",".join(reached)
+                            LOGGER.info("Reachability: %s -> [%s]", line[:60], "][".join(reached))
+
         # Фаза 3: строки-записи и запись результатов в базу одним commit'ом.
+        # Профиль достижимости прошиваем в записи для capabilities.
+        for d in decisions:
+            d["capabilities"] = capabilities_map.get(d["raw_line"], "")
         rows = _finalize_rows(decisions, speedtest_country)
         store.record_results(rows)
 
@@ -309,7 +363,11 @@ def run_debug_ping_cycle(
     blacklist_output = Path(blacklist_path) if blacklist_path else merge_file.with_suffix(".blacklist.txt")
     exported_wl = exported_bl = 0
     if export_lists:
-        exported_wl = store.export_to_file(whitelist_output, min_stable=WHITELIST_EXPORT_MIN_STABLE)
+        exported_wl = store.export_tagged_to_file(
+            whitelist_output,
+            min_stable=WHITELIST_EXPORT_MIN_STABLE,
+            global_tag=REACHABILITY_GLOBAL_TAG,
+        )
         exported_bl = store.export_to_file(blacklist_output, max_stable=PURGE_STABLE_BELOW)
 
     total_elapsed = time.monotonic() - cycle_started

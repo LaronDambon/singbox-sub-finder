@@ -1,0 +1,94 @@
+{
+  "comment": "Целевые сайты для профилирования достижимости прокси (reachability check).",
+  "format_version": 1,
+  "targets": [
+    {
+      "name": "openrouter",
+      "tag": "openrouter",
+      "url": "https://openrouter.ai",
+      "max_ping_ms": 2000,
+      "timeout_ms": 6000,
+      "expected_statuses": [200, 301, 302, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "openai",
+      "tag": "openai",
+      "url": "https://api.openai.com/v1/",
+      "max_ping_ms": 2000,
+      "timeout_ms": 6000,
+      "expected_statuses": [401, 405, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "gemini",
+      "tag": "gemini",
+      "url": "https://gemini.google.com/",
+      "max_ping_ms": 2000,
+      "timeout_ms": 6000,
+      "expected_statuses": [200, 301, 302, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "youtube",
+      "tag": "youtube",
+      "url": "https://www.youtube.com/generate_204",
+      "max_ping_ms": 2000,
+      "timeout_ms": 6000,
+      "expected_statuses": [200, 204, 301, 302, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "telegram",
+      "tag": "telegram",
+      "url": "https://api.telegram.org",
+      "max_ping_ms": 2000,
+      "timeout_ms": 6000,
+      "expected_statuses": [200, 401, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "github",
+      "tag": "github",
+      "url": "https://www.github.com",
+      "max_ping_ms": 2000,
+      "timeout_ms": 6000,
+      "expected_statuses": [200, 301, 302, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "microsoft",
+      "tag": "microsoft",
+      "url": "https://www.microsoft.com",
+      "max_ping_ms": 2000,
+      "timeout_ms": 6000,
+      "expected_statuses": [200, 301, 302, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "aniliberty",
+      "tag": "aniliberty",
+      "url": "https://www.aniliberty.top",
+      "max_ping_ms": 2000,
+      "timeout_ms": 6000,
+      "expected_statuses": [200, 301, 302, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    }
+  ]
+}

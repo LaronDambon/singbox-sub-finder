@@ -832,19 +832,42 @@ def run_singbox_admin(
 
     started_at = time.monotonic()
     deadline = started_at + timeout
+    # Причина выхода из цикла ожидания — отличаем штатное завершение
+    # (собрали достаточно результатов) от аварийного выхода процесса.
+    stopped_by_us = False      # мы сами убили sing-box после получения результатов
+    timed_out = False          # истекло время ожидания
     while time.monotonic() < deadline:
         if expected_debug_count > 0 and result_count >= expected_debug_count:
+            stopped_by_us = True
             break
         if process.poll() is not None:
+            # Процесс завершился сам (аварийно или раньше времени) ДО сбора
+            # всех результатов — это реальная проблема, не штатная остановка.
+            stopped_by_us = False
+            timed_out = False
             break
         time.sleep(0.1)
+    else:
+        timed_out = True
 
     if process.poll() is None:
+        # sing-box ещё жив: штатный путь — убиваем его, чтобы забрать результаты.
         _terminate_process_tree(process)
+        stopped_by_us = True
 
     reader.join(timeout=1)
     elapsed = time.monotonic() - started_at
     return_code = process.returncode
+
+    # Штатное завершение: мы сами остановили sing-box после того, как он отдал
+    # все N urltest-результатов. На Windows принудительный kill процесса даёт
+    # return_code=1, но это НЕ ошибка — просто нормальный teardown.
+    graceful = bool(
+        expected_debug_count > 0
+        and result_count >= expected_debug_count
+        and stopped_by_us
+        and timed_out is False
+    )
 
     # urltest unavailable-строки — это нормальный результат проверки, не ошибка.
     # Логируем только реальные проблемы: отсутствие результатов или аварийный выход.
@@ -856,13 +879,14 @@ def run_singbox_admin(
             elapsed,
             expected_debug_count,
         )
-    # Любой ненулевой (или отсутствующий — процесс был убит) exit-код означает,
-    # что sing-box НЕ смог нормально завершиться (например, порт занят, невалидный
-    # конфиг, нехватка прав). Показываем его реальный вывод, иначе ошибка остаётся
-    # незаметной (как в случае 0.2-секундных батчей с return_code=1).
-    if return_code is None or return_code != 0:
+    # Ненулевой exit-код при САМОСТОЯТЕЛЬНОМ аварийном выходе sing-box
+    # (порт занят, невалидный конфиг, нехватка прав и т.п.) — реальная ошибка.
+    # Штатный случай (graceful: мы сами убили sing-box после сбора всех
+    # результатов, на Windows это даёт return_code=1) НЕ логируем как ERROR.
+    crashed = (return_code is None or return_code != 0) and not graceful
+    if crashed:
         LOGGER.error(
-            "sing-box exited with return_code=%s (captured %d lines):",
+            "sing-box exited unexpectedly with return_code=%s (captured %d lines):",
             return_code,
             len(output_lines),
         )
@@ -876,11 +900,12 @@ def run_singbox_admin(
             LOGGER.error("sing-box output: ... (%d more lines)", len(output_lines) - shown)
 
     LOGGER.info(
-        "sing-box run finished: %d/%d urltest results in %.2fs (return_code=%s)",
+        "sing-box run finished: %d/%d urltest results in %.2fs (return_code=%s)%s",
         result_count,
         expected_debug_count,
         elapsed,
         return_code,
+        " [graceful]" if graceful else "",
     )
     return (output_lines, [line for line in output_lines if line])
 
@@ -1005,4 +1030,3 @@ def generate_debug_configs_with_singbox(
     finally:
         os.chdir(old_cwd)
         providers = previous_providers
-

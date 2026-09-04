@@ -449,7 +449,11 @@ def api_whitelist():
     """
     try:
         store = _get_store()
-        lines = store.export_lines(min_stable=WHITELIST_EXPORT_MIN_STABLE)
+        from config.settings import REACHABILITY_GLOBAL_TAG
+        lines = store.export_tagged_lines(
+            min_stable=WHITELIST_EXPORT_MIN_STABLE,
+            global_tag=REACHABILITY_GLOBAL_TAG,
+        )
         if lines:
             return "\n".join(lines), 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception:
