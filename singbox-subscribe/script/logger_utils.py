@@ -44,11 +44,10 @@ def setup_project_logging(
         logger.addHandler(handler)
         return handler
 
-    add_rotating_file_handler("all.log", logging.DEBUG)
     add_rotating_file_handler("info.log", logging.INFO)
-    add_rotating_file_handler("debug.log", logging.DEBUG)
     add_rotating_file_handler("warnings.log", logging.WARNING)
     add_rotating_file_handler("fatal.log", logging.ERROR)
+    add_rotating_file_handler("debug.log", logging.DEBUG)
 
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(console_level)

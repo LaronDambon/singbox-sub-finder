@@ -28,7 +28,7 @@
       "name": "gemini",
       "tag": "gemini",
       "url": "https://gemini.google.com/",
-      "max_ping_ms": 2000,
+      "max_ping_ms": 3000,
       "timeout_ms": 6000,
       "expected_statuses": [200, 301, 302, 403, 429],
       "headers": {

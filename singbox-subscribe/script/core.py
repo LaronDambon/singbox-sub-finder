@@ -722,16 +722,20 @@ _URLTEST_RESULT_RE = re.compile(r"outbound/urltest\[[^\]]+\]: outbound\s+.+?\s+(
 
 
 def _terminate_process_tree(process) -> None:
-    """Надёжно завершает sing-box и все его дочерние процессы.
+    """Достоверно завершает сам sing-box и его дочерние процессы.
 
     Popen.terminate()/kill() на Windows (TerminateProcess) убивает только сам
     процесс и НЕ трогает детей — из-за этого после остановленного по таймауту
     sing-box может остаться жить ещё один экземпляр, который держит inbound-порт.
     Следующий батч тогда падает с "bind: address already in use" -> return_code=1
     -> все 100 конфигов батча помечаются как недоступные.
+
+    ВАЖНО: taskkill /F /T не всегда срабатывает (нет прав / sing-box детачится),
+    поэтому после него обязательно резервный process.kill() (убивает сам процесс
+    через дескриптор Popen). Проверяем через poll() и при необходимости повторяем.
     """
-    try:
-        if os.name == "nt":
+    if os.name == "nt":
+        try:
             # taskkill /T /F убивает дерево процессов, включая детей.
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(process.pid)],
@@ -739,17 +743,21 @@ def _terminate_process_tree(process) -> None:
                 stderr=subprocess.DEVNULL,
                 timeout=10,
             )
-        else:
-            process.terminate()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-    except Exception:  # noqa: BLE001
-        try:
-            process.kill()
         except Exception:  # noqa: BLE001
             pass
+    # Резервный путь: гарантированно убиваем сам Popen-процесс. На Windows под
+    # песочницей taskkill может быть отклонён — TerminateProcess из handle точно.
+    for _ in range(2):
+        if process.poll() is None:
+            try:
+                process.kill()
+            except Exception:  # noqa: BLE001 — уже мёртв
+                pass
+            try:
+                process.wait(timeout=3)
+            except Exception:  # noqa: BLE001
+                pass
+    # Ещё раз дождаться освобождения ПЕРЕД возвратом (чтобы порт точно освободился).
     try:
         process.wait(timeout=3)
     except Exception:  # noqa: BLE001

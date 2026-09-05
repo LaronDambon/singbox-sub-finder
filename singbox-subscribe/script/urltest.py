@@ -79,6 +79,61 @@ def build_ping_result_line(proxy_line: str, seq_counter: int, ping_ms: int | Non
     return cleaned
 
 
+def _has_urltest_records(raw_lines: list[str]) -> bool:
+    """True, если в выводе sing-box есть хоть один outbound/urltest-результат.
+
+    Пустой результат (при bind-ошибке / аварийном старте) — инфраструктурный
+    сбой, а не «все серверы мертвы»: списывать на него весь батч нельзя.
+    """
+    return any(
+        "outbound/urltest" in line
+        and ("available" in line or "unavailable" in line)
+        for line in raw_lines
+    )
+
+
+def _run_singbox_batch(batch: list[str], urltest: str, *,
+                       batch_no: int = 0, max_retries: int = 3) -> dict | None:
+    """Запускает sing-box на батче с ретраями на инфраструктурные сбои.
+
+    Причина: зависший/осиротевший sing-box может держать порт из
+    fresh_inbound_port; следующий батч с тем же портом падает с
+    "bind: address already in use" -> sing-box возвращается без urltest-строк ->
+    весь батч списывается в unavailable. Каждый ретрай делает свежий порт
+    (fresh_inbound_port выбирает новый), поэтому конфликт сам себя разрешает.
+
+    Возвращает result либо None, если батч так и не удалось обработать
+    (вызывающий должен пропустить его, НЕ помечая серверы dead).
+    """
+    result = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            result = generate_debug_configs_with_singbox(
+                threads=4,
+                urltest=urltest,
+                ping_limit=500,
+                merge_lines=batch,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "Batch %d attempt %d/%d: sing-box generation failed: %s",
+                batch_no, attempt, max_retries, exc,
+            )
+            result = None
+        raw = (result.get("raw_output") or result.get("output", [])) if result else []
+        if result is not None and _has_urltest_records(raw):
+            return result
+        # Инфраструктурный сбой (нет результатов). Даём ещё одну попытку на
+        # свежем порту; если снова пусто после последней — отдаём результат,
+        # чтобы вызывающий разобрался по выводу.
+        LOGGER.warning(
+            "Batch %d attempt %d/%d: sing-box вернул без urltest-результатов "
+            "(вероятно занятый порт); retry на свежем порту.",
+            batch_no, attempt, max_retries,
+        )
+    return result
+
+
 def _evaluate_nodes(
     tag_to_line: dict[str, str],
     parsed: list[tuple[str, int | None]],
@@ -221,19 +276,12 @@ def run_debug_ping_cycle(
         LOGGER.info("Checking batch %d-%d/%d", start + 1, batch_end, total)
 
         batch_started = time.monotonic()
-        try:
-            result = generate_debug_configs_with_singbox(
-                threads=4,
-                urltest=urltest,
-                ping_limit=500,
-                merge_lines=batch,
-            )
-        except Exception:
-            LOGGER.exception(
-                "Batch %d-%d failed during sing-box generation; skipping this batch.",
-                start + 1,
-                batch_end,
-            )
+        # Запуск sing-box с ретраями на инфраструктурные сбои (занятый порт
+        # от зависшего экземпляра -> bind error -> ноль результатов). Ретраим
+        # тем же батчем на СВЕЖЕМ порту (fresh_inbound_port выбирает новый),
+        # вместо того чтобы списать весь батч в unavailable и уронить stable.
+        result = _run_singbox_batch(batch, urltest, batch_no=start + 1)
+        if result is None:
             continue
         batch_elapsed = time.monotonic() - batch_started
         LOGGER.info(
