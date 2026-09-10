@@ -4,6 +4,42 @@
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версионирование — [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [2.2.0]
+
+### Added
+- **Временный чс серверов** — защита рабочих конфигов от ложного бана в час-пики
+  (метод работает вместе со stable и скрыто):
+  - в базу добавлены колонки `fail_streak` (серия неудач подряд) и `temp_ban_until`
+    (момент окончания бана); миграция старой базы — автоматически при первом открытии;
+  - `TEMP_BAN_FAILS` (по умолчанию `2`) неудач подряд → сервер на `TEMP_BAN_HOURS`
+    (по умолчанию `12`) часов исключается из проверки и из whitelist;
+  - первая проверка после бана решающая: успех → восстановление, неудача →
+    полноценный чс (`stable=FULL_BAN_STABLE=-2`);
+  - серверы во временном чсе не попадают в `whitelist.txt`, `/api/whitelist`,
+    `/api/servers` и merge-пул, даже если их stable выше порога экспорта;
+  - CLI: `python -m script.server_store reset-temp-bans`.
+- `PURGE_STABLE_BELOW` теперь по умолчанию `-1`: `stable=-1` остаётся в списках
+  проверки, в полноценный чс уходит только `stable=-2`. Ошибочно исключённые
+  ранее серверы (stable >= порога чс) один раз возвращаются в ротацию при первом
+  открытии базы (маркер `servers.tempban-migrated.json`).
+- Стейт-машина переходов состояния вынесена в чистую функцию
+  `script.server_store.compute_next_state()` — её используют и БД (`record_results`),
+  и цикл проверки (`urltest._evaluate_nodes`); в логах батчей и итоговом логе
+  появились счётчики `temp-ban`/`temp_banned`, в `stats()` — зоны
+  `full_ban`/`probation`/`testing`/`proven`/`temp_banned`.
+
+### Changed
+- **Конфигурация переведена на окружение**: `config/settings.py` удалён, вместо него
+  тонкий `config/env.py` — все значения читаются из переменных окружения
+  (`.env` в корне репозитория; приоритет: системное окружение > `.env` > дефолт).
+  Добавлен полноценный шаблон `.env.example` со всеми переменными и комментариями.
+  Новые env-переменные: `URLTEST_URL`, `URLTEST_TIMEOUT` (бывш. TIMEOUT),
+  `URLTEST_BATCH_SIZE` (бывш. BATCH_SIZE), `TEMP_BAN_FAILS`, `TEMP_BAN_HOURS`,
+  `FULL_BAN_STABLE`, `SING_BOX_PATH`, `SING_BOX_OUTPUT_DIR`, `CONFIG_TEMPLATE_DIR`;
+  переименованные читаются с новыми именами во всех модулях
+  (`main.py`, `urltest.py`, `downloader.py`, `core.py`, `country_check.py`,
+  `reachability_check.py`, `server_store.py`, `gensub_api.py`, `deploy_config.py`).
+
 ## [2.1.1]
 
 ### Added
@@ -37,7 +73,7 @@
   - Включение: `DEPLOY_ENABLED=1` в `.env`; настройки — `GH_DEPLOY_REPO`,
     `DEPLOY_TEMPLATE`, `DEPLOY_PATH`, `DEPLOY_CREATE_REPO`.
   - Новый шаблон сборки `config/templates/sbc-1.14.json` (под sing-box 1.14).
-- Поддержка `python-dotenv` + `load_dotenv` в `start.py` и `settings.py`
+- Поддержка `python-dotenv` + `load_dotenv` в `start.py` (теперь и в `config/env.py`)
   (`.env`) в корне; приоритет системных переменных окружения сохранён.
 - Фильтр конфигов с insecure TLS-fingerprint (`fp=/fingerprint=unsafe|none|disabled`)
   на этапе скачивания и при сборке merge — такие узлы sing-box отвергает и

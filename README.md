@@ -2,7 +2,8 @@
 - Собирает списки серверов из источников в `config/subs/urls.json`.
 - Объединяет, очищает и генерирует `source/merge.txt`.
 - Запускает `urltest` через `sing-box`; результат (+1/-1 к `stable`) пишется в центральную базу `source/servers.db` (SQLite).
-- Списки — это проекции базы по фильтру `stable`: `stable > WHITELIST_EXPORT_MIN_STABLE` → `whitelist.txt` (и `/api/whitelist`), `stable < PURGE_STABLE_BELOW` → удаление из проверочного списка (исключаются из пула проверки).
+- Списки — это проекции базы по фильтру `stable`: `stable > WHITELIST_EXPORT_MIN_STABLE` → `whitelist.txt` (и `/api/whitelist`), `stable < PURGE_STABLE_BELOW` → полноценный чс (исключаются из пула проверки).
+- **Временный чс** (защита рабочих серверов от час-пиков): `TEMP_BAN_FAILS` неудач подряд отправляют сервер в бан на `TEMP_BAN_HOURS` часов — он исчезает из проверки и из whitelist, а первая проверка после бана решает его судьбу: успех → восстановление, неудача → полноценный чс (`stable=-2`).
 - Первая полная проверка будет долгой (200к+ серверов). Далее мёртвые серверы выпадают из пула проверки и поиск рабочих конфигов идёт значительно быстрее.
 - Отфильтрованные сервера сохраняются в `source/whitelist.txt`, их можно использовать в любом клиенте без генерации конфига для sing-box.
 - Либо можно сразу же собрать автономный конфиг для запуска sing-box.
@@ -50,14 +51,16 @@ python singbox-subscribe/main.py
 ```
 
 ## Конфигурация
-- Основные пути и настройки — [singbox-subscribe/config/settings.py](singbox-subscribe/config/settings.py#L1).
+- Все настройки — переменные окружения: скопируйте `.env.example` в `.env` и заполните
+  свои значения. Читаются модулем [singbox-subscribe/config/env.py](singbox-subscribe/config/env.py#L1);
+  приоритет: системное окружение (setx/export) > `.env` > значение по умолчанию.
 - Файлы источников URL: `singbox-subscribe/config/subs/*.json`.
 - Шаблоны конфигураций: `singbox-subscribe/config/templates/`.
 
 ## sing-box
 - По умолчанию в папке репозитория присутствуют собранные бинарные файлы `sing-box` для Linux и Windows: `sing-box/sing-box` и `sing-box/sing-box.exe`.
 
-- Вы можете указать путь в `SING_BOX_PATH` в [config/settings.py](singbox-subscribe/config/settings.py#L1) или установить переменную окружения `SING_BOX_PATH`. 
+- Вы можете указать путь в переменной окружения `SING_BOX_PATH` (или в `.env`); по умолчанию используется `sing-box/sing-box.exe` (Windows) или `sing-box/sing-box` (Linux/macOS).
 
 ## Определение страны сервера (country_check)
 Реализация по мотивам [Throne](https://github.com/throneproj/Throne) (core/server/test_utils/speedtest_utils.go):
@@ -77,27 +80,42 @@ python singbox-subscribe/main.py
 
 | Диапазон | Значение |
 |---|---|---|
-| `stable <= -1` | мёртвый: исключён из проверочного пула (`excluded=1`) |
+| `stable = -2` | полноценный чс: исключён из проверочного пула (`excluded=1`) |
+| `stable = -1` | «подозрительный»: остаётся в списках проверки, в whitelist не попадает |
 | `stable 0..1` | в ротации проверки, в списки не попадает |
 | `stable >= 2` | подтверждённый: попадает в `whitelist.txt` и `/api/whitelist` |
 
 Пороги настраиваются переменными окружения:
 - `WHITELIST_EXPORT_MIN_STABLE` (по умолчанию `1`) — экспорт списков: только `stable >` порога;
-- `PURGE_STABLE_BELOW` (по умолчанию `0`) — удаление из проверочного списка: все со `stable <` порога.
+- `PURGE_STABLE_BELOW` (по умолчанию `-1`) — полноценный чс: из проверки исключаются все со `stable <` порога.
+
+### Временный чс (защита от час-пиков)
+В периоды высокой нагрузки рабочие серверы могут провалить пару проверок подряд.
+Чтобы такие серверы не вылетали насовсем, работает «временный чс» (скрыто, вместе со stable):
+- `TEMP_BAN_FAILS` (по умолчанию `2`) неудач **подряд** → сервер попадает во временный чс:
+  `TEMP_BAN_HOURS` (по умолчанию `12`) часов он не проверяется и не попадает в whitelist
+  (даже если его stable формально выше порога экспорта);
+- первая проверка после окончания бана решающая: успех → бан и серия неудач сбрасываются,
+  сервер возвращается в работу; неудача → полноценный чс (`stable=FULL_BAN_STABLE=-2`).
+
+Состояние хранится в колонках `fail_streak` (серия неудач подряд) и `temp_ban_until`
+(момент окончания бана); при первом открытии старой базы они добавляются автоматически,
+а ошибочно исключённые ранее серверы (stable >= порога чс) один раз возвращаются в ротацию.
 
 CLI управления базой (из папки `singbox-subscribe`):
 
 ```bash
 python -m script.server_store stats                 # статистика по зонам stable
 python -m script.server_store export --min-stable 1 # вывести список stable > 1
-python -m script.server_store export --max-stable 0 # вывести мёртвые (stable < 0)
-python -m script.server_store purge --below 0       # исключить мёртвые из проверки (--hard — удалить физически)
-python -m script.server_store reset-excluded        # вернуть исключённые в ротацию (stable -> 0)
+python -m script.server_store export --max-stable -1 # вывести полноценный чс (stable < -1)
+python -m script.server_store purge --below -1       # исключить полноценный чс из проверки (--hard — удалить физически)
+python -m script.server_store reset-excluded         # вернуть исключённые в ротацию (сброс состояния)
+python -m script.server_store reset-temp-bans        # снять все временные чс
 ```
 
 HTTP API (дополнительно к `/api/whitelist`, который теперь читает базу):
 - `GET /api/servers/stats` — статистика базы;
-- `GET /api/servers?min_stable=1` — выборка `stable > 1`; `?max_stable=0` — `stable < 0`; поддержан `limit`.
+- `GET /api/servers?min_stable=1` — выборка `stable > 1`; `?max_stable=-1` — `stable < -1` (полноценный чс); поддержан `limit`. Серверы в действующем временном чсе не отдаются.
 
 ## Логи
 - Логи записываются в папку `logs/`.

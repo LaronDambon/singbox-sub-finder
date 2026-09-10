@@ -8,7 +8,7 @@ UTILS = ROOT / "utils"
 
 from flask import Flask, jsonify, request, render_template_string
 
-from config.settings import (
+from config.env import (
     URLTEST_TEMPLATE,
     WHITELIST_FILE,
     FLASK_HOST,
@@ -449,7 +449,7 @@ def api_whitelist():
     """
     try:
         store = _get_store()
-        from config.settings import REACHABILITY_GLOBAL_TAG
+        from config.env import REACHABILITY_GLOBAL_TAG
         lines = store.export_tagged_lines(
             min_stable=WHITELIST_EXPORT_MIN_STABLE,
             global_tag=REACHABILITY_GLOBAL_TAG,

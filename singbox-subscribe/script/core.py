@@ -14,7 +14,7 @@ from parsers.clash2base64 import clash2v2ray
 
 ROOT = Path(__file__).resolve().parents[1]
 
-from config.settings import SING_BOX_PATH, URLTEST_TEMPLATE, CONFIG_TEMPLATE_DIR, SING_BOX_PORT
+from config.env import SING_BOX_PATH, URLTEST_TEMPLATE, CONFIG_TEMPLATE_DIR, SING_BOX_PORT
 from script.logger_utils import get_project_logger
 
 warnings.filterwarnings("ignore", category=requests.packages.urllib3.exceptions.DependencyWarning)
@@ -34,7 +34,7 @@ def get_inbound_port(template_data: dict | None = None) -> int:
 
     Priority:
       1. ENV `SING_BOX_PORT`
-      2. `config.settings.SING_BOX_PORT` if set (>0)
+      2. `config.env.SING_BOX_PORT` if set (>0)
       3. `listen_port` found in provided template_data (if any)
       4. allocate a free ephemeral port and cache it for the lifetime of the process
     """
@@ -53,7 +53,7 @@ def get_inbound_port(template_data: dict | None = None) -> int:
     except Exception:
         pass
 
-    # 2. settings
+    # 2. config.env
     try:
         if isinstance(SING_BOX_PORT, int) and SING_BOX_PORT > 0:
             _ALLOCATED_SINGBOX_PORT = int(SING_BOX_PORT)

@@ -66,7 +66,7 @@ import requests
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-# Локальные секреты/настройки из .env в корне репозитория (как в config/settings.py):
+# Локальные секреты/настройки из .env в корне репозитория (как в config/env.py):
 # GH_DEPLOY_TOKEN, GH_READ_TOKEN, DEPLOY_IP_SOURCE и т.д. override=False —
 # переменные системного окружения имеют приоритет.
 try:
@@ -116,13 +116,13 @@ def _load_source_uris(args) -> list[str]:
         return lines
 
     # Источник по умолчанию — whitelist центральной базы (stable > порога).
-    from config.settings import SERVERS_DB_FILE, WHITELIST_EXPORT_MIN_STABLE
+    from config.env import SERVERS_DB_FILE, WHITELIST_EXPORT_MIN_STABLE
     from script.server_store import ServerStore
 
     store = ServerStore(SERVERS_DB_FILE)
     # export_tagged_lines добавляет capability-тэги ([name] / [Global]) к строкам
     # на этапе экспорта для генерации итогового конфига.
-    from config.settings import REACHABILITY_GLOBAL_TAG
+    from config.env import REACHABILITY_GLOBAL_TAG
     lines = store.export_tagged_lines(
         min_stable=WHITELIST_EXPORT_MIN_STABLE,
         global_tag=REACHABILITY_GLOBAL_TAG,
@@ -487,7 +487,7 @@ def deploy(
       token      — ДЕПЛОЙ-ключ (write), только для пуша, наружу не выдаётся;
       read_token — READ-ключ (read-only), вшивается в ссылку на скачивание.
 
-    Параметры по умолчанию берутся из переменных окружения / settings:
+    Параметры по умолчанию берутся из переменных окружения (.env / config.env):
       GH_DEPLOY_TOKEN, GH_READ_TOKEN. Авто-деплой после цикла проверки:
         from deploy_config import deploy
         deploy(silent=True)

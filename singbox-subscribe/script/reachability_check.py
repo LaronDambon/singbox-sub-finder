@@ -33,7 +33,7 @@ import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 
-from config.settings import (
+from config.env import (
     SING_BOX_PATH,
     COUNTRYTEST_TEMPLATE,
     REACHABILITY_TARGETS_FILE,
@@ -377,7 +377,7 @@ def batch_reachability_check(proxy_lines: list[str], *,
 
     Возвращает {proxy_line: {"error": str|None, "targets": {name: {ok,status,latency_ms,error}}}}.
     """
-    from config.settings import REACHABILITY_CONCURRENCY
+    from config.env import REACHABILITY_CONCURRENCY
 
     if concurrency is None:
         concurrency = REACHABILITY_CONCURRENCY

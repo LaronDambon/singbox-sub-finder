@@ -358,7 +358,7 @@ def _download_sources_parallel(urls: list[str], download_dir: Path,
     """Параллельно скачивает все источники; возвращает список существующих файлов."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    from config.settings import SUB_DOWNLOAD_CONCURRENCY
+    from config.env import SUB_DOWNLOAD_CONCURRENCY
 
     results: list[dict] = []
     workers = max(1, min(int(SUB_DOWNLOAD_CONCURRENCY), len(urls)))
@@ -433,7 +433,7 @@ def build_merge_from_urls(
         }
 
     # --- Центральная база: регистрируем всё скачанное и собираем пул проверки ---
-    from config.settings import (
+    from config.env import (
         SERVERS_DB_FILE,
         WHITELIST_FILE,
         WHITELIST_EXPORT_MIN_STABLE,
@@ -472,7 +472,7 @@ def build_merge_from_urls(
 
     # Экспорт подтверждённых серверов (stable > порога) в whitelist.txt —
     # файловая проекция базы для внешних потребителей.
-    from config.settings import REACHABILITY_GLOBAL_TAG
+    from config.env import REACHABILITY_GLOBAL_TAG
     exported = store.export_tagged_to_file(
         WHITELIST_FILE,
         min_stable=WHITELIST_EXPORT_MIN_STABLE,

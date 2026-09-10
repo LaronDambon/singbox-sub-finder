@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 # Прямые пакеты доступны через package imports, sys.path правки не нужны.
 
-from config.settings import URLS_FILE, MERGE_FILE, LOG_FILE, URLTEST_URL, URLTEST_TEMPLATE, SING_BOX_OUTPUT_DIR
+from config.env import URLS_FILE, MERGE_FILE, LOG_FILE, URLTEST_URL, URLTEST_TEMPLATE, SING_BOX_OUTPUT_DIR
 from script.logger_utils import capture_stdout_stderr_to_logger, get_project_logger, setup_project_logging
 import importlib
 

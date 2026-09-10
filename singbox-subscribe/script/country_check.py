@@ -48,7 +48,7 @@ import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 
-from config.settings import (
+from config.env import (
     SING_BOX_PATH,
     COUNTRYTEST_TEMPLATE,
     COUNTRY_CHECK_TIMEOUT,
@@ -430,7 +430,7 @@ def batch_country_check(proxy_lines: list[str], *, concurrency: int | None = Non
     Возвращает dict {proxy_line: результат-словарь} с ключами:
     country, country_code, emoji, server_name, latency_ms, error.
     """
-    from config.settings import COUNTRY_CHECK_CONCURRENCY
+    from config.env import COUNTRY_CHECK_CONCURRENCY
 
     if concurrency is None:
         concurrency = COUNTRY_CHECK_CONCURRENCY
