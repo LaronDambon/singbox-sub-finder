@@ -79,7 +79,15 @@ DEPLOY_ENABLED = os.getenv("DEPLOY_ENABLED", "0") == "1"
 GH_DEPLOY_REPO = os.getenv("GH_DEPLOY_REPO", "LaronDambon/sing-box-config")
 # Какой шаблон из config/templates использовать для сборки деплоя
 DEPLOY_TEMPLATE = os.getenv("DEPLOY_TEMPLATE", "sbc-1.14.json")
-# Путь файла внутри репозитория
+# Мульти-деплой: несколько шаблонов через запятую/пробел или 'all' (все из config/templates).
+# Если задан — авто-деплой деплоит КАЖДЫЙ шаблон, итоговый файл называется именем шаблона.
+DEPLOY_TEMPLATES = os.getenv("DEPLOY_TEMPLATES", "")
+# Путь файла внутри репозитория (в мульти-режиме используется только каталог из него)
 DEPLOY_PATH = os.getenv("DEPLOY_PATH", "config.json")
 # Создавать репозиторий автоматически, если его нет (0/1)
 DEPLOY_CREATE_REPO = os.getenv("DEPLOY_CREATE_REPO", "0") == "1"
+# Источник текущего IP сервера для плейсхолдера в шаблоне деплоя:
+# путь к локальному файлу (первая непустая строка) либо http(s)-ссылка
+DEPLOY_IP_SOURCE = os.getenv("DEPLOY_IP_SOURCE", "")
+# Имя плейсхолдера в шаблоне, замещаемого актуальным IP (по умолчанию {{SERVER_IP}})
+DEPLOY_IP_PLACEHOLDER = os.getenv("DEPLOY_IP_PLACEHOLDER", "{{SERVER_IP}}")

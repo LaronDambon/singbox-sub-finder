@@ -36,6 +36,7 @@ from config.settings import (
     DEPLOY_ENABLED,
     GH_DEPLOY_REPO,
     DEPLOY_TEMPLATE,
+    DEPLOY_TEMPLATES,
     DEPLOY_PATH,
 )
 
@@ -455,9 +456,42 @@ def _auto_deploy():
     Вызывается в конце run_debug_ping_cycle, когда whitelist уже обновлён.
     Никогда не бросает исключений наружу — при любой ошибке логирует и
     возвращает None, чтобы сбой деплоя не ломал основной цикл проверки.
+
+    Мульти-режим: если задан DEPLOY_TEMPLATES (имена через запятую/пробел или
+    'all' — все шаблоны из config/templates), деплоится КАЖДЫЙ шаблон, а
+    итоговый файл называется именем шаблона. Иначе — один шаблон DEPLOY_TEMPLATE,
+    как раньше.
     """
     try:
-        from deploy_config import deploy
+        from deploy_config import deploy, deploy_multi
+
+        if DEPLOY_TEMPLATES:
+            tpl_list = [t for t in DEPLOY_TEMPLATES.replace(",", " ").split() if t]
+            LOGGER.info(
+                "Авто-деплой (мульти) в GitHub: repo=%s templates=%s path=%s",
+                GH_DEPLOY_REPO, tpl_list, DEPLOY_PATH,
+            )
+            res = deploy_multi(
+                repo=GH_DEPLOY_REPO,
+                templates=tpl_list,
+                path=DEPLOY_PATH,
+                silent=True,
+            )
+            if res.get("ok"):
+                LOGGER.info(
+                    "Авто-деплой выполнен: %s/%s шаблонов (ветка %s)",
+                    res.get("deployed"), len(res.get("results") or []), res.get("branch"),
+                )
+                for r in res.get("results") or []:
+                    LOGGER.info("  %s -> %s (commit %s)", r.get("template"), r.get("url"), r.get("commit_sha"))
+            else:
+                LOGGER.warning("Авто-деплой не выполнен: %s", res.get("error"))
+            if any(r.get("url_uses_write_token") for r in res.get("results") or []):
+                LOGGER.warning(
+                    "GH_READ_TOKEN не задан: ссылки на скачивание содержат ДЕПЛОЙ-токен "
+                    "(write). Задайте GH_READ_TOKEN и не раздавайте эти ссылки наружу."
+                )
+            return res
 
         LOGGER.info(
             "Авто-деплой конфига в GitHub: repo=%s template=%s path=%s",
