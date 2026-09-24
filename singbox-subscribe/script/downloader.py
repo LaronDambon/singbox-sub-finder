@@ -461,11 +461,43 @@ def build_merge_from_urls(
             seen_keys.add(key)
             source_lines.append(clean)
 
-    upsert_res = store.upsert_lines(source_lines)
+    # Отделяем строки, которые ни один парсер не превращает в узел: проверить
+    # их нельзя, поэтому сразу отправляем в чс, а не в merge.txt. Иначе такой
+    # мусор (битые ss/vless/vmess-ссылки) занимает батчи проверки и засоряет
+    # лог в каждом цикле.
+    #
+    # Кандидаты = всё скачанное + всё, что уже лежит в пуле проверки: мусор мог
+    # накопиться в базе раньше (от удалённых источников или до этого фикса) и
+    # сам по себе из пула не исчезнет — он никогда не проверяется, поэтому
+    # stable у него не меняется.
+    from script import core as core_mod
+
+    candidates = list(source_lines)
+    known_lines = set(source_lines)
+    for row in store.check_pool():
+        line = row["line"]
+        if line and line not in known_lines:
+            known_lines.add(line)
+            candidates.append(line)
+
+    parsable_lines, unparsable_lines = core_mod.split_parsable_lines(candidates)
+    if unparsable_lines:
+        logger.info(
+            "Отфильтровано %d неразбираемых строк (нет парсера/битый формат)",
+            len(unparsable_lines),
+        )
+
+    upsert_res = store.upsert_lines(parsable_lines)
     logger.info(
         "База серверов: добавлено %d новых, обновлено %d известных (источников строк: %d)",
-        upsert_res["added"], upsert_res["updated"], len(source_lines),
+        upsert_res["added"], upsert_res["updated"], len(parsable_lines),
     )
+
+    blacklisted = store.blacklist_unparsable(unparsable_lines) if unparsable_lines else 0
+    if blacklisted:
+        logger.info(
+            "Чс: %d неразбираемых серверов исключены из проверки (blacklist)", blacklisted,
+        )
 
     logger.info("Сборка %s из пула проверки базы", output_path_path)
     merged_count = write_merge_from_pool(store, output_path_path)
@@ -493,6 +525,7 @@ def build_merge_from_urls(
         "merged_count": merged_count,
         "db": db_stats,
         "upsert": upsert_res,
+        "blacklisted": blacklisted,
         "whitelist_exported": exported,
         "partial_files": [str(path) for path in partial_files],
         "logger": logger,

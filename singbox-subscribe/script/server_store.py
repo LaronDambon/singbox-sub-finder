@@ -366,6 +366,48 @@ class ServerStore:
                     )
         return {"added": added, "updated": updated, "skipped": skipped}
 
+    def blacklist_unparsable(self, lines: Iterable[str]) -> int:
+        """Отправляет неразбираемые строки в полноценный чс.
+
+        Строка, из которой ни один парсер не может собрать узел, не
+        проверяется вообще: она лишь занимает слот в батче проверки и засоряет
+        лог. Помечаем её excluded=1 и stable=FULL_BAN_STABLE — тогда она
+        выпадает из пула проверки (check_pool) и попадает в blacklist.txt
+        (проекция stable < PURGE_STABLE_BELOW).
+
+        Существующие серверы не теряются: обновляется только флаг/зона,
+        строка (line) и страна остаются как были.
+
+        Возвращает количество уникальных ключей, переведённых в чс.
+        """
+        now = _now()
+        full_ban = int(FULL_BAN_STABLE)
+        unique: dict[str, str] = {}
+        for raw in lines:
+            clean = str(raw).strip()
+            if not clean:
+                continue
+            key = self._key_of(clean)
+            if not key:
+                continue
+            unique.setdefault(key, clean)
+        if not unique:
+            return 0
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO servers"
+                " (key, line, stable, excluded, first_seen, last_seen)"
+                " VALUES (?, ?, ?, 1, ?, ?)",
+                [(key, line, full_ban, now, now) for key, line in unique.items()],
+            )
+            conn.executemany(
+                "UPDATE servers SET excluded = 1, stable = ?, fail_streak = 0,"
+                " temp_ban_until = NULL, available = 0, last_seen = ?"
+                " WHERE key = ?",
+                [(full_ban, now, key) for key in unique],
+            )
+        return len(unique)
+
     def record_results(self, rows: Sequence[dict]) -> None:
         """Записывает результаты проверки пачкой (один commit на batch).
 

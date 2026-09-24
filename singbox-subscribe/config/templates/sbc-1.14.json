@@ -353,28 +353,6 @@
       "tolerance": 100
     },
     {
-      "tag": "Aniliberty-ping",
-      "type": "urltest",
-      "outbounds": ["{all}"],
-      "filter": [
-        {
-          "action": "include",
-          "keywords": ["aniliberty"]
-        }
-      ],
-      "url": "https://www.aniliberty.top",
-      "interval": "10m",
-      "tolerance": 50
-    },
-    {
-      "tag": "Aniliberty",
-      "type": "urltest",
-      "outbounds": ["Aniliberty-ping", "proxy"],
-      "url": "https://www.anilibria.top",
-      "interval": "1m",
-      "tolerance": 100
-    },
-    {
       "tag": "direct",
       "type": "direct"
     }

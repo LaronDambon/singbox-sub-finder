@@ -17,3 +17,11 @@ singbox-subscribe/.tmp_tests/
 singbox-subscribe/_bench_tmp/
 *.db-wal
 *.db-shm
+
+# Singbox subscribe config templates
+sbc-1.14-ray-phone.json
+sbc-1.14-ray-pc.json
+sbc-1.14-ray-tab.json
+sbc-1.14-nika-phone.json
+sbc-1.14-nika-tab.json
+sbc-1.14-server.json

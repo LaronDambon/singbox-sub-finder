@@ -251,6 +251,27 @@ def get_nodes(url):
         return processed_list
 
 
+# Сколько одинаковых пропусков на протокол писать в debug.log за процесс.
+# Битая подписка легко даёт тысячи неразбираемых ссылок; без ограничения они
+# забивают debug.log одинаковыми сообщениями.
+_SKIP_LOG_LIMIT = 20
+_skip_log_counters: dict[str, int] = {}
+
+
+def _log_skipped_line(reason: str, proto: str | None, line: str) -> None:
+    """Пишет пропущенную строку в debug.log, но не более _SKIP_LOG_LIMIT раз
+    на протокол (дальше — только одна строка-уведомление)."""
+    key = proto or "unknown"
+    count = _skip_log_counters.get(key, 0) + 1
+    _skip_log_counters[key] = count
+    if count <= _SKIP_LOG_LIMIT:
+        LOGGER.debug("parse_content: %s (строка пропущена): %s", reason, line[:200])
+    elif count == _SKIP_LOG_LIMIT + 1:
+        LOGGER.debug(
+            "parse_content: протокол '%s': дальнейшие пропуски не логируются (счётчик)", key
+        )
+
+
 def parse_content(content):
     # firstline = tool.firstLine(content)
     # # print(firstline)
@@ -265,9 +286,9 @@ def parse_content(content):
         if not factory:
             proto = tool.get_protocol(t)
             if proto:
-                LOGGER.debug("parse_content: нет парсера для протокола '%s' (строка пропущена)", proto)
+                _log_skipped_line(f"нет парсера для протокола '{proto}'", proto, t)
             else:
-                LOGGER.debug("parse_content: не удалось определить протокол (строка пропущена): %s", t[:120])
+                _log_skipped_line("не удалось определить протокол", None, t)
             continue
         try:
             node = factory(t)
@@ -278,7 +299,8 @@ def parse_content(content):
         if node:
             nodelist.append(node)
         else:
-            LOGGER.debug("parse_content: парсер '%s' вернул None (строка пропущена): %s", tool.get_protocol(t), t[:200])
+            proto = tool.get_protocol(t)
+            _log_skipped_line(f"парсер '{proto}' вернул None", proto, t)
     return nodelist
 
 
@@ -296,6 +318,59 @@ def get_parser(node):
     if not proto or proto not in parsers_mod.keys():
         return None
     return parsers_mod[proto].parse
+
+
+# Схемы, для которых get_nodes разбирает строку ЛОКАЛЬНО (без сетевых
+# запросов) — совпадает со списком prefixes в get_content_from_url.
+_LOCAL_URI_PREFIXES = (
+    "vmess://", "vless://", "ss://", "ssr://", "trojan://", "tuic://",
+    "hysteria://", "hysteria2://", "hy2://", "wg://", "wireguard://",
+    "http2://", "socks://", "socks5://",
+)
+
+
+def split_parsable_lines(lines):
+    """Делит строки на разбираемые и нет: (parsable, unparsable).
+
+    «Разбираемая» — строка, из которой получается хотя бы один outbound-dict,
+    то есть её реально можно проверить через sing-box. Всё остальное
+    (неизвестный протокол, отсутствие парсера, битый формат) проверить нельзя:
+    такие строки не должны попадать в пул проверки.
+
+    Используется на этапе сборки merge.txt, чтобы сразу отправить мусор в чс,
+    а не тратить на него батчи проверки в каждом цикле.
+    """
+    global providers
+    previous_providers = providers
+    old_cwd = os.getcwd()
+    parsable: list[str] = []
+    unparsable: list[str] = []
+    try:
+        os.chdir(ROOT)
+        init_parsers()
+        providers = {"exclude_protocol": "", "subscribes": []}
+        for raw in lines:
+            text = str(raw).strip()
+            if not text:
+                continue
+            # Только схемы, которые разбираются локально: иначе get_nodes
+            # попытается скачать строку как URL подписки.
+            if not text.startswith(_LOCAL_URI_PREFIXES):
+                unparsable.append(text)
+                continue
+            try:
+                nodes = get_nodes(text)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("split_parsable_lines: ошибка разбора: %s", exc)
+                nodes = None
+            if nodes and any(isinstance(node, dict) for node in nodes):
+                parsable.append(text)
+            else:
+                unparsable.append(text)
+        return parsable, unparsable
+    finally:
+        os.chdir(old_cwd)
+        providers = previous_providers
 
 
 def get_content_from_url(url, n=10):
@@ -957,6 +1032,7 @@ def generate_debug_configs_with_singbox(
                 "command": [],
                 "output": [],
                 "node_count": 0,
+                "unparsable_lines": [],
             }
 
         lines = [line.strip() for line in merge_lines if line.strip()]
@@ -964,17 +1040,23 @@ def generate_debug_configs_with_singbox(
 
         parsed_nodes = []
         parsed_node_lines = []
+        # Строки, из которых не собрался ни один узел: их нельзя проверить,
+        # вызывающий переводит их в чс (см. ServerStore.blacklist_unparsable).
+        unparsable_lines = []
         skipped_lines = 0
         for line_index, line in enumerate(lines, start=1):
             nodes = get_nodes(line)
             if not nodes:
                 skipped_lines += 1
+                unparsable_lines.append(line)
                 continue
             node_index = 0
+            line_used = False
             for node in nodes:
                 if not isinstance(node, dict):
                     skipped_lines += 1
                     continue
+                line_used = True
                 original_tag = node.get("tag")
                 if original_tag:
                     node_index += 1
@@ -984,6 +1066,8 @@ def generate_debug_configs_with_singbox(
                     node["tag"] = numbered_tag
                 parsed_nodes.append(node)
                 parsed_node_lines.append(line)
+            if not line_used:
+                unparsable_lines.append(line)
 
         if skipped_lines:
             LOGGER.info(
@@ -1001,6 +1085,7 @@ def generate_debug_configs_with_singbox(
                 "node_count": 0,
                 "parsed_nodes": [],
                 "parsed_node_lines": [],
+                "unparsable_lines": unparsable_lines,
             }
 
         config = build_singbox_config_from_nodes(template_data, parsed_nodes)
@@ -1034,6 +1119,7 @@ def generate_debug_configs_with_singbox(
             "node_count": len(parsed_nodes),
             "parsed_nodes": parsed_nodes,
             "parsed_node_lines": parsed_node_lines,
+            "unparsable_lines": unparsable_lines,
         }
     finally:
         os.chdir(old_cwd)

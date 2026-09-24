@@ -34,7 +34,7 @@
       "outbounds": [
         "{all}"
       ],
-      "url": "https://cp.cloudflare.com/gen_204",
+      "url": "https://speed.cloudflare.com/__down?during=download&bytes=2048576",
       "interval": "5m",
       "tolerance": 50
     },

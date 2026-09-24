@@ -291,6 +291,7 @@ def run_debug_ping_cycle(
     checked = 0
     available_count = 0
     failed_count = 0
+    unparsable_banned = 0
     cycle_started = time.monotonic()
 
     for start in range(0, total, batch_size):
@@ -312,6 +313,18 @@ def run_debug_ping_cycle(
             "Batch %d-%d sing-box finished in %.2fs, captured %d output lines",
             start + 1, batch_end, batch_elapsed, len(result.get("output", [])),
         )
+
+        # Строки батча, из которых не собрался ни один узел, проверить нельзя:
+        # сразу отправляем их в чс, чтобы они не занимали батчи в следующих
+        # циклах (страховка к фильтру на этапе сборки merge.txt).
+        unparsable_lines = result.get("unparsable_lines") or []
+        if unparsable_lines:
+            banned_now = store.blacklist_unparsable(unparsable_lines)
+            unparsable_banned += banned_now
+            LOGGER.info(
+                "Batch %d-%d: %d неразбираемых строк отправлено в чс (blacklist)",
+                start + 1, batch_end, banned_now,
+            )
 
         output_lines = result.get("raw_output") or result.get("output", [])
         parsed = parse_ping_from_output(output_lines)
@@ -448,11 +461,11 @@ def run_debug_ping_cycle(
     LOGGER.info(
         "Ping cycle finished in %.2fs: processed=%d checked=%d available=%d failed=%d | "
         "db: total=%d active=%d excluded=%d proven=%d temp_banned=%d | "
-        "excluded_now=%d wl_export=%d bl_export=%d",
+        "excluded_now=%d unparsable_banned=%d wl_export=%d bl_export=%d",
         total_elapsed, processed, checked, available_count, failed_count,
         stats["total"], stats["active"], stats["excluded"],
         stats["zones"]["proven"], stats["zones"]["temp_banned"],
-        purged, exported_wl, exported_bl,
+        purged, unparsable_banned, exported_wl, exported_bl,
     )
 
     # --- Авто-деплой собранного конфига в GitHub (если включён) ---
@@ -468,6 +481,7 @@ def run_debug_ping_cycle(
         "available": available_count,
         "failed": failed_count,
         "excluded_now": purged,
+        "unparsable_banned": unparsable_banned,
         "whitelist_exported": exported_wl,
         "blacklist_exported": exported_bl,
         "whitelist_path": str(whitelist_output),

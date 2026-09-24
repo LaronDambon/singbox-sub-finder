@@ -64,8 +64,9 @@ def parse(data):
             return node
         else:
             proxy_str = tool.b64Decode(info).decode('utf-8')
-    except:
-        print(info)
+    except Exception:
+        # Битая vmess-строка: без вывода в stdout — причина уже логируется
+        # через parse_content (иначе битые подписки забивают лог base64-мусором).
         return None
     try:
         item = json.loads(proxy_str)

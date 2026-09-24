@@ -94,7 +94,7 @@ FULL_BAN_STABLE = _int("FULL_BAN_STABLE", -2)
 
 # --------------------------------------------------------- проверка urltest
 # URL для проверки доступности (лёгкий 204-ответ; можно заменить на «тяжёлый»).
-URLTEST_URL = os.getenv("URLTEST_URL", "https://cp.cloudflare.com/gen_204")
+URLTEST_URL = os.getenv("URLTEST_URL", "https://speed.cloudflare.com/__down?during=download&bytes=2048576")
 # Таймаут одной проверки, сек.
 URLTEST_TIMEOUT = _float("URLTEST_TIMEOUT", 10.0)
 # Сколько серверов проверять за один запуск sing-box.

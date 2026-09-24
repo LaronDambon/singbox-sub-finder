@@ -80,9 +80,9 @@
       }
     },
     {
-      "name": "aniliberty",
-      "tag": "aniliberty",
-      "url": "https://www.aniliberty.top",
+      "name": "yandex",
+      "tag": "yandex",
+      "url": "https://yandex.ru/portal/generate_204",
       "max_ping_ms": 2000,
       "timeout_ms": 6000,
       "expected_statuses": [200, 301, 302, 403, 429],
