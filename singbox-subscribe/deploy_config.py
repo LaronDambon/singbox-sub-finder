@@ -115,20 +115,20 @@ def _load_source_uris(args) -> list[str]:
         lines = [ln.strip() for ln in path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
         return lines
 
-    # Источник по умолчанию — whitelist центральной базы (stable > порога).
-    from config.env import SERVERS_DB_FILE, WHITELIST_EXPORT_MIN_STABLE
+    # Источник по умолчанию — whitelist центральной базы: серверы,
+    # пинговавшиеся в последней проверке (available=1).
+    from config.env import SERVERS_DB_FILE
     from script.server_store import ServerStore
 
     store = ServerStore(SERVERS_DB_FILE)
-    # export_tagged_lines добавляет capability-тэги ([name] / [Global]) к строкам
+    # export_whitelist_lines добавляет capability-тэги ([name] / [Global]) к строкам
     # на этапе экспорта для генерации итогового конфига.
     from config.env import REACHABILITY_GLOBAL_TAG
-    lines = store.export_tagged_lines(
-        min_stable=WHITELIST_EXPORT_MIN_STABLE,
-        global_tag=REACHABILITY_GLOBAL_TAG,
-    )
+    lines = store.export_whitelist_lines(global_tag=REACHABILITY_GLOBAL_TAG)
     if not lines:
-        raise RuntimeError("В whitelist базы нет серверов (stable > порога). Нечего собирать.")
+        raise RuntimeError(
+            "В whitelist базы нет серверов (ни один не пинговался в последней проверке). Нечего собирать."
+        )
     return lines
 
 

@@ -2,33 +2,34 @@
 
 Заменяет связку whitelist.txt/blacklist.txt:
   * каждый известный сервер хранится одной записью с ключом normalize_proxy_key;
-  * stable накапливается между запусками (+1 успех, -1 неудача);
-  * временный чс (защита от час-пиков): TEMP_BAN_FAILS неудач ПОДРЯД отправляют
-    сервер в бан на TEMP_BAN_HOURS часов — из проверки и из whitelist он исчезает
-    «скрыто», а первая проверка после окончания бана решает его судьбу:
-    успех -> восстановление, неудача -> полноценный чс (stable = FULL_BAN_STABLE);
-  * списки выводятся из базы фильтром: stable > WHITELIST_EXPORT_MIN_STABLE —
-    в экспорт (whitelist.txt, /api/whitelist); серверы во временном чс не
-    экспортируются, даже если их stable формально проходит порог;
-  * серверы со stable < PURGE_STABLE_BELOW (по умолчанию только stable=-2 —
-    полноценный чс) исключаются из проверочного пула (флаг excluded) и могут
-    быть возвращены вручную (CLI reset-excluded).
+  * stable — накопленный счётчик здоровья: успех проверки +1 (БЕЗ потолка),
+    неудача -1 (пол FULL_BAN_STABLE). У давно работающего сервера большой
+    «запас прочности»: один провал не выбрасывает его ни из проверки, ни
+    откуда-либо ещё — stable просто уменьшается на 1 (например, 20 -> 19);
+  * смерть сервера: stable < PURGE_STABLE_BELOW (по умолчанию stable=-2) —
+    полноценный чс, флаг excluded=1: сервер выпадает из пула проверки и может
+    быть возвращён вручную (CLI reset-excluded);
+  * пул проверки — ВСЕ серверы выше порога чса (excluded=0), без ограничений:
+    и подтверждённые, и «подозрительные», и ещё ни разу не проверенные;
+  * whitelist (whitelist.txt, /api/whitelist) — проекция ПОСЛЕДНЕЙ проверки:
+    сервер пинганулся (available=1) -> добавляется в whitelist, не пинганулся ->
+    не добавляется. Принципа «2 раза не пинганулся — убрать» больше нет: провал
+    не удаляет сервер из проверки, а лишь не добавляет его в whitelist на этом
+    цикле; реально мёртвый сервер «истекает» сам — stable уходит в минус за
+    (stable + 2) провальных проверок и сервер исключается purge'ом.
 
-Зоны stable при настройках по умолчанию (export>1, purge<-1, full ban=-2):
+Зоны stable при настройках по умолчанию (purge<-1, пол=-2):
   stable = -2   — полноценный чс: исключён из проверки (excluded=1)
-  stable = -1   — «подозрительный»: остаётся в списках проверки, в whitelist не попадает
-  stable 0..1   — в ротации проверки, в списки не попадают
-  stable >= 2   — подтверждённые, идут в экспорт списков
-Колонки временного чс:
-  fail_streak    — счётчик подряд идущих неудачных проверок
-  temp_ban_until — ISO-момент окончания временного чса (NULL — бана нет)
+  stable = -1   — «подозрительный»: в ротации проверки, в whitelist не попадает
+  stable >= 0   — в ротации; в whitelist попадает по результату ПОСЛЕДНЕЙ
+                  проверки (available=1)
+Колонка available — результат последней проверки (1/0/NULL — ещё не проверялся).
 
 CLI:
   python -m script.server_store stats
   python -m script.server_store export [--min-stable N] [--max-stable N] [--out FILE]
   python -m script.server_store purge [--below N] [--hard]
   python -m script.server_store reset-excluded
-  python -m script.server_store reset-temp-bans
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ import argparse
 import json
 import re
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -45,10 +46,6 @@ from config.env import (
     FULL_BAN_STABLE,
     PURGE_STABLE_BELOW,
     SERVERS_DB_FILE,
-    STABLE_MAX,
-    TEMP_BAN_FAILS,
-    TEMP_BAN_HOURS,
-    WHITELIST_EXPORT_MIN_STABLE,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,8 +57,6 @@ CREATE TABLE IF NOT EXISTS servers (
     key            TEXT PRIMARY KEY,
     line           TEXT NOT NULL,
     stable         INTEGER NOT NULL DEFAULT 0,
-    fail_streak    INTEGER NOT NULL DEFAULT 0,
-    temp_ban_until TEXT,
     ping_ms        INTEGER,
     protocol       TEXT NOT NULL DEFAULT '',
     country        TEXT NOT NULL DEFAULT '',
@@ -78,24 +73,13 @@ CREATE INDEX IF NOT EXISTS idx_servers_stable ON servers(stable);
 CREATE INDEX IF NOT EXISTS idx_servers_excluded ON servers(excluded);
 """
 
-# Индекс создаётся в __init__ ПОСЛЕ миграции колонок (в старой базе колонки
-# temp_ban_until может ещё не быть).
-TEMP_BAN_INDEX_SQL = "CREATE INDEX IF NOT EXISTS idx_servers_temp_ban ON servers(temp_ban_until)"
-
-# Фильтр «сервер не в действующем временном чс». Сравнение ISO-строк
-# лексикографическое — оба значения пишутся в одном формате (UTC, секунды).
-_NOT_BANNED_SQL = "(temp_ban_until IS NULL OR temp_ban_until = '' OR temp_ban_until <= ?)"
-_BANNED_SQL = "(temp_ban_until IS NOT NULL AND temp_ban_until != '' AND temp_ban_until > ?)"
-
 UPSERT_RESULT_SQL = """
 INSERT INTO servers (
-    key, line, stable, fail_streak, temp_ban_until, ping_ms, protocol,
-    country, capabilities, available, checks, fails, first_seen, last_seen, last_checked
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+    key, line, stable, ping_ms, protocol, country, capabilities,
+    available, checks, fails, first_seen, last_seen, last_checked
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
 ON CONFLICT(key) DO UPDATE SET
     stable         = excluded.stable,
-    fail_streak    = excluded.fail_streak,
-    temp_ban_until = excluded.temp_ban_until,
     ping_ms        = COALESCE(excluded.ping_ms, servers.ping_ms),
     protocol       = CASE WHEN excluded.protocol != '' THEN excluded.protocol ELSE servers.protocol END,
     country        = CASE WHEN excluded.country != '' THEN excluded.country ELSE servers.country END,
@@ -121,84 +105,23 @@ def parse_stable_from_line(line: str) -> int:
     return 0
 
 
-def compute_next_state(
-    prev_stable: int,
-    prev_fail_streak: int,
-    prev_temp_ban_until: str | None,
-    *,
-    ok: bool,
-    now: str | None = None,
-    stable_max: int | None = None,
-    temp_ban_fails: int | None = None,
-    temp_ban_hours: float | None = None,
-    full_ban_stable: int | None = None,
-) -> dict:
-    """Чистая функция перехода состояния сервера после одной проверки.
+def compute_next_state(prev_stable: int, *, ok: bool, full_ban_stable: int | None = None) -> int:
+    """Чистая функция перехода stable после одной проверки.
 
-    Правила (метод «временного чса», работает вместе со stable и скрыто):
-      * успех: stable +1 (потолок STABLE_MAX), серия неудач и бан сбрасываются;
-      * неудача: stable -1 (пол — FULL_BAN_STABLE), fail_streak +1;
-      * TEMP_BAN_FAILS неудач подряд -> временный чс: temp_ban_until =
-        now + TEMP_BAN_HOURS, stable удерживается на уровне выше полного чса
-        (сервер ещё НЕ в полноценном чс, но из проверки и whitelist исчезает);
-      * бан истёк и повторная проверка снова провалена -> полноценный чс:
-        stable = FULL_BAN_STABLE (дальше его исключит purge из ротации);
-      * внеплановая проверка во время действия бана — состояние удерживается,
-        эскалации нет (сервер уже «наказан»).
+    Правила:
+      * успех: stable +1 — БЕЗ потолка (накопленный авторитет не сгорает);
+      * неудача: stable -1 с полом FULL_BAN_STABLE (полноценный чс).
 
-    Возвращает {stable, fail_streak, temp_ban_until}.
+    «Запас прочности» = текущий stable: провал НЕ удаляет сервер из проверки
+    и НЕ ban'ит его, а просто уменьшает счётчик. Реально мёртвый сервер
+    исключается из пула, когда stable опускается ниже PURGE_STABLE_BELOW
+    (за (stable - PURGE_STABLE_BELOW) провальных проверок подряд).
     """
-    cap = max(int(STABLE_MAX if stable_max is None else stable_max), 0)
-    ban_fails = max(int(TEMP_BAN_FAILS if temp_ban_fails is None else temp_ban_fails), 1)
-    ban_hours = float(TEMP_BAN_HOURS if temp_ban_hours is None else temp_ban_hours)
     full_ban = int(FULL_BAN_STABLE if full_ban_stable is None else full_ban_stable)
-
-    if now is None:
-        base = datetime.now(timezone.utc)
-    else:
-        base = datetime.fromisoformat(str(now))
-        if base.tzinfo is None:
-            base = base.replace(tzinfo=timezone.utc)
-
+    prev = int(prev_stable)
     if ok:
-        return {
-            "stable": min(int(prev_stable) + 1, cap),
-            "fail_streak": 0,
-            "temp_ban_until": None,
-        }
-
-    fail_streak = int(prev_fail_streak) + 1
-    ban_until = (str(prev_temp_ban_until).strip() if prev_temp_ban_until else "") or None
-
-    if ban_until:
-        if ban_until > base.isoformat(timespec="seconds"):
-            # Бан ещё действует (внеплановая проверка): удерживаем состояние.
-            return {
-                "stable": max(int(prev_stable) - 1, full_ban + 1),
-                "fail_streak": fail_streak,
-                "temp_ban_until": ban_until,
-            }
-        # Бан истёк — это решающая повторная проверка: провал = полноценный чс.
-        return {
-            "stable": full_ban,
-            "fail_streak": fail_streak,
-            "temp_ban_until": None,
-        }
-
-    if fail_streak >= ban_fails and int(prev_stable) > full_ban:
-        # TEMP_BAN_FAILS неудач подряд -> временный чс на TEMP_BAN_HOURS часов.
-        until = (base + timedelta(hours=ban_hours)).isoformat(timespec="seconds")
-        return {
-            "stable": max(int(prev_stable) - 1, full_ban + 1),
-            "fail_streak": fail_streak,
-            "temp_ban_until": until,
-        }
-
-    return {
-        "stable": max(int(prev_stable) - 1, full_ban),
-        "fail_streak": fail_streak,
-        "temp_ban_until": None,
-    }
+        return prev + 1
+    return max(prev - 1, full_ban)
 
 
 class ServerStore:
@@ -213,16 +136,10 @@ class ServerStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(SCHEMA)
-            # Нормализация накопленных значений под текущие границы stable:
-            # без этого старые записи с большим |stable| вымывались бы слишком
-            # медленно (или наоборот выпадали мгновенно).
-            cap = max(int(STABLE_MAX), 0)
-            full_ban = int(FULL_BAN_STABLE)
-            conn.execute("UPDATE servers SET stable = ? WHERE stable > ?", (cap, cap))
-            conn.execute("UPDATE servers SET stable = ? WHERE stable < ?", (full_ban, full_ban))
-        self._ensure_temp_ban_columns()
-        with self._connect() as conn:
-            conn.execute(TEMP_BAN_INDEX_SQL)
+            # Нормализация накопленных значений: stable не бывает ниже
+            # полноценного чса (сверху он не ограничен).
+            floor = int(FULL_BAN_STABLE)
+            conn.execute("UPDATE servers SET stable = ? WHERE stable < ?", (floor, floor))
         self._maybe_migrate_stable_zones()
         self._maybe_migrate_legacy()
 
@@ -247,25 +164,6 @@ class ServerStore:
         with self._connect() as conn:
             rows = conn.execute("SELECT key, stable FROM servers").fetchall()
         return {row["key"]: (row["stable"] or 0) for row in rows}
-
-    def load_state_map(self) -> dict[str, dict]:
-        """Карта ключ -> {stable, fail_streak, temp_ban_until}.
-
-        Полное состояние для стейт-машины compute_next_state(): его используют
-        цикл проверки (urltest) для решений и суффиксов строк.
-        """
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT key, stable, fail_streak, temp_ban_until FROM servers"
-            ).fetchall()
-        return {
-            row["key"]: {
-                "stable": row["stable"] or 0,
-                "fail_streak": row["fail_streak"] or 0,
-                "temp_ban_until": (row["temp_ban_until"] or "").strip() or None,
-            }
-            for row in rows
-        }
 
     def load_country_map(self) -> dict[str, str]:
         """Карта ключ -> эмодзи страны для серверов с известной страной.
@@ -329,9 +227,8 @@ class ServerStore:
 
         Новый сервер получает stable=0 и попадает в ротацию проверки.
         Существующий обновляет last_seen (и line, если его ещё ни разу
-        не проверяли), НЕ сбрасывая stable/fail_streak и не снимая excluded
-        и временный чс: мёртвый сервер не воскресает от повторного появления
-        в подписке.
+        не проверяли), НЕ сбрасывая stable и не снимая excluded: мёртвый
+        сервер не воскресает от повторного появления в подписке.
         """
         added = updated = skipped = 0
         now = _now()
@@ -396,13 +293,12 @@ class ServerStore:
         with self._connect() as conn:
             conn.executemany(
                 "INSERT OR IGNORE INTO servers"
-                " (key, line, stable, excluded, first_seen, last_seen)"
-                " VALUES (?, ?, ?, 1, ?, ?)",
+                " (key, line, stable, excluded, available, first_seen, last_seen)"
+                " VALUES (?, ?, ?, 1, 0, ?, ?)",
                 [(key, line, full_ban, now, now) for key, line in unique.items()],
             )
             conn.executemany(
-                "UPDATE servers SET excluded = 1, stable = ?, fail_streak = 0,"
-                " temp_ban_until = NULL, available = 0, last_seen = ?"
+                "UPDATE servers SET excluded = 1, stable = ?, available = 0, last_seen = ?"
                 " WHERE key = ?",
                 [(full_ban, now, key) for key in unique],
             )
@@ -414,45 +310,36 @@ class ServerStore:
         row: {key, available: bool, line?: str, ping_ms?: int|None,
               country?: str, protocol?: str, capabilities?: str}
 
-        Переход состояния считает compute_next_state():
-          * успех  — stable +1 (до STABLE_MAX), серия неудач и бан сбрасываются;
-          * неудача — stable -1, fail_streak +1; TEMP_BAN_FAILS подряд ->
-            временный чс (temp_ban_until = now + TEMP_BAN_HOURS); провал
-            решающей проверки после бана — полноценный чс (stable=FULL_BAN_STABLE).
+        Переход stable считает compute_next_state():
+          * успех  — stable +1 (БЕЗ потолка);
+          * неудача — stable -1 (пол FULL_BAN_STABLE).
+        available запоминает результат ПОСЛЕДНЕЙ проверки — это критерий
+        whitelist: пинганулся -> в whitelist, не пинганулся -> нет.
         """
         if not rows:
             return
         now = _now()
         with self._connect() as conn:
             keys = list({row["key"] for row in rows})
-            prev: dict[str, sqlite3.Row] = {}
+            prev: dict[str, int] = {}
             for i in range(0, len(keys), 500):
                 chunk = keys[i:i + 500]
                 placeholders = ",".join("?" * len(chunk))
                 for r in conn.execute(
-                    "SELECT key, stable, fail_streak, temp_ban_until FROM servers "
+                    "SELECT key, stable FROM servers "
                     f"WHERE key IN ({placeholders})",
                     chunk,
                 ):
-                    prev[r["key"]] = r
+                    prev[r["key"]] = r["stable"] or 0
             for row in rows:
                 ok = bool(row.get("available"))
-                p = prev.get(row["key"])
-                nxt = compute_next_state(
-                    p["stable"] if p else 0,
-                    p["fail_streak"] if p else 0,
-                    p["temp_ban_until"] if p else None,
-                    ok=ok,
-                    now=now,
-                )
+                new_stable = compute_next_state(prev.get(row["key"], 0), ok=ok)
                 conn.execute(
                     UPSERT_RESULT_SQL,
                     (
                         row["key"],
                         row.get("line") or "",
-                        nxt["stable"],
-                        nxt["fail_streak"],
-                        nxt["temp_ban_until"],
+                        new_stable,
                         row.get("ping_ms"),
                         row.get("protocol") or "",
                         row.get("country") or "",
@@ -465,21 +352,20 @@ class ServerStore:
 
     # ----------------------------------------------------------- запросы DB
     def check_pool(self) -> list[sqlite3.Row]:
-        """Пул проверки: активные серверы вне действующего временного чса.
+        """Пул проверки: ВСЕ активные серверы (excluded=0), без ограничений.
 
-        Лучшие (высокий stable, низкий пинг) — первыми. Серверы во временном
-        чсе (temp_ban_until > now) в пул не попадают; как только бан истёк,
-        сервер автоматически возвращается в ротацию для решающей проверки.
+        В пул попадает каждый сервер со stable выше порога чса
+        (stable >= PURGE_STABLE_BELOW): и подтверждённые, и «подозрительные»,
+        и ещё ни разу не проверенные, и провалившие последнюю проверку.
+        Лучшие (высокий stable, низкий пинг) — первыми.
         """
-        now = _now()
         with self._connect() as conn:
             return conn.execute(
-                f"""
-                SELECT key, line, stable, ping_ms, fail_streak, temp_ban_until FROM servers
-                WHERE excluded = 0 AND {_NOT_BANNED_SQL}
+                """
+                SELECT key, line, stable, ping_ms, available FROM servers
+                WHERE excluded = 0
                 ORDER BY stable DESC, ping_ms IS NULL, ping_ms ASC, key ASC
                 """,
-                (now,),
             ).fetchall()
 
     def export_lines(
@@ -488,18 +374,20 @@ class ServerStore:
         min_stable: int | None = None,
         max_stable: int | None = None,
         limit: int | None = None,
+        only_available: bool = False,
     ) -> list[str]:
-        """Строки серверов по фильтру stable.
+        """Строки серверов по фильтру.
 
         min_stable=1 -> только stable > 1 (строго больше);
         max_stable=-1 -> только stable < -1 (строго меньше).
-        Серверы в действующем временном чсе не экспортируются никогда:
-        «помеченные временным чс не попадают в whitelist».
+        only_available=True -> только серверы, ПИНГОВАВШИЕСЯ в последней
+        проверке (available=1) — это критерий whitelist.
         Сортировка: stable DESC, затем пинг по возрастанию (без пинга — в конце).
         """
-        now = _now()
-        query = f"SELECT line, stable, ping_ms, capabilities FROM servers WHERE line != '' AND {_NOT_BANNED_SQL}"
-        params: list[object] = [now]
+        query = "SELECT line, stable, ping_ms, capabilities FROM servers WHERE line != ''"
+        params: list[object] = []
+        if only_available:
+            query += " AND available = 1 AND excluded = 0"
         if min_stable is not None:
             query += " AND stable > ?"
             params.append(min_stable)
@@ -534,18 +422,19 @@ class ServerStore:
     def export_tagged_lines(self, *,
                             min_stable: int | None = None,
                             max_stable: int | None = None,
-                            global_tag: str = "Global") -> list[str]:
-        """Строки серверов по фильтру stable с добавленными capability-тэгами.
+                            global_tag: str = "Global",
+                            only_available: bool = False) -> list[str]:
+        """Строки серверов по фильтру с добавленными capability-тэгами.
 
         ВАЖНО: capability-профиль ХРАНИТСЯ в БД, тэги [name] добавляются
         только здесь, на этапе экспорта для генерации итогового конфига.
         Сервер, у которого профиль полностью состоит из global_tag (достиг
-        всех целей), получает ровно один тэг [Global]. Серверы в действующем
-        временном чсе не экспортируются.
+        всех целей), получает ровно один тэг [Global].
         """
-        now = _now()
-        query = f"SELECT line, stable, ping_ms, capabilities FROM servers WHERE line != '' AND {_NOT_BANNED_SQL}"
-        params: list[object] = [now]
+        query = "SELECT line, stable, ping_ms, capabilities FROM servers WHERE line != ''"
+        params: list[object] = []
+        if only_available:
+            query += " AND available = 1 AND excluded = 0"
         if min_stable is not None:
             query += " AND stable > ?"
             params.append(min_stable)
@@ -576,8 +465,11 @@ class ServerStore:
         *,
         min_stable: int | None = None,
         max_stable: int | None = None,
+        only_available: bool = False,
     ) -> int:
-        lines = self.export_lines(min_stable=min_stable, max_stable=max_stable)
+        lines = self.export_lines(
+            min_stable=min_stable, max_stable=max_stable, only_available=only_available,
+        )
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("\n".join(lines), encoding="utf-8")
@@ -590,24 +482,39 @@ class ServerStore:
         min_stable: int | None = None,
         max_stable: int | None = None,
         global_tag: str = "Global",
+        only_available: bool = False,
     ) -> int:
-        """Экспорт whitelist-строк С capability-тэгами ([name] / [Global]).
+        """Экспорт строк С capability-тэгами ([name] / [Global]) в файл.
 
         Это «whitelist для генерации»: тэги добавляются только здесь, на этапе
         выгрузки строк, чтобы итоговый sing-box конфиг мог фильтровать outbound'ы
         по достижимости целей. Профиль при этом остаётся в БД, а не в merge-пуле.
         """
         lines = self.export_tagged_lines(
-            min_stable=min_stable, max_stable=max_stable, global_tag=global_tag,
+            min_stable=min_stable, max_stable=max_stable,
+            global_tag=global_tag, only_available=only_available,
         )
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("\n".join(lines), encoding="utf-8")
         return len(lines)
 
+    def export_whitelist_lines(self, *, global_tag: str = "Global") -> list[str]:
+        """Whitelist-строки: серверы, ПИНГОВАВШИЕСЯ в последней проверке.
+
+        Критерий нового принципа: available=1 (последняя проверка успешна) —
+        без порога stable. Не пинганулся -> не добавляется, но остаётся в пуле
+        проверки. Тэги [name] / [Global] добавляются здесь же.
+        """
+        return self.export_tagged_lines(only_available=True, global_tag=global_tag)
+
+    def export_whitelist_to_file(self, path: str | Path, *, global_tag: str = "Global") -> int:
+        """Whitelist = available=1 (последняя проверка успешна), в файл."""
+        return self.export_tagged_to_file(path, only_available=True, global_tag=global_tag)
+
     # --------------------------------------------------- удаление из проверки
     def purge_dead(self, below: int | None = None, *, hard: bool = False) -> int:
-        """Удаляет серверы со stable < below из проверочного списка.
+        """Исключает серверы со stable < below из проверочного списка.
 
         По умолчанию below = PURGE_STABLE_BELOW (-1): в полноценный чс уходят
         только stable <= FULL_BAN_STABLE (-2), «подозрительные» (stable=-1)
@@ -631,24 +538,12 @@ class ServerStore:
         """Возвращает исключённые серверы в ротацию проверки с чистым листом."""
         with self._connect() as conn:
             cur = conn.execute(
-                "UPDATE servers SET excluded = 0, stable = 0, fail_streak = 0, "
-                "temp_ban_until = NULL WHERE excluded = 1"
-            )
-            return cur.rowcount
-
-    def reset_temp_bans(self) -> int:
-        """Снимает все временные чс и сбрасывает серии неудач."""
-        with self._connect() as conn:
-            cur = conn.execute(
-                "UPDATE servers SET temp_ban_until = NULL, fail_streak = 0 "
-                "WHERE temp_ban_until IS NOT NULL AND temp_ban_until != ''"
+                "UPDATE servers SET excluded = 0, stable = 0 WHERE excluded = 1"
             )
             return cur.rowcount
 
     def stats(self) -> dict:
-        now = _now()
         full_ban = int(FULL_BAN_STABLE)
-        min_export = int(WHITELIST_EXPORT_MIN_STABLE)
         with self._connect() as conn:
             total, active, excluded = conn.execute(
                 "SELECT COUNT(*), SUM(excluded = 0), SUM(excluded = 1) FROM servers"
@@ -658,24 +553,17 @@ class ServerStore:
                 "full_ban": conn.execute(
                     "SELECT COUNT(*) FROM servers WHERE stable <= ?", (full_ban,)
                 ).fetchone()[0],
-                # stable = FULL_BAN_STABLE + 1 («подозрительные») — в ротации,
-                # в списки не попадают.
-                "probation": conn.execute(
-                    "SELECT COUNT(*) FROM servers WHERE stable = ?", (full_ban + 1,)
+                # Пинганулся в последней проверке -> в whitelist.
+                "online": conn.execute(
+                    "SELECT COUNT(*) FROM servers WHERE excluded = 0 AND available = 1"
                 ).fetchone()[0],
-                # 0..порога экспорта — в ротации проверки.
-                "testing": conn.execute(
-                    "SELECT COUNT(*) FROM servers WHERE stable > ? AND stable <= ?",
-                    (full_ban + 1, min_export),
+                # Не пинганулся в последней проверке -> вне whitelist, в запасе.
+                "reserve": conn.execute(
+                    "SELECT COUNT(*) FROM servers WHERE excluded = 0 AND available = 0"
                 ).fetchone()[0],
-                # stable > порога экспорта — подтверждённые.
-                "proven": conn.execute(
-                    "SELECT COUNT(*) FROM servers WHERE stable > ?", (min_export,)
-                ).fetchone()[0],
-                # Сейчас в действующем временном чсе (не считая excluded).
-                "temp_banned": conn.execute(
-                    f"SELECT COUNT(*) FROM servers WHERE excluded = 0 AND {_BANNED_SQL}",
-                    (now,),
+                # Ещё ни разу не проверялись.
+                "unchecked": conn.execute(
+                    "SELECT COUNT(*) FROM servers WHERE excluded = 0 AND available IS NULL"
                 ).fetchone()[0],
             }
         return {
@@ -690,29 +578,13 @@ class ServerStore:
     LEGACY_WHITELIST = ROOT / "source" / "whitelist.txt"
     LEGACY_BLACKLIST = ROOT / "source" / "blacklist.txt"
 
-    def _ensure_temp_ban_columns(self) -> None:
-        """Добавляет колонки временного чса в существующую базу (один раз).
-
-        Старые базы созданы без fail_streak/temp_ban_until — SQLite требует
-        ALTER TABLE для каждой недостающей колонки.
-        """
-        with self._connect() as conn:
-            cols = [row[1] for row in conn.execute("PRAGMA table_info(servers)").fetchall()]
-            if "fail_streak" not in cols:
-                conn.execute(
-                    "ALTER TABLE servers ADD COLUMN fail_streak INTEGER NOT NULL DEFAULT 0"
-                )
-            if "temp_ban_until" not in cols:
-                conn.execute("ALTER TABLE servers ADD COLUMN temp_ban_until TEXT")
-
     def _maybe_migrate_stable_zones(self) -> None:
         """Однократный возврат «старых» исключённых серверов в ротацию.
 
-        Раньше порог исключения был stable < 0: первый же провал (stable=-1)
-        навсегда убирал сервер из проверки — в том числе рабочие серверы,
-        временно перегруженные в час-пик. Теперь stable=-1 остаётся в ротации
-        (временный чс наступает по серии неудач), поэтому старые excluded-
-        записи со stable >= PURGE_STABLE_BELOW возвращаются в пул один раз.
+        Старые политики исключали сервер уже после первого провала (stable < 0)
+        или по серии неудач (временный чс). Теперь из проверки исключаются
+        только серверы ниже порога чса (stable < PURGE_STABLE_BELOW), поэтому
+        старые excluded-записи со stable >= порога возвращаются в пул один раз.
         Маркер рядом с базой защищает от повторного запуска.
         """
         marker = self.db_path.with_suffix(".tempban-migrated.json")
@@ -720,7 +592,7 @@ class ServerStore:
             return
         with self._connect() as conn:
             revived = conn.execute(
-                "UPDATE servers SET excluded = 0, fail_streak = 0, temp_ban_until = NULL "
+                "UPDATE servers SET excluded = 0 "
                 "WHERE excluded = 1 AND stable >= ?",
                 (int(PURGE_STABLE_BELOW),),
             ).rowcount
@@ -764,12 +636,16 @@ class ServerStore:
                 key = self._key_of(clean)
                 if not key:
                     continue
-                stable = min(parse_stable_from_line(clean), max(int(STABLE_MAX), 0))
-                stable = max(stable, full_ban)
+                stable = max(parse_stable_from_line(clean), full_ban)
+                # Импортированный whitelist считаем «пинговавшимся в прошлой
+                # жизни» (available=1): он попадает в новый whitelist сразу,
+                # первая же проверка скорректирует результат.
+                available = 0 if excluded else 1
                 cur = conn.execute(
-                    verb + " INTO servers (key, line, stable, excluded, first_seen, last_seen)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (key, clean, stable, 1 if excluded else 0, now, now),
+                    verb + " INTO servers"
+                    " (key, line, stable, excluded, available, first_seen, last_seen)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (key, clean, stable, 1 if excluded else 0, available, now, now),
                 )
                 inserted += cur.rowcount
         return inserted
@@ -790,7 +666,6 @@ def main() -> int:
     p_purge.add_argument("--below", type=int, default=int(PURGE_STABLE_BELOW))
     p_purge.add_argument("--hard", action="store_true")
     sub.add_parser("reset-excluded")
-    sub.add_parser("reset-temp-bans")
 
     args = parser.parse_args()
     store = ServerStore(args.db)
@@ -798,14 +673,20 @@ def main() -> int:
     if args.cmd == "stats":
         print(json.dumps(store.stats(), ensure_ascii=False, indent=2))
     elif args.cmd == "export":
-        min_stable = args.min_stable
-        if min_stable is None and args.max_stable is None:
-            min_stable = int(WHITELIST_EXPORT_MIN_STABLE)
+        # Без явных фильтров экспортируем whitelist: серверы, пинговавшиеся
+        # в последней проверке (available=1).
+        only_available = args.min_stable is None and args.max_stable is None
         if args.out:
-            n = store.export_to_file(args.out, min_stable=min_stable, max_stable=args.max_stable)
+            n = store.export_to_file(
+                args.out, min_stable=args.min_stable, max_stable=args.max_stable,
+                only_available=only_available,
+            )
             print(f"Exported {n} lines -> {args.out}")
         else:
-            lines = store.export_lines(min_stable=min_stable, max_stable=args.max_stable, limit=args.limit)
+            lines = store.export_lines(
+                min_stable=args.min_stable, max_stable=args.max_stable,
+                limit=args.limit, only_available=only_available,
+            )
             print("\n".join(lines))
     elif args.cmd == "purge":
         affected = store.purge_dead(args.below, hard=args.hard)
@@ -814,9 +695,6 @@ def main() -> int:
     elif args.cmd == "reset-excluded":
         revived = store.reset_excluded()
         print(f"Returned {revived} servers to check rotation (state reset)")
-    elif args.cmd == "reset-temp-bans":
-        cleared = store.reset_temp_bans()
-        print(f"Cleared temp ban for {cleared} servers (fail streaks reset)")
     return 0
 
 

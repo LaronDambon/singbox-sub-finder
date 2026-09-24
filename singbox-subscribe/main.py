@@ -41,9 +41,11 @@ def orchestrate_default_run():
     """Default no-argument run:
     1) Скачать источники и зарегистрировать серверы в центральной базе (source/servers.db)
     2) Собрать source/merge.txt из пула проверки базы (excluded-серверы не входят)
-    3) Прогнать urltest-циклы: stable +/- пишется в базу
-    4) Экспорт списков из базы: whitelist.txt = stable > порога;
-       серверы со stable < PURGE_STABLE_BELOW исключаются из проверочного списка
+    3) Прогнать urltest-циклы: stable +/- пишется в базу (успех +1 без
+       потолка, неудача -1; пол FULL_BAN_STABLE)
+    4) Экспорт списков из базы: whitelist.txt = серверы, пинговавшиеся в
+       последней проверке (available=1); серверы со stable <
+       PURGE_STABLE_BELOW исключаются из проверочного списка
     """
     urls_file = URLS_FILE
     output_merge = MERGE_FILE

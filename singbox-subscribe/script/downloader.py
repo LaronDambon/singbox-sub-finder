@@ -305,8 +305,9 @@ def normalize_proxy_key(raw: str) -> str:
 def write_merge_from_pool(store, output_path: Path) -> int:
     """Пишет merge.txt из пула проверки центральной базы.
 
-    Пул = все серверы с excluded=0 (stable < PURGE_STABLE_BELOW уже исключены
-    из базы проверки). Лучшие серверы (высокий stable) идут первыми.
+    Пул = ВСЕ серверы с excluded=0: каждый сервер со stable выше порога чса
+    (stable >= PURGE_STABLE_BELOW) попадает в проверку, без ограничений.
+    Лучшие серверы (высокий stable) идут первыми.
     """
     pool = store.check_pool()
     # Дополнительно вырезаем серверы с insecure-fingerprint (fp=unsafe и т.п.),
@@ -395,8 +396,8 @@ def build_merge_from_urls(
     logger: logging.Logger | None = None,
 ) -> dict[str, object]:
     """Скачивает подписки, регистрирует серверы в центральной базе (servers.db)
-    и собирает merge.txt из пула проверки базы. Списки экспортируются из базы
-    по фильтру stable (whitelist.txt = stable > порога)."""
+    и собирает merge.txt из пула проверки базы. Whitelist экспортируется из
+    базы по результату последней проверки (whitelist.txt = available=1)."""
     urls_file_path = Path(urls_file).resolve()
     output_path_path = Path(output_path).resolve()
     log_file_path = Path(log_file).resolve() if log_file else None
@@ -436,7 +437,6 @@ def build_merge_from_urls(
     from config.env import (
         SERVERS_DB_FILE,
         WHITELIST_FILE,
-        WHITELIST_EXPORT_MIN_STABLE,
     )
     from script.server_store import ServerStore
 
@@ -502,17 +502,16 @@ def build_merge_from_urls(
     logger.info("Сборка %s из пула проверки базы", output_path_path)
     merged_count = write_merge_from_pool(store, output_path_path)
 
-    # Экспорт подтверждённых серверов (stable > порога) в whitelist.txt —
-    # файловая проекция базы для внешних потребителей.
+    # Экспорт whitelist.txt — файловая проекция базы: серверы, ПИНГОВАВШИЕСЯ
+    # в последней проверке (available=1), для внешних потребителей.
     from config.env import REACHABILITY_GLOBAL_TAG
-    exported = store.export_tagged_to_file(
+    exported = store.export_whitelist_to_file(
         WHITELIST_FILE,
-        min_stable=WHITELIST_EXPORT_MIN_STABLE,
         global_tag=REACHABILITY_GLOBAL_TAG,
     )
     logger.info(
-        "Экспорт whitelist.txt из базы: %d серверов со stable > %d",
-        exported, WHITELIST_EXPORT_MIN_STABLE,
+        "Экспорт whitelist.txt из базы: %d серверов, пинговавшихся в последней проверке",
+        exported,
     )
     db_stats = store.stats()
     logger.info(

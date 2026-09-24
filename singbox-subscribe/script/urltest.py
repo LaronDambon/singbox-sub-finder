@@ -26,7 +26,6 @@ from config.env import (
     WHITELIST_FILE,
     BLACKLIST_FILE,
     SERVERS_DB_FILE,
-    WHITELIST_EXPORT_MIN_STABLE,
     PURGE_STABLE_BELOW,
     COUNTRY_CHECK_ENABLED,
     COUNTRY_CHECK_CONCURRENCY,
@@ -141,7 +140,7 @@ def _run_singbox_batch(batch: list[str], urltest: str, *,
 def _evaluate_nodes(
     tag_to_line: dict[str, str],
     parsed: list[tuple[str, int | None]],
-    state_map: dict[str, dict],
+    stable_map: dict[str, int],
     serial_start: int,
     purge_below: int,
     known_countries: dict[str, str] | None = None,
@@ -150,19 +149,19 @@ def _evaluate_nodes(
 
     Возвращает decisions — список словарей
       {tag, key, raw_line, ping_ms, is_ok, serial, prev_stable, new_stable,
-       is_temp_banned}
+       is_excluded}
     и country_check_lines — исходные строки ok-узлов, страну которых
     не удалось определить дёшево.
 
-    Переход состояния (stable, fail_streak, temp_ban_until) считает
-    compute_next_state() из server_store — та же стейт-машина, что и в БД:
-      * успех — stable +1, серия неудач и бан сбрасываются;
-      * TEMP_BAN_FAILS неудач подряд — временный чс (is_temp_banned=True):
-        сервер пропадает из проверки и whitelist на TEMP_BAN_HOURS часов;
-      * провал решающей проверки после бана — stable=FULL_BAN_STABLE.
+    Переход stable считает compute_next_state() из server_store — та же
+    стейт-машина, что и в БД:
+      * успех — stable +1 (БЕЗ потолка);
+      * неудача — stable -1 (пол FULL_BAN_STABLE). Серии неудач и временный
+        чс больше не нужны: провал просто НЕ добавляет сервер в whitelist
+        (критерий whitelist — результат последней проверки), а сервер
+        остаётся в пуле проверки («запас» = значение stable).
 
-    state_map: key -> {stable, fail_streak, temp_ban_until} из базы;
-    обновляется по ходу (как раньше stable_map).
+    stable_map: key -> stable из базы; обновляется по ходу.
     Узлы с new_stable < purge_below помечаются is_excluded=True:
     их результат всё равно пишется в базу, а из пула проверки их
     исключит purge_dead() в конце цикла.
@@ -179,20 +178,9 @@ def _evaluate_nodes(
         is_ok = tag in available_tags
         ping_ms = tag_to_ping.get(tag)
         key = normalize_proxy_key(raw_line)
-        prev = state_map.get(key) or {}
-        prev_stable = int(prev.get("stable", 0) or 0)
-        nxt = compute_next_state(
-            prev_stable,
-            int(prev.get("fail_streak", 0) or 0),
-            prev.get("temp_ban_until"),
-            ok=is_ok,
-        )
-        new_stable = nxt["stable"]
-        state_map[key] = {
-            "stable": new_stable,
-            "fail_streak": nxt["fail_streak"],
-            "temp_ban_until": nxt["temp_ban_until"],
-        }
+        prev_stable = int(stable_map.get(key, 0) or 0)
+        new_stable = compute_next_state(prev_stable, ok=is_ok)
+        stable_map[key] = new_stable
 
         # Страна известна, если эмодзи уже есть в имени строки или в базе.
         # В обоих случаях скоростной тест не нужен: эмодзи просто переносится
@@ -211,7 +199,6 @@ def _evaluate_nodes(
             "serial": serial,
             "prev_stable": prev_stable,
             "new_stable": new_stable,
-            "is_temp_banned": bool(nxt["temp_ban_until"]),
             "is_excluded": new_stable < purge_below,
             "country_tag": known_country if is_ok else None,
             # Страна из имени считается один раз здесь и переиспользуется
@@ -269,21 +256,21 @@ def run_debug_ping_cycle(
     """Проверяет серверы из merge.txt через sing-box urltest и пишет результаты
     в центральную базу (ServerStore).
 
-    stable: +1 за успешный пинг, -1 за неудачу; TEMP_BAN_FAILS неудач подряд
-    отправляют сервер во временный чс (TEMP_BAN_HOURS часов вне проверки и
-    whitelist), провал решающей проверки после бана — полноценный чс
-    (stable=FULL_BAN_STABLE). По завершении цикла:
-      * серверы со stable < PURGE_STABLE_BELOW (только полноценный чс)
+    stable: +1 за успешный пинг (БЕЗ потолка), -1 за неудачу (пол
+    FULL_BAN_STABLE). Whitelist — проекция ПОСЛЕДНЕЙ проверки: пинганулся
+    (available=1) -> добавляется в whitelist, не пинганулся -> не добавляется,
+    но остаётся в пуле проверки («запас» = значение stable). По завершении
+    цикла:
+      * серверы со stable < PURGE_STABLE_BELOW (полноценный чс, stable=-2)
         исключаются из проверочного пула;
-      * whitelist.txt экспортируется из базы по фильтру stable > порога
-        (серверы в действующем временном чсе не экспортируются);
+      * whitelist.txt экспортируется из базы: available=1;
       * blacklist.txt — проекция полноценного чса для наблюдения.
     """
     merge_file = Path(merge_path).resolve()
     lines = load_merge_lines(merge_file)
 
     store = ServerStore(db_path)
-    state_map = store.load_state_map()
+    stable_map = store.load_stable_map()
     known_countries = store.load_country_map()
 
     total = len(lines)
@@ -342,10 +329,10 @@ def run_debug_ping_cycle(
                 start + 1, batch_end, len(missing_tags), missing_tags[:10],
             )
 
-        # Фаза 1: решение по узлам (stable +/-, временный чс) — чистая функция
-        # над картой состояния базы.
+        # Фаза 1: решение по узлам (stable +/-) — чистая функция
+        # над картой stable из базы.
         decisions, country_check_lines = _evaluate_nodes(
-            tag_to_line, parsed, state_map,
+            tag_to_line, parsed, stable_map,
             serial_start=start, purge_below=PURGE_STABLE_BELOW,
             known_countries=known_countries,
         )
@@ -431,14 +418,13 @@ def run_debug_ping_cycle(
 
         batch_ok = sum(1 for r in rows if r["available"])
         batch_fail = len(rows) - batch_ok
-        batch_banned = sum(1 for d in decisions if d.get("is_temp_banned"))
         checked += len(rows)
         available_count += batch_ok
         failed_count += batch_fail
         LOGGER.info(
-            "Batch %d-%d result: %d available, %d failed, %d записано в базу, "
-            "temp-ban: %d (sing-box %.2fs + country/write %.2fs)",
-            start + 1, batch_end, batch_ok, batch_fail, len(rows), batch_banned,
+            "Batch %d-%d result: %d available, %d failed, %d записано в базу "
+            "(sing-box %.2fs + country/write %.2fs)",
+            start + 1, batch_end, batch_ok, batch_fail, len(rows),
             batch_elapsed, (time.monotonic() - batch_started) - batch_elapsed,
         )
 
@@ -450,9 +436,9 @@ def run_debug_ping_cycle(
     blacklist_output = Path(blacklist_path) if blacklist_path else merge_file.with_suffix(".blacklist.txt")
     exported_wl = exported_bl = 0
     if export_lists:
-        exported_wl = store.export_tagged_to_file(
+        # whitelist = серверы, пинговавшиеся в последней проверке (available=1).
+        exported_wl = store.export_whitelist_to_file(
             whitelist_output,
-            min_stable=WHITELIST_EXPORT_MIN_STABLE,
             global_tag=REACHABILITY_GLOBAL_TAG,
         )
         exported_bl = store.export_to_file(blacklist_output, max_stable=PURGE_STABLE_BELOW)
@@ -460,11 +446,11 @@ def run_debug_ping_cycle(
     total_elapsed = time.monotonic() - cycle_started
     LOGGER.info(
         "Ping cycle finished in %.2fs: processed=%d checked=%d available=%d failed=%d | "
-        "db: total=%d active=%d excluded=%d proven=%d temp_banned=%d | "
+        "db: total=%d active=%d excluded=%d online=%d reserve=%d | "
         "excluded_now=%d unparsable_banned=%d wl_export=%d bl_export=%d",
         total_elapsed, processed, checked, available_count, failed_count,
         stats["total"], stats["active"], stats["excluded"],
-        stats["zones"]["proven"], stats["zones"]["temp_banned"],
+        stats["zones"]["online"], stats["zones"]["reserve"],
         purged, unparsable_banned, exported_wl, exported_bl,
     )
 

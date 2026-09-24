@@ -14,7 +14,6 @@ from config.env import (
     FLASK_HOST,
     FLASK_PORT,
     SERVERS_DB_FILE,
-    WHITELIST_EXPORT_MIN_STABLE,
 )
 from functools import lru_cache
 
@@ -443,15 +442,16 @@ def api_template(name):
 
 @app.route("/api/whitelist")
 def api_whitelist():
-    """Подтверждённые серверы из центральной базы (stable > порога).
+    """Серверы, пинговавшиеся в последней проверке (available=1), из базы.
 
-    Формат ответа прежний — построчный URI-список; сортировка по stable DESC.
+    Критерий whitelist — результат последней проверки: пинганулся -> в списке,
+    не пинганулся -> нет. Формат ответа прежний — построчный URI-список;
+    сортировка по stable DESC.
     """
     try:
         store = _get_store()
         from config.env import REACHABILITY_GLOBAL_TAG
-        lines = store.export_tagged_lines(
-            min_stable=WHITELIST_EXPORT_MIN_STABLE,
+        lines = store.export_whitelist_lines(
             global_tag=REACHABILITY_GLOBAL_TAG,
         )
         if lines:
@@ -476,18 +476,23 @@ def api_servers_stats():
 
 @app.route("/api/servers")
 def api_servers():
-    """Выборка из базы по фильтру stable: ?min_stable=&max_stable=&limit=.
+    """Выборка из базы по фильтру stable: ?min_stable=&max_stable=&limit=&available=1.
 
     Примеры:
-      /api/servers?min_stable=1  -> stable > 1  (рабочие серверы для списков)
-      /api/servers?max_stable=0  -> stable < 0  (мёртвые — удалены из проверки)
+      /api/servers?available=1   -> пинговались в последней проверке (whitelist)
+      /api/servers?min_stable=1  -> stable > 1
+      /api/servers?max_stable=-1 -> stable < -1 (полноценный чс)
     """
     try:
         store = _get_store()
         min_stable = request.args.get("min_stable", type=int)
         max_stable = request.args.get("max_stable", type=int)
         limit = request.args.get("limit", type=int)
-        lines = store.export_lines(min_stable=min_stable, max_stable=max_stable, limit=limit)
+        only_available = request.args.get("available") == "1"
+        lines = store.export_lines(
+            min_stable=min_stable, max_stable=max_stable, limit=limit,
+            only_available=only_available,
+        )
         return jsonify({"count": len(lines), "servers": lines})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
