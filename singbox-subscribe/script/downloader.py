@@ -305,8 +305,8 @@ def normalize_proxy_key(raw: str) -> str:
 def write_merge_from_pool(store, output_path: Path) -> int:
     """Пишет merge.txt из пула проверки центральной базы.
 
-    Пул = ВСЕ серверы с excluded=0: каждый сервер со stable выше порога чса
-    (stable >= PURGE_STABLE_BELOW) попадает в проверку, без ограничений.
+    Пул = ВСЕ живые серверы: excluded=0 и stable >= PURGE_STABLE_BELOW
+    (нижний порог, по умолчанию 0). Умершие (stable = -1) не импортируются.
     Лучшие серверы (высокий stable) идут первыми.
     """
     pool = store.check_pool()

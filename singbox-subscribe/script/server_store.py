@@ -1,28 +1,29 @@
 """Центральная база серверов (SQLite) — единственный источник правды по stable.
 
-Заменяет связку whitelist.txt/blacklist.txt:
+Новый режим — «щит» от удаления для серверов, которые хотя бы раз пинговались:
   * каждый известный сервер хранится одной записью с ключом normalize_proxy_key;
-  * stable — накопленный счётчик здоровья: успех проверки +1 (БЕЗ потолка),
-    неудача -1 (пол FULL_BAN_STABLE). У давно работающего сервера большой
-    «запас прочности»: один провал не выбрасывает его ни из проверки, ни
-    откуда-либо ещё — stable просто уменьшается на 1 (например, 20 -> 19);
-  * смерть сервера: stable < PURGE_STABLE_BELOW (по умолчанию stable=-2) —
-    полноценный чс, флаг excluded=1: сервер выпадает из пула проверки и может
-    быть возвращён вручную (CLI reset-excluded);
-  * пул проверки — ВСЕ серверы выше порога чса (excluded=0), без ограничений:
-    и подтверждённые, и «подозрительные», и ещё ни разу не проверенные;
+  * stable — счётчик жизней сервера:
+      - новый сервер до первого удачного пинга получает NEW_SERVER_STABLE
+        (по умолчанию 5) — несколько попыток доказать жизнеспособность;
+      - каждый УДАЧНЫЙ пинг ставит stable не ниже SHIELD_CYCLES (по умолчанию 96):
+        «щит» от удаления — сервер переживёт 96 неудачных проверок подряд;
+      - каждая НЕУДАЧНАЯ проверка вычитает 1;
+      - нижний порог — 0: в цикл проверки импортируются серверы со
+        stable >= PURGE_STABLE_BELOW, а дойдя до порога - 1 (по умолчанию -1)
+        сервер считается умершим и больше НЕ импортируется из базы;
+  * колонка ever_pinged — 1, если сервер пинговался хотя бы раз (отслеживание
+    таких конфигов и статистика);
+  * пул проверки (check_pool / merge.txt) — ВСЕ живые серверы: excluded=0
+    и stable >= PURGE_STABLE_BELOW, без ограничений по количеству;
   * whitelist (whitelist.txt, /api/whitelist) — проекция ПОСЛЕДНЕЙ проверки:
     сервер пинганулся (available=1) -> добавляется в whitelist, не пинганулся ->
-    не добавляется. Принципа «2 раза не пинганулся — убрать» больше нет: провал
-    не удаляет сервер из проверки, а лишь не добавляет его в whitelist на этом
-    цикле; реально мёртвый сервер «истекает» сам — stable уходит в минус за
-    (stable + 2) провальных проверок и сервер исключается purge'ом.
+    не добавляется, но остаётся в пуле проверки, пока жив (stable >= порога).
 
-Зоны stable при настройках по умолчанию (purge<-1, пол=-2):
-  stable = -2   — полноценный чс: исключён из проверки (excluded=1)
-  stable = -1   — «подозрительный»: в ротации проверки, в whitelist не попадает
-  stable >= 0   — в ротации; в whitelist попадает по результату ПОСЛЕДНЕЙ
-                  проверки (available=1)
+Зоны stable при настройках по умолчанию (порог 0, мёртвый -1):
+  stable = -1   — умерший: не импортируется в проверку (excluded=1 после purge)
+  stable = 0    — на границе: одна неудачная проверка до смерти
+  stable 1..95  — живёт за счёт остатка щита
+  stable >= 96  — под полным щитом после удачного пинга
 Колонка available — результат последней проверки (1/0/NULL — ещё не проверялся).
 
 CLI:
@@ -43,9 +44,10 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from config.env import (
-    FULL_BAN_STABLE,
+    NEW_SERVER_STABLE,
     PURGE_STABLE_BELOW,
     SERVERS_DB_FILE,
+    SHIELD_CYCLES,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,6 +59,7 @@ CREATE TABLE IF NOT EXISTS servers (
     key            TEXT PRIMARY KEY,
     line           TEXT NOT NULL,
     stable         INTEGER NOT NULL DEFAULT 0,
+    ever_pinged    INTEGER NOT NULL DEFAULT 0,
     ping_ms        INTEGER,
     protocol       TEXT NOT NULL DEFAULT '',
     country        TEXT NOT NULL DEFAULT '',
@@ -75,11 +78,12 @@ CREATE INDEX IF NOT EXISTS idx_servers_excluded ON servers(excluded);
 
 UPSERT_RESULT_SQL = """
 INSERT INTO servers (
-    key, line, stable, ping_ms, protocol, country, capabilities,
+    key, line, stable, ever_pinged, ping_ms, protocol, country, capabilities,
     available, checks, fails, first_seen, last_seen, last_checked
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
 ON CONFLICT(key) DO UPDATE SET
     stable         = excluded.stable,
+    ever_pinged    = MAX(servers.ever_pinged, excluded.ever_pinged),
     ping_ms        = COALESCE(excluded.ping_ms, servers.ping_ms),
     protocol       = CASE WHEN excluded.protocol != '' THEN excluded.protocol ELSE servers.protocol END,
     country        = CASE WHEN excluded.country != '' THEN excluded.country ELSE servers.country END,
@@ -105,23 +109,33 @@ def parse_stable_from_line(line: str) -> int:
     return 0
 
 
-def compute_next_state(prev_stable: int, *, ok: bool, full_ban_stable: int | None = None) -> int:
-    """Чистая функция перехода stable после одной проверки.
+def compute_next_state(
+    prev_stable: int,
+    *,
+    ok: bool,
+    shield_cycles: int | None = None,
+    alive_min: int | None = None,
+) -> int:
+    """Чистая функция перехода stable после одной проверки (режим «щита»).
 
     Правила:
-      * успех: stable +1 — БЕЗ потолка (накопленный авторитет не сгорает);
-      * неудача: stable -1 с полом FULL_BAN_STABLE (полноценный чс).
+      * УСПЕХ: сервер получает «щит» от удаления — stable выставляется не ниже
+        SHIELD_CYCLES (по умолчанию 96): столько неудачных проверок подряд он
+        ещё проживёт. Сервер считается пинговавшимся (ever_pinged=1);
+      * НЕУДАЧА: stable -1, но не ниже (PURGE_STABLE_BELOW - 1). Дойдя до -1,
+        сервер считается умершим и больше не импортируется в цикл проверки.
 
-    «Запас прочности» = текущий stable: провал НЕ удаляет сервер из проверки
-    и НЕ ban'ит его, а просто уменьшает счётчик. Реально мёртвый сервер
-    исключается из пула, когда stable опускается ниже PURGE_STABLE_BELOW
-    (за (stable - PURGE_STABLE_BELOW) провальных проверок подряд).
+    Нижний порог stable = PURGE_STABLE_BELOW (0): в пул проверки попадают
+    серверы со stable >= порога. Новый сервер до первого удачного пинга имеет
+    stable = NEW_SERVER_STABLE (5) — у него есть несколько попыток доказать
+    жизнеспособность, после чего он умирает.
     """
-    full_ban = int(FULL_BAN_STABLE if full_ban_stable is None else full_ban_stable)
+    shield = int(SHIELD_CYCLES if shield_cycles is None else shield_cycles)
+    alive_min = int(PURGE_STABLE_BELOW if alive_min is None else alive_min)
     prev = int(prev_stable)
     if ok:
-        return prev + 1
-    return max(prev - 1, full_ban)
+        return max(prev, shield)
+    return max(prev - 1, alive_min - 1)
 
 
 class ServerStore:
@@ -136,11 +150,13 @@ class ServerStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._ensure_ever_pinged_column(conn)
             # Нормализация накопленных значений: stable не бывает ниже
-            # полноценного чса (сверху он не ограничен).
-            floor = int(FULL_BAN_STABLE)
-            conn.execute("UPDATE servers SET stable = ? WHERE stable < ?", (floor, floor))
+            # «мёртвой» отметки (нижний порог - 1).
+            dead = self._dead_stable()
+            conn.execute("UPDATE servers SET stable = ? WHERE stable < ?", (dead, dead))
         self._maybe_migrate_stable_zones()
+        self._maybe_migrate_shield()
         self._maybe_migrate_legacy()
 
     # ------------------------------------------------------------------ util
@@ -151,6 +167,25 @@ class ServerStore:
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
+
+    @staticmethod
+    def _dead_stable() -> int:
+        """Значение stable, при котором сервер считается умершим.
+
+        Живые серверы имеют stable >= PURGE_STABLE_BELOW (нижний порог, 0);
+        дойдя до порога - 1 (по умолчанию -1), сервер выпадает из цикла
+        проверки и больше не импортируется из базы.
+        """
+        return int(PURGE_STABLE_BELOW) - 1
+
+    @staticmethod
+    def _ensure_ever_pinged_column(conn: sqlite3.Connection) -> None:
+        """Миграция схемы: добавляет колонку ever_pinged в старую базу."""
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(servers)")}
+        if "ever_pinged" not in cols:
+            conn.execute(
+                "ALTER TABLE servers ADD COLUMN ever_pinged INTEGER NOT NULL DEFAULT 0"
+            )
 
     @staticmethod
     def _key_of(line: str) -> str:
@@ -225,10 +260,12 @@ class ServerStore:
     def upsert_lines(self, lines: Iterable[str]) -> dict[str, int]:
         """Регистрирует серверы из подписок/исходников.
 
-        Новый сервер получает stable=0 и попадает в ротацию проверки.
-        Существующий обновляет last_seen (и line, если его ещё ни разу
-        не проверяли), НЕ сбрасывая stable и не снимая excluded: мёртвый
-        сервер не воскресает от повторного появления в подписке.
+        Новый сервер получает stable=NEW_SERVER_STABLE (по умолчанию 5) и
+        попадает в ротацию проверки: до первого удачного пинга у него есть
+        несколько попыток доказать жизнеспособность. Существующий обновляет
+        last_seen (и line, если его ещё ни разу не проверяли), НЕ сбрасывая
+        stable/ever_pinged и не снимая excluded: мёртвый сервер не воскресает
+        от повторного появления в подписке.
         """
         added = updated = skipped = 0
         now = _now()
@@ -257,9 +294,10 @@ class ServerStore:
                 else:
                     added += 1
                     conn.execute(
-                        "INSERT INTO servers (key, line, stable, first_seen, last_seen)"
-                        " VALUES (?, ?, 0, ?, ?)",
-                        (key, clean, now, now),
+                        "INSERT INTO servers"
+                        " (key, line, stable, ever_pinged, first_seen, last_seen)"
+                        " VALUES (?, ?, ?, 0, ?, ?)",
+                        (key, clean, int(NEW_SERVER_STABLE), now, now),
                     )
         return {"added": added, "updated": updated, "skipped": skipped}
 
@@ -268,9 +306,9 @@ class ServerStore:
 
         Строка, из которой ни один парсер не может собрать узел, не
         проверяется вообще: она лишь занимает слот в батче проверки и засоряет
-        лог. Помечаем её excluded=1 и stable=FULL_BAN_STABLE — тогда она
-        выпадает из пула проверки (check_pool) и попадает в blacklist.txt
-        (проекция stable < PURGE_STABLE_BELOW).
+        лог. Помечаем её excluded=1 и stable = PURGE_STABLE_BELOW - 1 (умерший
+        сервер) — тогда она выпадает из пула проверки (check_pool, фильтр
+        stable >= PURGE_STABLE_BELOW) и попадает в blacklist.txt.
 
         Существующие серверы не теряются: обновляется только флаг/зона,
         строка (line) и страна остаются как были.
@@ -278,7 +316,7 @@ class ServerStore:
         Возвращает количество уникальных ключей, переведённых в чс.
         """
         now = _now()
-        full_ban = int(FULL_BAN_STABLE)
+        dead = self._dead_stable()
         unique: dict[str, str] = {}
         for raw in lines:
             clean = str(raw).strip()
@@ -293,14 +331,15 @@ class ServerStore:
         with self._connect() as conn:
             conn.executemany(
                 "INSERT OR IGNORE INTO servers"
-                " (key, line, stable, excluded, available, first_seen, last_seen)"
-                " VALUES (?, ?, ?, 1, 0, ?, ?)",
-                [(key, line, full_ban, now, now) for key, line in unique.items()],
+                " (key, line, stable, ever_pinged, excluded, available,"
+                "  first_seen, last_seen)"
+                " VALUES (?, ?, ?, 0, 1, 0, ?, ?)",
+                [(key, line, dead, now, now) for key, line in unique.items()],
             )
             conn.executemany(
                 "UPDATE servers SET excluded = 1, stable = ?, available = 0, last_seen = ?"
                 " WHERE key = ?",
-                [(full_ban, now, key) for key in unique],
+                [(dead, now, key) for key in unique],
             )
         return len(unique)
 
@@ -310,9 +349,11 @@ class ServerStore:
         row: {key, available: bool, line?: str, ping_ms?: int|None,
               country?: str, protocol?: str, capabilities?: str}
 
-        Переход stable считает compute_next_state():
-          * успех  — stable +1 (БЕЗ потолка);
-          * неудача — stable -1 (пол FULL_BAN_STABLE).
+        Переход stable считает compute_next_state() («щит» от удаления):
+          * успех  — stable не ниже SHIELD_CYCLES (по умолчанию 96), и сервер
+            навсегда помечается ever_pinged=1 (он пинговался хотя бы раз);
+          * неудача — stable -1, но не ниже PURGE_STABLE_BELOW - 1 (на -1
+            сервер считается умершим и больше не импортируется).
         available запоминает результат ПОСЛЕДНЕЙ проверки — это критерий
         whitelist: пинганулся -> в whitelist, не пинганулся -> нет.
         """
@@ -340,6 +381,7 @@ class ServerStore:
                         row["key"],
                         row.get("line") or "",
                         new_stable,
+                        1 if ok else 0,
                         row.get("ping_ms"),
                         row.get("protocol") or "",
                         row.get("country") or "",
@@ -352,20 +394,21 @@ class ServerStore:
 
     # ----------------------------------------------------------- запросы DB
     def check_pool(self) -> list[sqlite3.Row]:
-        """Пул проверки: ВСЕ активные серверы (excluded=0), без ограничений.
+        """Пул проверки: ВСЕ живые серверы со stable >= PURGE_STABLE_BELOW.
 
-        В пул попадает каждый сервер со stable выше порога чса
-        (stable >= PURGE_STABLE_BELOW): и подтверждённые, и «подозрительные»,
-        и ещё ни разу не проверенные, и провалившие последнюю проверку.
-        Лучшие (высокий stable, низкий пинг) — первыми.
+        Живым считается сервер, не исключённый (excluded=0) и имеющий stable
+        не ниже нижнего порога (по умолчанию 0). Умершие (stable = -1) в пул
+        не попадают и больше не импортируются из базы. Лучшие (высокий stable,
+        низкий пинг) — первыми.
         """
         with self._connect() as conn:
             return conn.execute(
                 """
                 SELECT key, line, stable, ping_ms, available FROM servers
-                WHERE excluded = 0
+                WHERE excluded = 0 AND stable >= ?
                 ORDER BY stable DESC, ping_ms IS NULL, ping_ms ASC, key ASC
                 """,
+                (int(PURGE_STABLE_BELOW),),
             ).fetchall()
 
     def export_lines(
@@ -516,11 +559,10 @@ class ServerStore:
     def purge_dead(self, below: int | None = None, *, hard: bool = False) -> int:
         """Исключает серверы со stable < below из проверочного списка.
 
-        По умолчанию below = PURGE_STABLE_BELOW (-1): в полноценный чс уходят
-        только stable <= FULL_BAN_STABLE (-2), «подозрительные» (stable=-1)
-        остаются в ротации. hard=False выставляет excluded=1 — запись остаётся
-        в базе для статистики и повторного включения вручную; hard=True
-        физически удаляет.
+        По умолчанию below = PURGE_STABLE_BELOW (0): исключаются умершие
+        серверы со stable = -1. hard=False выставляет excluded=1 — запись
+        остаётся в базе для статистики и повторного включения вручную;
+        hard=True физически удаляет.
         """
         if below is None:
             below = int(PURGE_STABLE_BELOW)
@@ -535,35 +577,56 @@ class ServerStore:
             return cur.rowcount
 
     def reset_excluded(self) -> int:
-        """Возвращает исключённые серверы в ротацию проверки с чистым листом."""
+        """Возвращает исключённые серверы в ротацию, выдавая «щит».
+
+        Пинговавшийся когда-либо сервер (ever_pinged=1) получает полный щит
+        SHIELD_CYCLES, новый — NEW_SERVER_STABLE.
+        """
         with self._connect() as conn:
             cur = conn.execute(
-                "UPDATE servers SET excluded = 0, stable = 0 WHERE excluded = 1"
+                """
+                UPDATE servers SET
+                    excluded = 0,
+                    stable = CASE WHEN ever_pinged = 1 THEN ? ELSE ? END
+                WHERE excluded = 1
+                """,
+                (int(SHIELD_CYCLES), int(NEW_SERVER_STABLE)),
             )
             return cur.rowcount
 
     def stats(self) -> dict:
-        full_ban = int(FULL_BAN_STABLE)
+        alive_min = int(PURGE_STABLE_BELOW)
         with self._connect() as conn:
             total, active, excluded = conn.execute(
                 "SELECT COUNT(*), SUM(excluded = 0), SUM(excluded = 1) FROM servers"
             ).fetchone()
             zones = {
-                # stable <= FULL_BAN_STABLE — полноценный чс (исключены purge'ом).
-                "full_ban": conn.execute(
-                    "SELECT COUNT(*) FROM servers WHERE stable <= ?", (full_ban,)
+                # Живые: stable >= нижнего порога — импортируются в цикл проверки.
+                "alive": conn.execute(
+                    "SELECT COUNT(*) FROM servers WHERE stable >= ?", (alive_min,)
+                ).fetchone()[0],
+                # Умершие: stable < порога (по умолчанию -1) — не импортируются.
+                "dead": conn.execute(
+                    "SELECT COUNT(*) FROM servers WHERE stable < ?", (alive_min,)
+                ).fetchone()[0],
+                # Хотя бы раз пинговались -> был/есть «щит» от удаления.
+                "shielded": conn.execute(
+                    "SELECT COUNT(*) FROM servers WHERE ever_pinged = 1"
                 ).fetchone()[0],
                 # Пинганулся в последней проверке -> в whitelist.
                 "online": conn.execute(
-                    "SELECT COUNT(*) FROM servers WHERE excluded = 0 AND available = 1"
+                    "SELECT COUNT(*) FROM servers WHERE stable >= ? AND available = 1",
+                    (alive_min,),
                 ).fetchone()[0],
                 # Не пинганулся в последней проверке -> вне whitelist, в запасе.
                 "reserve": conn.execute(
-                    "SELECT COUNT(*) FROM servers WHERE excluded = 0 AND available = 0"
+                    "SELECT COUNT(*) FROM servers WHERE stable >= ? AND available = 0",
+                    (alive_min,),
                 ).fetchone()[0],
                 # Ещё ни разу не проверялись.
                 "unchecked": conn.execute(
-                    "SELECT COUNT(*) FROM servers WHERE excluded = 0 AND available IS NULL"
+                    "SELECT COUNT(*) FROM servers WHERE stable >= ? AND available IS NULL",
+                    (alive_min,),
                 ).fetchone()[0],
             }
         return {
@@ -583,7 +646,7 @@ class ServerStore:
 
         Старые политики исключали сервер уже после первого провала (stable < 0)
         или по серии неудач (временный чс). Теперь из проверки исключаются
-        только серверы ниже порога чса (stable < PURGE_STABLE_BELOW), поэтому
+        только серверы ниже нижнего порога (stable < PURGE_STABLE_BELOW), поэтому
         старые excluded-записи со stable >= порога возвращаются в пул один раз.
         Маркер рядом с базой защищает от повторного запуска.
         """
@@ -598,6 +661,32 @@ class ServerStore:
             ).rowcount
         marker.write_text(
             json.dumps({"revived": revived, "purge_below": int(PURGE_STABLE_BELOW)}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def _maybe_migrate_shield(self) -> None:
+        """Однократная инициализация ever_pinged для старой базы.
+
+        Историю пингов задним числом взять неоткуда, поэтому считаем, что
+        сервер пинговался, если последняя проверка успешна (available=1) или
+        он накопил положительный stable (> 0). Такие живые серверы сразу
+        получают полный щит SHIELD_CYCLES; умершие не воскрешаются.
+        """
+        marker = self.db_path.with_suffix(".shield-migrated.json")
+        if marker.exists():
+            return
+        with self._connect() as conn:
+            marked = conn.execute(
+                "UPDATE servers SET ever_pinged = 1 "
+                "WHERE ever_pinged = 0 AND (available = 1 OR stable > 0)"
+            ).rowcount
+            shielded = conn.execute(
+                "UPDATE servers SET stable = MAX(stable, ?) "
+                "WHERE ever_pinged = 1 AND stable >= ?",
+                (int(SHIELD_CYCLES), int(PURGE_STABLE_BELOW)),
+            ).rowcount
+        marker.write_text(
+            json.dumps({"ever_pinged": marked, "shielded": shielded}, ensure_ascii=False),
             encoding="utf-8",
         )
 
@@ -627,7 +716,11 @@ class ServerStore:
         now = _now()
         inserted = 0
         verb = "INSERT OR IGNORE" if ignore_existing else "INSERT OR REPLACE"
-        full_ban = int(FULL_BAN_STABLE)
+        # Whitelist — серверы, пинговавшиеся в прошлой жизни: полный щит и
+        # ever_pinged=1. Blacklist — умершие (ниже нижнего порога).
+        stable = self._dead_stable() if excluded else int(SHIELD_CYCLES)
+        ever_pinged = 0 if excluded else 1
+        available = 0 if excluded else 1
         with self._connect() as conn:
             for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
                 clean = raw.strip()
@@ -636,16 +729,13 @@ class ServerStore:
                 key = self._key_of(clean)
                 if not key:
                     continue
-                stable = max(parse_stable_from_line(clean), full_ban)
-                # Импортированный whitelist считаем «пинговавшимся в прошлой
-                # жизни» (available=1): он попадает в новый whitelist сразу,
-                # первая же проверка скорректирует результат.
-                available = 0 if excluded else 1
                 cur = conn.execute(
                     verb + " INTO servers"
-                    " (key, line, stable, excluded, available, first_seen, last_seen)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (key, clean, stable, 1 if excluded else 0, available, now, now),
+                    " (key, line, stable, ever_pinged, excluded, available,"
+                    "  first_seen, last_seen)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (key, clean, stable, ever_pinged, 1 if excluded else 0,
+                     available, now, now),
                 )
                 inserted += cur.rowcount
         return inserted

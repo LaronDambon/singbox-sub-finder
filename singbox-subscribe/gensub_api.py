@@ -481,7 +481,7 @@ def api_servers():
     Примеры:
       /api/servers?available=1   -> пинговались в последней проверке (whitelist)
       /api/servers?min_stable=1  -> stable > 1
-      /api/servers?max_stable=-1 -> stable < -1 (полноценный чс)
+      /api/servers?max_stable=0  -> stable < 0 (умершие, не импортируются)
     """
     try:
         store = _get_store()

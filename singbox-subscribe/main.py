@@ -40,12 +40,14 @@ def run_debug_generation(merge_lines, *, template=URLTEST_TEMPLATE, output_dir=S
 def orchestrate_default_run():
     """Default no-argument run:
     1) Скачать источники и зарегистрировать серверы в центральной базе (source/servers.db)
-    2) Собрать source/merge.txt из пула проверки базы (excluded-серверы не входят)
-    3) Прогнать urltest-циклы: stable +/- пишется в базу (успех +1 без
-       потолка, неудача -1; пол FULL_BAN_STABLE)
+    2) Собрать source/merge.txt из пула проверки базы (импортируются все
+       живые: excluded=0 и stable >= PURGE_STABLE_BELOW)
+    3) Прогнать urltest-циклы: stable пишется в базу («щит» от удаления:
+       успех -> stable не ниже SHIELD_CYCLES и ever_pinged=1, неудача -1;
+       дойдя до PURGE_STABLE_BELOW - 1 сервер больше не импортируется)
     4) Экспорт списков из базы: whitelist.txt = серверы, пинговавшиеся в
-       последней проверке (available=1); серверы со stable <
-       PURGE_STABLE_BELOW исключаются из проверочного списка
+       последней проверке (available=1); умершие (stable <
+       PURGE_STABLE_BELOW) исключаются из проверочного списка
     """
     urls_file = URLS_FILE
     output_merge = MERGE_FILE

@@ -27,6 +27,7 @@ from config.env import (
     BLACKLIST_FILE,
     SERVERS_DB_FILE,
     PURGE_STABLE_BELOW,
+    NEW_SERVER_STABLE,
     COUNTRY_CHECK_ENABLED,
     COUNTRY_CHECK_CONCURRENCY,
     COUNTRY_CHECK_TIMEOUT,
@@ -154,17 +155,18 @@ def _evaluate_nodes(
     не удалось определить дёшево.
 
     Переход stable считает compute_next_state() из server_store — та же
-    стейт-машина, что и в БД:
-      * успех — stable +1 (БЕЗ потолка);
-      * неудача — stable -1 (пол FULL_BAN_STABLE). Серии неудач и временный
-        чс больше не нужны: провал просто НЕ добавляет сервер в whitelist
-        (критерий whitelist — результат последней проверки), а сервер
-        остаётся в пуле проверки («запас» = значение stable).
+    стейт-машина, что и в БД (режим «щита»):
+      * успех — stable не ниже SHIELD_CYCLES (по умолчанию 96): сервер
+        получает «щит» от удаления и помечается ever_pinged=1;
+      * неудача — stable -1 (не ниже PURGE_STABLE_BELOW - 1). Провал просто
+        НЕ добавляет сервер в whitelist (критерий whitelist — результат
+        последней проверки), а сервер остаётся в пуле проверки, пока жив;
+        дойдя до -1, он больше не импортируется.
 
     stable_map: key -> stable из базы; обновляется по ходу.
-    Узлы с new_stable < purge_below помечаются is_excluded=True:
-    их результат всё равно пишется в базу, а из пула проверки их
-    исключит purge_dead() в конце цикла.
+    Узлы с new_stable < purge_below (по умолчанию -1, то есть умершие)
+    помечаются is_excluded=True: их результат всё равно пишется в базу,
+    а из пула проверки их исключит purge_dead() в конце цикла.
     """
     known_countries = known_countries or {}
     available_tags = {tag for tag, ping_ms in parsed if ping_ms is not None}
@@ -178,7 +180,10 @@ def _evaluate_nodes(
         is_ok = tag in available_tags
         ping_ms = tag_to_ping.get(tag)
         key = normalize_proxy_key(raw_line)
-        prev_stable = int(stable_map.get(key, 0) or 0)
+        # Новый (ещё не записанный в базу) сервер стартует с NEW_SERVER_STABLE,
+        # как и при регистрации: 0 означало бы смерть после первой же неудачи.
+        prev_stable = stable_map.get(key, int(NEW_SERVER_STABLE))
+        prev_stable = int(NEW_SERVER_STABLE) if prev_stable is None else int(prev_stable)
         new_stable = compute_next_state(prev_stable, ok=is_ok)
         stable_map[key] = new_stable
 
@@ -256,15 +261,17 @@ def run_debug_ping_cycle(
     """Проверяет серверы из merge.txt через sing-box urltest и пишет результаты
     в центральную базу (ServerStore).
 
-    stable: +1 за успешный пинг (БЕЗ потолка), -1 за неудачу (пол
-    FULL_BAN_STABLE). Whitelist — проекция ПОСЛЕДНЕЙ проверки: пинганулся
-    (available=1) -> добавляется в whitelist, не пинганулся -> не добавляется,
-    но остаётся в пуле проверки («запас» = значение stable). По завершении
-    цикла:
-      * серверы со stable < PURGE_STABLE_BELOW (полноценный чс, stable=-2)
-        исключаются из проверочного пула;
+    «Щит» от удаления: успешный пинг ставит stable не ниже SHIELD_CYCLES
+    (по умолчанию 96) и помечает сервер ever_pinged=1; каждая неудача -1.
+    Нижний порог stable = PURGE_STABLE_BELOW (0): в цикл проверки попадают
+    серверы со stable >= порога, а дойдя до -1 сервер больше не импортируется.
+    Whitelist — проекция ПОСЛЕДНЕЙ проверки: пинганулся (available=1) ->
+    добавляется в whitelist, не пинганулся -> не добавляется, но остаётся
+    в пуле проверки, пока жив. По завершении цикла:
+      * умершие (stable < PURGE_STABLE_BELOW, по умолчанию -1) исключаются
+        из проверочного пула;
       * whitelist.txt экспортируется из базы: available=1;
-      * blacklist.txt — проекция полноценного чса для наблюдения.
+      * blacklist.txt — проекция умерших для наблюдения.
     """
     merge_file = Path(merge_path).resolve()
     lines = load_merge_lines(merge_file)
@@ -446,11 +453,12 @@ def run_debug_ping_cycle(
     total_elapsed = time.monotonic() - cycle_started
     LOGGER.info(
         "Ping cycle finished in %.2fs: processed=%d checked=%d available=%d failed=%d | "
-        "db: total=%d active=%d excluded=%d online=%d reserve=%d | "
-        "excluded_now=%d unparsable_banned=%d wl_export=%d bl_export=%d",
+        "db: total=%d active=%d excluded=%d alive=%d dead=%d online=%d "
+        "shielded=%d | excluded_now=%d unparsable_banned=%d wl_export=%d bl_export=%d",
         total_elapsed, processed, checked, available_count, failed_count,
         stats["total"], stats["active"], stats["excluded"],
-        stats["zones"]["online"], stats["zones"]["reserve"],
+        stats["zones"]["alive"], stats["zones"]["dead"],
+        stats["zones"]["online"], stats["zones"]["shielded"],
         purged, unparsable_banned, exported_wl, exported_bl,
     )
 
