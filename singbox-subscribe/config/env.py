@@ -55,6 +55,27 @@ def _bool(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+# Человекочитаемые имена уровней -> числовые (logging.DEBUG и т.п.).
+_LEVELS = {
+    "CRITICAL": 50, "FATAL": 50, "ERROR": 40, "WARN": 30, "WARNING": 30,
+    "INFO": 20, "DEBUG": 10, "NOTSET": 0, "OFF": 100,
+}
+
+
+def _level(name: str, default: str) -> int:
+    """Читает уровень логирования из окружения (DEBUG/INFO/WARNING/ERROR/...).
+
+    Принимается и числовое значение (например LOG_LEVEL=25). Неизвестное имя
+    не роняет процесс — берётся значение по умолчанию.
+    """
+    raw = str(os.getenv(name, "")).strip().upper()
+    if not raw:
+        raw = str(default).upper()
+    if raw.isdigit():
+        return int(raw)
+    return _LEVELS.get(raw, _LEVELS.get(str(default).upper(), _LEVELS["INFO"]))
+
+
 # --------------------------------------------------------------------- пути
 # Пути считаются от корня пакета; при необходимости переопределяются env.
 URLS_FILE = ROOT / "config" / "subs" / "urls.json"
@@ -131,3 +152,85 @@ DEPLOY_PATH = os.getenv("DEPLOY_PATH", "config.json")
 DEPLOY_CREATE_REPO = _bool("DEPLOY_CREATE_REPO", False)
 DEPLOY_IP_SOURCE = os.getenv("DEPLOY_IP_SOURCE", "")
 DEPLOY_IP_PLACEHOLDER = os.getenv("DEPLOY_IP_PLACEHOLDER", "{{SERVER_IP}}")
+
+# ================================================================== ЛОГИРОВАНИЕ
+# Единая точка настройки — pipeline.logging_setup. Всё, что ниже, читается
+# ОДИН раз при первом обращении к get_logger()/setup_logging().
+#
+# ГЛАВНОЕ ПРАВИЛО: LOG_LEVEL — это ПОРОГ. Запись ниже порога не попадает ни в
+# один файл и ни в консоль.
+#     LOG_LEVEL=INFO  -> пишутся только info/warning/error/critical
+#     LOG_LEVEL=WARNING-> пишутся только warning/error/critical
+#     LOG_LEVEL=ERROR -> пишутся только error/critical
+#     LOG_LEVEL=DEBUG -> всё, включая отладочные сообщения
+LOG_DIR_PATH = Path(os.getenv("LOG_DIR", str(ROOT / "logs")))
+LOG_LEVEL = _level("LOG_LEVEL", "INFO")
+# Уровень консоли отдельно от файлов: LOG_CONSOLE_LEVEL=INFO -> файлы подробнее.
+LOG_CONSOLE_LEVEL = _level("LOG_CONSOLE_LEVEL", str(os.getenv("LOG_LEVEL", "INFO")))
+# Главный файл: всё, что прошло порог LOG_LEVEL.
+LOG_FILE_NAME = os.getenv("LOG_FILE_NAME", "app.log")
+# Ротация по размеру: файл до LOG_MAX_BYTES, затем LOG_BACKUP_COUNT копий.
+LOG_MAX_BYTES = _int("LOG_MAX_BYTES", 10 * 1024 * 1024)
+LOG_BACKUP_COUNT = _int("LOG_BACKUP_COUNT", 5)
+# Очистка по возрасту: файлы старше LOG_RETENTION_DAYS дней удаляются при старте.
+# 0 = не удалять по возрасту (чистая ротация по размеру).
+LOG_RETENTION_DAYS = _int("LOG_RETENTION_DAYS", 14)
+# Отдельный файл на каждый уровень (info.log/warning.log/error.log) с фильтром
+# ТОЧНО на уровень: запись INFO попадает только в info.log, а не копией в три
+# файла сразу. 1 = включено, 0 = только главный LOG_FILE_NAME.
+LOG_PER_LEVEL_FILES = _bool("LOG_PER_LEVEL_FILES", True)
+# Подробный формат с модулем в файле: text|json
+LOG_FORMAT = os.getenv("LOG_FORMAT", "text").strip().lower()
+# Защита от «пулемёта»: не более LOG_THROTTLE_LIMIT одинаковых сообщений
+# за LOG_THROTTLE_WINDOW секунд (далее — одна сводная строка).
+LOG_THROTTLE_LIMIT = _int("LOG_THROTTLE_LIMIT", 20)
+LOG_THROTTLE_WINDOW = _float("LOG_THROTTLE_WINDOW", 60.0)
+# Перенаправлять print()/сторонние библиотеки в логгер (1/0).
+LOG_CAPTURE_STDOUT = _bool("LOG_CAPTURE_STDOUT", False)
+
+# ==================================================================== PIPELINE
+# Порядок и состав этапов задаются здесь; каждый этап реализуется отдельным
+# модулем (см. pipeline/checkers и pipeline/stages).
+# Проверяющие алгоритмы через запятую: url_probe,country,reachability.
+# «none» или пусто -> только url_probe.
+PIPELINE_CHECKERS = os.getenv(
+    "PIPELINE_CHECKERS", "url_probe,country,reachability"
+)
+# Этап поиска новых серверов из ссылок (асинхронный, расширяет БД).
+PIPELINE_DISCOVERY = _bool("PIPELINE_DISCOVERY", True)
+# Сколько источников качать одновременно на этапе поиска.
+PIPELINE_DISCOVERY_CONCURRENCY = _int("PIPELINE_DISCOVERY_CONCURRENCY", 6)
+# Сколько батчей проверки крутится одновременно (каждый = свой sing-box).
+PIPELINE_CHECK_WORKERS = _int("PIPELINE_CHECK_WORKERS", 2)
+# Размер батча проверки = сколько серверов уходит в один запуск sing-box.
+PIPELINE_BATCH_SIZE = _int("PIPELINE_BATCH_SIZE", URLTEST_BATCH_SIZE)
+# Таймаут одного БАТЧА проверки, сек. Батч из 100 серверов получает
+# PIPELINE_CHECK_TIMEOUT + PIPELINE_BATCH_STARTUP, осколок — долю от своего
+# размера. По истечении sing-box убивается, а серверы, про которых он не
+# успел сказать ни слова, НЕ считаются мёртвыми: они возвращаются в очередь
+# и проверяются в следующем круге (PIPELINE_MAX_RETRIES).
+PIPELINE_CHECK_TIMEOUT = _float("PIPELINE_CHECK_TIMEOUT", 20.0)
+# Постоянная часть таймаута: запуск sing-box, разбор конфига, резолв DNS.
+PIPELINE_BATCH_STARTUP = _float("PIPELINE_BATCH_STARTUP", 10.0)
+# Таймаут ЧЕКЕРОВ-ДОПОЛНЕНИЙ (страна, достижимость целевых сайтов), сек.
+# Это отдельные часы: профиль достижимости гоняет каждый сервер через
+# несколько сайтов и спокойно занимает минуту даже на трёх серверах.
+PIPELINE_ENRICH_TIMEOUT = _float("PIPELINE_ENRICH_TIMEOUT", 180.0)
+# Сколько попыток повторить батч при сбое ЗАПУСКА sing-box (занятый порт).
+PIPELINE_MAX_ATTEMPTS = _int("PIPELINE_MAX_ATTEMPTS", 3)
+# Сколько раз сервер возвращается в очередь, если sing-box ни разу не сказал
+# про него ничего: таймаут батча, сбой конфига, обрыв. Такие серверы не
+# считаются мёртвыми — они просто проверяются заново. После этого срока
+# снимаются с проверки на текущий прогон.
+PIPELINE_MAX_RETRIES = _int("PIPELINE_MAX_RETRIES", 3)
+# Очередь проверки живёт в БД (check_queue) и переживает перезапуск.
+# PIPELINE_QUEUE_PERSIST=1 -> ставить pending-строки обратно в очередь при старте.
+PIPELINE_QUEUE_PERSIST = _bool("PIPELINE_QUEUE_PERSIST", True)
+# Папка с ПОЛЬЗОВАТЕЛЬСКИМИ проверяющими алгоритмами (подхватываются автоматически).
+PIPELINE_CUSTOM_CHECKERS_DIR = Path(
+    os.getenv("PIPELINE_CUSTOM_CHECKERS_DIR", str(ROOT / "pipeline" / "checkers" / "custom"))
+)
+# Экспортировать whitelist.txt/blacklist.txt после цикла.
+PIPELINE_EXPORT_LISTS = _bool("PIPELINE_EXPORT_LISTS", True)
+# Записывать merge.txt (пул проверки) после наполнения очереди.
+PIPELINE_WRITE_MERGE = _bool("PIPELINE_WRITE_MERGE", True)

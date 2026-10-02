@@ -13,7 +13,7 @@ warnings.filterwarnings("ignore", category=Warning, module=r"requests")
 
 from script.core import generate_debug_configs_with_singbox
 from script.downloader import build_clean_tag, normalize_proxy_key
-from script.logger_utils import get_project_logger, setup_project_logging
+from script.logger_utils import get_project_logger
 from script.server_store import (  # noqa: F401 — re-export parse_stable_from_line для совместимости
     ServerStore,
     compute_next_state,
@@ -45,8 +45,10 @@ from config.env import (
 
 from utils import tool
 
-setup_project_logging(console_level=20)
-LOGGER = get_project_logger("debug_ping_runner")
+# Логирование настраивается один раз (pipeline.logging_setup); здесь только
+# берём логгер. Модуль можно импортировать откуда угодно — обработчики не
+# пересоздаются.
+LOGGER = get_project_logger(__name__)
 
 
 def load_merge_lines(merge_path: str | Path) -> List[str]:

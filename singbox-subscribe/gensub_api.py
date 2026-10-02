@@ -19,6 +19,10 @@ from functools import lru_cache
 
 from script.server_store import ServerStore
 from script import core as core_mod
+from pipeline.logging_setup import get_logger, setup_logging
+
+setup_logging()
+LOGGER = get_logger("gensub_api")
 
 app = Flask(__name__)
 
@@ -457,7 +461,7 @@ def api_whitelist():
         if lines:
             return "\n".join(lines), 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception:
-        app.logger.exception("server store read failed; falling back to file")
+        LOGGER.exception("Чтение базы не удалось, отдаю файл whitelist.txt")
     whitelist_path = Path(WHITELIST_FILE)
     if not whitelist_path.exists():
         return jsonify({"error": "Whitelist not found"}), 404
@@ -471,6 +475,23 @@ def api_servers_stats():
         store = _get_store()
         return jsonify(store.stats())
     except Exception as exc:
+        LOGGER.exception("Статистика базы не удалась")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/queue")
+def api_queue():
+    """Состояние очереди проверки (таблица check_queue в той же базе).
+
+    API и pipeline работают с ОДНОЙ базой: здесь видно, сколько серверов
+    ждут проверки, сколько в работе и сколько обработано с ошибкой.
+    """
+    from pipeline.database import read_queue_stats
+
+    try:
+        return jsonify(read_queue_stats(SERVERS_DB_FILE).as_dict())
+    except Exception as exc:
+        LOGGER.exception("Чтение очереди не удалось")
         return jsonify({"error": str(exc)}), 500
 
 

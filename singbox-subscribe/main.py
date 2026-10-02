@@ -1,69 +1,146 @@
+#!/usr/bin/env python3
+"""Точка входа. Загружает ядро pipeline и вызывает его функции.
+
+Здесь НЕТ логики проверки серверов и нет работы с базой — всё это живёт в
+ядре ``singbox-subscribe/pipeline``. Файл делает три вещи:
+
+  1. настраивает логирование;
+  2. собирает ``Pipeline`` с нужными настройками;
+  3. запускает прогон и печатает итог.
+
+Вся настройка — переменные окружения (`.env`), см. `.env.example`.
+
+Запуск:
+
+    python singbox-subscribe/main.py                  # полный цикл
+    python singbox-subscribe/main.py --checkers url_probe,country
+    python singbox-subscribe/main.py --no-discovery   # только проверка и экспорт
+    python singbox-subscribe/main.py --interval 1800  # крутить цикл каждые 30 мин
+
+Отдельные стадии ядра доступны напрямую:
+
+    python -m pipeline run | check | discover | export | checkers | status | queue | logs
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
 import json
-import logging
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-# Прямые пакеты доступны через package imports, sys.path правки не нужны.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from config.env import URLS_FILE, MERGE_FILE, LOG_FILE, URLTEST_URL, URLTEST_TEMPLATE, SING_BOX_OUTPUT_DIR
-from script.logger_utils import capture_stdout_stderr_to_logger, get_project_logger, setup_project_logging
-import importlib
+from pipeline import Pipeline, get_logger, setup_logging
 
-setup_project_logging(console_level=logging.INFO)
-LOGGER = get_project_logger("main")
-
-# import local script package modules (ROOT is first on sys.path)
-_core = importlib.import_module("script.core")
-_downloader = importlib.import_module("script.downloader")
-_urltest = importlib.import_module("script.urltest")
-
-# exported helpers
-generate_debug_configs_with_singbox = _core.generate_debug_configs_with_singbox
-build_merge_from_urls = _downloader.build_merge_from_urls
-run_debug_ping_cycle = _urltest.run_debug_ping_cycle
+LOGGER = get_logger("main")
 
 
-def run_debug_generation(merge_lines, *, template=URLTEST_TEMPLATE, output_dir=SING_BOX_OUTPUT_DIR, singbox_path=None):
-    """Оркеструет генерацию merged-config из переданных строк."""
-    return generate_debug_configs_with_singbox(
-        threads=1,
-        urltest=URLTEST_URL,
-        ping_limit=500,
-        template=template,
-        output_dir=output_dir,
-        singbox_path=singbox_path,
-        merge_lines=merge_lines,
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description="Один цикл pipeline: поиск серверов -> очередь -> проверка -> экспорт",
     )
+    parser.add_argument(
+        "--checkers", default=None,
+        help="проверяющие алгоритмы через запятую (перекрывает PIPELINE_CHECKERS)",
+    )
+    parser.add_argument(
+        "--no-discovery", action="store_true",
+        help="не искать новые серверы из подписок, только проверить очередь",
+    )
+    parser.add_argument(
+        "--no-export", action="store_true",
+        help="не обновлять whitelist.txt / blacklist.txt / merge.txt",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=None, help="серверов в одном запуске sing-box",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=None, help="сколько батчей проверять одновременно",
+    )
+    parser.add_argument(
+        "--interval", type=float, default=0.0,
+        help="если > 0 — повторять цикл с такой паузой в секундах (0 = один раз)",
+    )
+    parser.add_argument("--json", action="store_true", help="печатать отчёт в JSON")
+    return parser
 
 
-def orchestrate_default_run():
-    """Default no-argument run:
-    1) Скачать источники и зарегистрировать серверы в центральной базе (source/servers.db)
-    2) Собрать source/merge.txt из пула проверки базы (импортируются все
-       живые: excluded=0 и stable >= PURGE_STABLE_BELOW)
-    3) Прогнать urltest-циклы: stable пишется в базу («щит» от удаления:
-       успех -> stable не ниже SHIELD_CYCLES и ever_pinged=1, неудача -1;
-       дойдя до PURGE_STABLE_BELOW - 1 сервер больше не импортируется)
-    4) Экспорт списков из базы: whitelist.txt = серверы, пинговавшиеся в
-       последней проверке (available=1); умершие (stable <
-       PURGE_STABLE_BELOW) исключаются из проверочного списка
-    """
-    urls_file = URLS_FILE
-    output_merge = MERGE_FILE
-    log_file = LOG_FILE
+def settings_from_args(args: argparse.Namespace) -> dict:
+    """Перекрытия настроек из аргументов командной строки."""
+    overrides = {
+        "discovery": False if args.no_discovery else None,
+        "write_merge": False if args.no_export else None,
+        "export_lists": False if args.no_export else None,
+        "batch_size": args.batch_size,
+        "check_workers": args.workers,
+    }
+    return {k: v for k, v in overrides.items() if v is not None}
 
-    LOGGER.info("[main] Building merge from URLs")
-    build_res = build_merge_from_urls(urls_file, output_merge, log_file)
-    LOGGER.info("[main] Merged %d configs -> %s", build_res.get("merged_count", 0), build_res.get("output_path"))
 
-    # parse + sing-box generation is handled inside urltest runner; run ping cycle
-    LOGGER.info("[main] Running urltest ping cycle")
-    ping_res = run_debug_ping_cycle(output_merge)
-    LOGGER.info(json.dumps(ping_res, indent=2, ensure_ascii=False))
-    return {"merge": build_res, "urltest": ping_res}
+async def run_once(pipeline: Pipeline, *, discovery: bool, export: bool) -> dict:
+    """Один полный прогон ядра."""
+    return await pipeline.run(discovery=discovery, export=export)
+
+
+async def run_forever(pipeline: Pipeline, *, interval: float, discovery: bool,
+                      export: bool) -> None:
+    """Крутит цикл с паузой. Ошибка цикла не убивает процесс."""
+    from pipeline.logging_setup import log_throttle_summary
+
+    while True:
+        try:
+            report = await run_once(pipeline, discovery=discovery, export=export)
+            if not report.get("ok"):
+                LOGGER.error("Цикл завершился с ошибкой: %s", report.get("error"))
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — сервис не должен падать из-за цикла
+            LOGGER.exception("Непойманная ошибка цикла — продолжаю")
+        log_throttle_summary(LOGGER)
+        LOGGER.info("Следующий цикл через %.0f с", interval)
+        await asyncio.sleep(interval)
+
+
+def main(argv: list[str] | None = None) -> int:
+    setup_logging()
+    args = build_parser().parse_args(argv)
+    LOGGER.info("Запуск main.py (логирование настроено)")
+
+    async def amain() -> int:
+        async with Pipeline(
+            settings=settings_from_args(args), checkers=args.checkers,
+        ) as pipeline:
+            if args.json:
+                report = await run_once(
+                    pipeline, discovery=not args.no_discovery, export=not args.no_export,
+                )
+                print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+                return 0 if report.get("ok") else 1
+
+            if args.interval > 0:
+                LOGGER.info("Режим постоянной работы: цикл каждые %.0f с", args.interval)
+                await run_forever(
+                    pipeline, interval=args.interval,
+                    discovery=not args.no_discovery, export=not args.no_export,
+                )
+                return 0
+
+            report = await run_once(
+                pipeline, discovery=not args.no_discovery, export=not args.no_export,
+            )
+            return 0 if report.get("ok") else 1
+
+    try:
+        return asyncio.run(amain())
+    except KeyboardInterrupt:
+        LOGGER.info("Остановлено пользователем (Ctrl+C)")
+        return 0
 
 
 if __name__ == "__main__":
-    with capture_stdout_stderr_to_logger(LOGGER):
-        orchestrate_default_run()
+    raise SystemExit(main())

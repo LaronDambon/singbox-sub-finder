@@ -12,6 +12,7 @@ import sys
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -386,6 +387,54 @@ def _download_sources_parallel(urls: list[str], download_dir: Path,
         else:
             logger.error("[%d/%d] Ошибка загрузки %s: %s", idx, total, url, r["error"])
     return partial_files
+
+
+def download_sources(
+    urls: list[str],
+    download_dir: Path | str,
+    *,
+    logger: logging.Logger | None = None,
+) -> list[Path]:
+    """Публичная обёртка над параллельной загрузкой источников.
+
+    Этап поиска (pipeline/stages/discovery.py) вызывает только её и дальше сам
+    разбирает файлы: так поиск остаётся отдельным этапом, а не спрятан внутри
+    одной большой функции сборки merge.
+    """
+    target = Path(download_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    return _download_sources_parallel(
+        list(urls), target, logger=logger or get_project_logger("discovery"),
+    )
+
+
+def read_source_lines(
+    files: list[Path], *, exclude: Callable[[str], bool] | None = None,
+) -> tuple[list[str], int]:
+    """Читает скачанные файлы и убирает дубли по каноническому ключу.
+
+    Возвращает (уникальные строки, сколько дублей отброшено).
+    По умолчанию отбрасываются строки с небезопасным TLS-отпечатком
+    (fp=unsafe и т.п.): sing-box отвергает такой батч целиком.
+    """
+    predicate = exclude or has_unsafe_fingerprint
+    seen: set[str] = set()
+    out: list[str] = []
+    duplicates = 0
+    for path in sorted(Path(f) for f in files):
+        if not path.exists():
+            continue
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            clean = raw.strip()
+            if not clean or predicate(clean):
+                continue
+            key = normalize_proxy_key(clean)
+            if not key or key in seen:
+                duplicates += 1
+                continue
+            seen.add(key)
+            out.append(clean)
+    return out, duplicates
 
 
 def build_merge_from_urls(

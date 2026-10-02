@@ -282,6 +282,44 @@ def _probe_port(port: int, targets: list[dict]) -> dict:
     return result
 
 
+
+def _probe_single(port: int, target: dict) -> tuple[str, dict]:
+    """Одна проба: один прокси — одна цель.
+
+    Раньше все цели обходились последовательно внутри одного прокси, и батч
+    из двух серверов с восемью целями растягивался на 80+ секунд: каждая цель
+    ждала своего connect+read таймаута по очереди. Теперь цели независимы и
+    уходят в общий пул потоков.
+    """
+    name = target["name"]
+    connect_to, read_to = PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT
+    tm = target.get("timeout_ms")
+    if tm:
+        read_to = max(0.5, tm / 1000.0)
+    start = time.monotonic()
+    entry = {"ok": False, "status": None, "latency_ms": None, "error": None}
+    proxies = {"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"}
+    session = requests.Session()
+    session.trust_env = False  # игнорировать системные HTTP(S)_PROXY
+    try:
+        resp = session.get(
+            target["url"],
+            proxies=proxies,
+            timeout=(connect_to, read_to),
+            headers=target.get("headers") or {"User-Agent": BROWSER_UA},
+            allow_redirects=True,
+        )
+        elapsed = round((time.monotonic() - start) * 1000.0, 1)
+        entry["status"] = resp.status_code
+        entry["latency_ms"] = elapsed
+        entry["ok"] = elapsed <= target.get("max_ping_ms", 500)
+    except Exception as exc:  # noqa: BLE001
+        entry["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        session.close()
+    return name, entry
+
+
 # --- Батч-исполнение ---------------------------------------------------------
 def _run_batch(items: list[tuple[str, int]], results: dict[str, dict],
                targets: list[dict], concurrency: int, depth: int = 0) -> None:
@@ -346,13 +384,23 @@ def _run_batch(items: list[tuple[str, int]], results: dict[str, dict],
         port_by_index = {e["index"]: e["port"] for e in active}
         pairs = [(line, port_by_index[idx]) for line, idx in items if idx in port_by_index]
 
-        workers = max(1, min(concurrency, len(pairs)))
+        # Параллелим сразу по двум осям: прокси И цели. Иначе восемь целей
+        # шли последовательно и батч из двух серверов занимал больше минуты.
+        jobs = [(line, port, target) for line, port in pairs for target in targets]
+        workers = max(1, min(concurrency * len(targets), len(jobs)))
+        lock = threading.Lock()
+        for line, _ in pairs:
+            results.setdefault(line, {"error": None, "targets": {}})
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_probe_port, p, targets): line for line, p in pairs}
+            futures = {
+                pool.submit(_probe_single, port, target): (line, target["name"])
+                for line, port, target in jobs
+            }
             for fut in as_completed(futures):
-                line = futures[fut]
-                targets_res = fut.result()
-                results[line] = {"error": None, "targets": targets_res}
+                line, _expected = futures[fut]
+                name, entry = fut.result()
+                with lock:
+                    results[line]["targets"][name] = entry
     finally:
         proc.terminate()
         try:

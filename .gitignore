@@ -12,11 +12,18 @@ venv/
 ENV/ 
 env.bak/ 
 venv.bak/ 
+# Конфиг, который sing-box генерирует на каждый проверочный батч
+singbox-subscribe/sing-box/merged_config.json
+singbox-subscribe/sing-box/batch_*.json
+singbox-subscribe/source/tests/
+
 # Test & benchmark artifacts
 singbox-subscribe/.tmp_tests/
 singbox-subscribe/_bench_tmp/
+_pipeline_test_tmp/
 *.db-wal
 *.db-shm
+*.db-journal
 
 # Singbox subscribe config templates
 sbc-1.14-ray-phone.json

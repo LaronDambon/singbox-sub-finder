@@ -843,15 +843,16 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _clean_log_line(line: str) -> str:
-    """Делает строку вывода sing-box безопасной для логов.
+    """Готовит строку вывода sing-box к записи в лог.
 
-    Вывод sing-box содержит ANSI-escape (цвета) и emoji (флаги стран),
-    которые ломают консольный файловый обработчик в cp1251 — кодировка не
-    может закодировать такие символы, и logging роняет UnicodeEncodeError.
-    Убираем escape-последовательности и заменяем остальное на ASCII.
+    Раньше здесь всё заменялось на ASCII, потому что консольный обработчик был
+    в cp1251 и ронял logging на emoji флагов стран. Теперь консоль UTF-8
+    (см. pipeline.logging_setup._ensure_utf8), поэтому флаги и названия
+    стран остаются читаемыми — убираем только ANSI-цвета и управляющие
+    символы, которые лог ломают.
     """
     text = _ANSI_ESCAPE_RE.sub("", line)
-    return text.encode("ascii", "replace").decode("ascii")
+    return "".join(ch for ch in text if ch == "\t" or ch >= " ")
 
 
 def run_singbox_admin(
@@ -952,9 +953,15 @@ def run_singbox_admin(
         and timed_out is False
     )
 
-    # urltest unavailable-строки — это нормальный результат проверки, не ошибка.
-    # Логируем только реальные проблемы: отсутствие результатов или аварийный выход.
-    if expected_debug_count > 0 and result_count == 0:
+    # --- Как читать результат этого запуска -------------------------------
+    # sing-box для urltest возвращает ненулевой код почти всегда: он сам
+    # останавливается, когда все outbound'ы отчитались, а на Windows принудительное
+    # завершение дерева процессов всегда даёт код 1. Поэтому сам по себе
+    # return_code ничего не значит — важно, ЕСТЬ ЛИ РЕЗУЛЬТАТЫ.
+    has_results = result_count > 0
+    fatal_lines = [line for line in output_lines if "FATAL" in line or "ERROR[" in line]
+
+    if expected_debug_count > 0 and not has_results:
         LOGGER.error(
             "sing-box run returned no urltest results. return_code=%s output_lines=%d timeout=%.2fs expected=%d",
             return_code,
@@ -962,33 +969,47 @@ def run_singbox_admin(
             elapsed,
             expected_debug_count,
         )
-    # Ненулевой exit-код при САМОСТОЯТЕЛЬНОМ аварийном выходе sing-box
-    # (порт занят, невалидный конфиг, нехватка прав и т.п.) — реальная ошибка.
-    # Штатный случай (graceful: мы сами убили sing-box после сбора всех
-    # результатов, на Windows это даёт return_code=1) НЕ логируем как ERROR.
-    crashed = (return_code is None or return_code != 0) and not graceful
+
+    # Авария — это когда sing-box упал, НЕ отдав результатов: не смог привязать
+    # порт, не распарсил конфиг, не хватило прав. Таймаут с уже полученными
+    # результатами — штатная ситуация: часть серверов просто не отвечает.
+    crashed = (return_code is not None and return_code != 0) and not graceful and not has_results
     if crashed:
         LOGGER.error(
-            "sing-box exited unexpectedly with return_code=%s (captured %d lines):",
+            "sing-box завершился с кодом %s, результатов нет (captured %d lines):",
             return_code,
             len(output_lines),
         )
-        shown = 0
+        # Причина сбоя читается в строках FATAL/ERROR самого sing-box.
+        # Весь его вывод сюда не выводим: он состоит в основном из штатных
+        # INFO/DEBUG-строк про сеть и DNS, из-за чего error.log засорялся
+        # сообщениями об обычных вещах.
+        reasons = fatal_lines or output_lines[-3:]
+        for line in reasons[:5]:
+            LOGGER.error("  sing-box: %s", _clean_log_line(line))
+        if len(fatal_lines) > 5:
+            LOGGER.error(
+                "  sing-box: ... ещё %d строк с ошибками (смотрите DEBUG)", len(fatal_lines) - 5,
+            )
+
+    # Полный вывод sing-box — это DEBUG. Он нужен при разборе инцидентов
+    # (LOG_LEVEL=DEBUG), но не должен попадать в обычные логи: там для каждого
+    # мёртвого сервера своя строка, и на большом батче это сотни записей.
+    if has_results:
         for line in output_lines:
-            if shown >= 80:
-                break
-            shown += 1
-            LOGGER.error("sing-box output: %s", _clean_log_line(line))
-        if len(output_lines) > shown:
-            LOGGER.error("sing-box output: ... (%d more lines)", len(output_lines) - shown)
+            LOGGER.debug("sing-box output: %s", _clean_log_line(line))
+    elif fatal_lines:
+        for line in fatal_lines:
+            LOGGER.debug("sing-box output: %s", _clean_log_line(line))
 
     LOGGER.info(
-        "sing-box run finished: %d/%d urltest results in %.2fs (return_code=%s)%s",
+        "sing-box run finished: %d/%d urltest results in %.2fs (return_code=%s)%s%s",
         result_count,
         expected_debug_count,
         elapsed,
         return_code,
         " [graceful]" if graceful else "",
+        " [таймаут, часть серверов не ответила]" if timed_out and has_results else "",
     )
     return (output_lines, [line for line in output_lines if line])
 

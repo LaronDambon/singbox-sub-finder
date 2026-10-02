@@ -392,6 +392,41 @@ class ServerStore:
                     ),
                 )
 
+    def record_enrichment(self, rows: Sequence[dict]) -> int:
+        """Обновляет ТОЛЬКО обогащение: страна и профиль достижимости.
+
+        Отдельный метод нужен потому, что страна и reachability считаются
+        отдельным проходом уже ПОСЛЕ того, как сервер признан живым. Если
+        слать их через record_results, stable пересчитался бы второй раз за
+        тот же цикл проверки и сервер получал бы и за живого, и за мёртвого
+        два изменения подряд.
+
+        Пустые значения не затирают уже известные.
+        Возвращает количество обновлённых серверов.
+        """
+        if not rows:
+            return 0
+        updated = 0
+        now = _now()
+        with self._connect() as conn:
+            for row in rows:
+                country = row.get("country") or ""
+                capabilities = row.get("capabilities") or ""
+                if not country and not capabilities:
+                    continue
+                cursor = conn.execute(
+                    """
+                    UPDATE servers SET
+                        country = CASE WHEN ? <> '' THEN ? ELSE country END,
+                        capabilities = CASE WHEN ? <> '' THEN ? ELSE capabilities END,
+                        last_seen = ?
+                    WHERE key = ?
+                    """,
+                    (country, country, capabilities, capabilities, now, row["key"]),
+                )
+                updated += cursor.rowcount or 0
+        return updated
+
     # ----------------------------------------------------------- запросы DB
     def check_pool(self) -> list[sqlite3.Row]:
         """Пул проверки: ВСЕ живые серверы со stable >= PURGE_STABLE_BELOW.

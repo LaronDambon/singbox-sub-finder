@@ -1,0 +1,455 @@
+"""Доступ всех узлов pipeline к центральной базе.
+
+Обёртка над ``script.server_store.ServerStore`` (там живёт логика stable и
+«щита» от удаления — её не дублируем), к которой добавлены:
+
+  * таблица ``check_queue`` — ОЧЕРЕДЬ ПРОВЕРКИ. Она в базе, а не в памяти,
+    поэтому переживает перезапуск, её видно через CLI и HTTP API, и её можно
+    пополнять из разных этапов;
+  * асинхронные методы: обычный ``await db.xxx()``. SQLite — синхронный, поэтому
+    запросы уходят в пул потоков и не блокируют event loop; запись дополнительно
+    сериализуется замком, чтобы параллельные батчи не ловили SQLITE_BUSY.
+
+Кто что делает с базой:
+
+  * поиск (discovery) — ``upsert_lines()` + ``enqueue()`: расширяет базу новыми
+    серверами из ссылок и ставит их в очередь;
+  * проверка (check) — ``refill_from_pool()` забирает живой пул из базы по
+    фильтрам stable, ``claim_batch()` раздаёт батчи воркерам, ``record_results()`
+    перезаписывает базу по результатам тестов;
+  * экспорт — ``export_whitelist()`/``export_blacklist()`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+from config.env import (
+    PURGE_STABLE_BELOW,
+    SERVERS_DB_FILE,
+    SHIELD_CYCLES,
+)
+from pipeline.logging_setup import get_logger
+
+LOGGER = get_logger("database")
+
+QUEUE_PENDING = "pending"
+QUEUE_IN_PROGRESS = "in_progress"
+QUEUE_DONE = "done"
+QUEUE_FAILED = "failed"
+
+QUEUE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS check_queue (
+    key         TEXT PRIMARY KEY,
+    line        TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    source      TEXT NOT NULL DEFAULT 'pool',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    enqueued_at TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    last_error  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_check_queue_status ON check_queue(status);
+CREATE INDEX IF NOT EXISTS idx_check_queue_source ON check_queue(source);
+"""
+
+#: Источники постановки в очередь (для отчётов и фильтров в CLI/API).
+SOURCE_POOL = "pool"
+SOURCE_DISCOVERY = "discovery"
+SOURCE_RETRY = "retry"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@dataclass(slots=True)
+class QueueItem:
+    """Одна строка прокси, ожидающая проверки."""
+
+    key: str
+    line: str
+    source: str = SOURCE_POOL
+    attempts: int = 0
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "QueueItem":
+        return cls(
+            key=row["key"], line=row["line"],
+            source=row["source"], attempts=row["attempts"],
+        )
+
+
+@dataclass
+class QueueStats:
+    pending: int = 0
+    in_progress: int = 0
+    done: int = 0
+    failed: int = 0
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def total(self) -> int:
+        return self.pending + self.in_progress + self.done + self.failed
+
+    def as_dict(self) -> dict:
+        return {
+            "pending": self.pending,
+            "in_progress": self.in_progress,
+            "done": self.done,
+            "failed": self.failed,
+            "total": self.total,
+            **self.extra,
+        }
+
+
+def read_queue_stats(db_path: str | Path | None = None) -> QueueStats:
+    """Счётчики очереди одним коротким соединением.
+
+    Для синхронных потребителей (HTTP API, CLI), где ради одного SELECT не
+    нужно поднимать пул потоков. Если таблицы очереди ещё нет (база ещё не
+    открывалась ядром) — возвращаются нули, а не ошибка.
+    """
+    path = Path(db_path or SERVERS_DB_FILE)
+    stats = QueueStats()
+    if not path.exists():
+        return stats
+    conn = sqlite3.connect(path, timeout=5.0)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS n FROM check_queue GROUP BY status"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return stats
+    finally:
+        conn.close()
+
+    counters = {
+        QUEUE_PENDING: "pending",
+        QUEUE_IN_PROGRESS: "in_progress",
+        QUEUE_DONE: "done",
+        QUEUE_FAILED: "failed",
+    }
+    for row in rows:
+        field_name = counters.get(row["status"])
+        if field_name:
+            setattr(stats, field_name, row["n"])
+    return stats
+
+
+class Database:
+    """Асинхронная обёртка над центральной базой и очередью проверки."""
+
+    def __init__(
+        self,
+        db_path: str | Path | None = None,
+        *,
+        executor_workers: int = 4,
+        shield_cycles: int | None = None,
+    ) -> None:
+        # Импорт внутри конструктора: server_store тянет config.env, а тот не
+        # должен импортировать pipeline (иначе циклическая зависимость).
+        from script.server_store import ServerStore
+
+        self.path = Path(db_path or SERVERS_DB_FILE)
+        self._store = ServerStore(self.path)
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(1, executor_workers),
+            thread_name_prefix="db",
+        )
+        # Одна запись за раз: SQLite допускает одного писателя, а батчи идут
+        # параллельно. Замок не даёт получать SQLITE_BUSY.
+        self._write_lock = asyncio.Lock()
+        self._purge_below = int(PURGE_STABLE_BELOW)
+        self._shield_cycles = int(SHIELD_CYCLES if shield_cycles is None else shield_cycles)
+        self._ensure_queue_schema()
+
+    # ------------------------------------------------------------------ util
+    def _ensure_queue_schema(self) -> None:
+        with self._store._connect() as conn:  # noqa: SLF001 — свой же класс обёртки
+            conn.executescript(QUEUE_SCHEMA)
+
+    async def _run(self, func, *args, **kwargs):
+        """Выполняет блокирующий вызов в пуле потоков."""
+        loop = asyncio.get_running_loop()
+        if kwargs:
+            from functools import partial
+
+            func = partial(func, **kwargs)
+        return await loop.run_in_executor(self._executor, func, *args)
+
+    async def _write(self, func, *args, **kwargs):
+        """Выполняет ЗАПИСЬ под замком (один писатель на всю базу)."""
+        async with self._write_lock:
+            return await self._run(func, *args, **kwargs)
+
+    async def close(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    # ------------------------------------------------------- регистрация
+    async def upsert_lines(self, lines: Iterable[str]) -> dict[str, int]:
+        """Регистрирует серверы из ссылок. Новый stable = NEW_SERVER_STABLE."""
+        return await self._write(self._store.upsert_lines, list(lines))
+
+    async def blacklist_unparsable(self, lines: Iterable[str]) -> int:
+        """Убирает из ротации строки, которые нечем проверять."""
+        return await self._write(self._store.blacklist_unparsable, list(lines))
+
+    # ------------------------------------------------------- очередь
+    async def enqueue(self, lines: Iterable[str], *, source: str = SOURCE_POOL) -> int:
+        """Ставит серверы в очередь проверки. Повторная постановка обновляет line."""
+        from script.downloader import normalize_proxy_key
+
+        now = _now()
+        payload: list[tuple] = []
+        for raw in lines:
+            clean = str(raw).strip()
+            if not clean:
+                continue
+            key = normalize_proxy_key(clean)
+            if not key:
+                continue
+            payload.append((key, clean, QUEUE_PENDING, source, 0, now, now))
+        if not payload:
+            return 0
+        return await self._write(self._enqueue_sync, payload)
+
+    def _enqueue_sync(self, payload: list[tuple]) -> int:
+        with self._store._connect() as conn:
+            # Уже проверенные в этом же прогоне переводим обратно в pending,
+            # чтобы новый цикл их перепроверил, а не пропустил молча.
+            cur = conn.executemany(
+                """
+                INSERT INTO check_queue
+                    (key, line, status, source, attempts, enqueued_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    line       = excluded.line,
+                    -- Повтор обязан вернуть строку в очередь: пока она висит
+                    -- в in_progress, её никто не возьмёт, батч-то отработал.
+                    status     = CASE WHEN excluded.source = 'retry' THEN 'pending'
+                                      WHEN check_queue.status = 'done' THEN 'pending'
+                                      ELSE check_queue.status END,
+                    source     = excluded.source,
+                    attempts   = CASE WHEN check_queue.status = 'done' THEN 0
+                                      ELSE check_queue.attempts
+                                           + (CASE WHEN excluded.source = 'retry'
+                                                   THEN 1 ELSE 0 END) END,
+                    updated_at = excluded.updated_at,
+                    last_error = NULL
+                """,
+                payload,
+            )
+            return cur.rowcount
+
+    async def refill_from_pool(
+        self, *, limit: int | None = None, min_stable: int | None = None,
+    ) -> int:
+        """Наполняет очередь живым пулом из базы.
+
+        Именно это «собирает по фильтрам из базы список на проверку»: берутся
+        серверы с ``excluded=0`` и ``stable >= min_stable`` (по умолчанию
+        PURGE_STABLE_BELOW), лучшие — высокий stable, малый пинг — первыми.
+        """
+        threshold = int(self._purge_below if min_stable is None else min_stable)
+        pool = await self._run(self._store.check_pool)
+        lines = [row["line"] for row in pool if row["line"] and row["stable"] >= threshold]
+        if limit is not None:
+            lines = lines[:limit]
+        if not lines:
+            return 0
+        return await self.enqueue(lines, source=SOURCE_POOL)
+
+    async def claim_batch(self, size: int) -> list[QueueItem]:
+        """Забирает до ``size`` строк из очереди и помечает их как взятые в работу.
+
+        Одно действие под BEGIN IMMEDIATE: два воркера не получат одну строку.
+        """
+        if size <= 0:
+            return []
+        return await self._write(self._claim_batch_sync, size)
+
+    def _claim_batch_sync(self, size: int) -> list[QueueItem]:
+        now = _now()
+        with self._store._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT key, line, source, attempts FROM check_queue
+                    WHERE status = ?
+                    ORDER BY attempts ASC, enqueued_at ASC, key ASC
+                    LIMIT ?
+                    """,
+                    (QUEUE_PENDING, size),
+                ).fetchall()
+                if not rows:
+                    conn.commit()
+                    return []
+                keys = [(row["key"], now) for row in rows]
+                conn.executemany(
+                    f"UPDATE check_queue SET status = ?, attempts = attempts + 1, "
+                    f"updated_at = ? WHERE key = ?",
+                    [(QUEUE_IN_PROGRESS, updated, key) for key, updated in keys],
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return [QueueItem.from_row(row) for row in rows]
+
+    async def complete_batch(self, items: Sequence[QueueItem], *, error: str | None = None,
+                         skip_keys: Sequence[str] = ()) -> None:
+        """Снимает батч с работы: done — или failed, если был сбой.
+
+        skip_keys — строки, которые уже вернули в очередь на повтор. Их нельзя
+        закрывать как сделанные: иначе повтор тут же затирается, очередь
+        выглядит пустой, и серверы молча теряются.
+        """
+        skip = set(skip_keys)
+        now = _now()
+        status = QUEUE_FAILED if error else QUEUE_DONE
+        payload = [
+            (status, now, error or "", item.key)
+            for item in items
+            if item.key not in skip
+        ]
+        if not payload:
+            return
+        await self._write(self._complete_batch_sync, payload)
+
+    def _complete_batch_sync(self, payload: list[tuple]) -> None:
+        with self._store._connect() as conn:
+            conn.executemany(
+                "UPDATE check_queue SET status = ?, updated_at = ?, last_error = ? "
+                "WHERE key = ?",
+                payload,
+            )
+
+    async def requeue_stale(self, *, statuses: Sequence[str] = (QUEUE_IN_PROGRESS, QUEUE_FAILED)) -> int:
+        """Возвращает в pending всё, что осталось в работе после падения.
+
+        Нужен при старте: процесс мог быть убит посреди батча, и без этого
+        строки навсегда залипли бы в in_progress.
+        """
+        marks = ",".join("?" for _ in statuses)
+        return await self._write(
+            self._requeue_stale_sync, list(statuses), _now(), f"status IN ({marks})",
+        )
+
+    def _requeue_stale_sync(self, statuses: list[str], now: str, clause: str) -> int:
+        with self._store._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE check_queue SET status = ?, updated_at = ? WHERE {clause}",
+                [QUEUE_PENDING, now, *statuses],
+            )
+            return cur.rowcount
+
+    async def queue_stats(self) -> QueueStats:
+        rows = await self._run(self._queue_stats_sync)
+        stats = QueueStats()
+        for row in rows:
+            if row["status"] == QUEUE_PENDING:
+                stats.pending = row["n"]
+            elif row["status"] == QUEUE_IN_PROGRESS:
+                stats.in_progress = row["n"]
+            elif row["status"] == QUEUE_DONE:
+                stats.done = row["n"]
+            elif row["status"] == QUEUE_FAILED:
+                stats.failed = row["n"]
+        return stats
+
+    def _queue_stats_sync(self) -> list[sqlite3.Row]:
+        with self._store._connect() as conn:
+            return conn.execute(
+                "SELECT status, COUNT(*) AS n FROM check_queue GROUP BY status"
+            ).fetchall()
+
+    async def clear_queue(self, *, statuses: Sequence[str] = (QUEUE_DONE,)) -> int:
+        """Очищает очередь (по умолчанию — убранные проверенные)."""
+        marks = ",".join("?" for _ in statuses)
+        return await self._write(
+            self._clear_queue_sync, list(statuses), f"status IN ({marks})",
+        )
+
+    def _clear_queue_sync(self, statuses: list[str], clause: str) -> int:
+        with self._store._connect() as conn:
+            cur = conn.execute(f"DELETE FROM check_queue WHERE {clause}", statuses)
+            return cur.rowcount
+
+    # --------------------------------------------------------- результаты
+    async def record_enrichment(self, rows: Sequence[dict]) -> int:
+        """Дописывает страну и профиль, НЕ трогая stable и available.
+
+        Страна и reachability считаются отдельным проходом по уже живым
+        серверам. Отправлять их в record_results нельзя: там пересчитывается
+        stable, и сервер получил бы второе изменение за тот же цикл.
+        """
+        if not rows:
+            return 0
+        return await self._run(self._store.record_enrichment, list(rows))
+
+    async def record_results(self, rows: Sequence[dict]) -> None:
+        """Перезаписывает базу по результатам проверки батча.
+
+        Переход stable (успех/провал, «щит») считает ServerStore — это
+        единственное место, где живёт такая логика.
+        """
+        if not rows:
+            return
+        await self._write(self._store.record_results, list(rows))
+
+    # ------------------------------------------------------------ запросы
+    # Имена load_* повторяют ServerStore, чтобы чекерам не приходилось знать,
+    # как устроена обёртка.
+    async def load_stable_map(self) -> dict[str, int]:
+        """key -> stable для всех серверов (нужно для переходов в чек-стадии)."""
+        return await self._run(self._store.load_stable_map)
+
+    async def load_country_map(self) -> dict[str, str]:
+        """key -> уже известная страна: не проверяем заново то, что определено."""
+        return await self._run(self._store.load_country_map)
+
+    async def load_capabilities_map(self) -> dict[str, str]:
+        """key -> профиль достижимости."""
+        return await self._run(self._store.load_capabilities_map)
+
+    # Короткие псевдонимы — читаемее в коде этапов.
+    stable_map = load_stable_map
+    country_map = load_country_map
+
+    async def stats(self) -> dict:
+        return await self._run(self._store.stats)
+
+    async def purge_dead(self, below: int | None = None) -> int:
+        return await self._write(self._store.purge_dead, below)
+
+    async def export_whitelist(self, path: str | Path, *, global_tag: str = "Global") -> int:
+        return await self._run(
+            self._store.export_whitelist_to_file, Path(path), global_tag=global_tag,
+        )
+
+    async def export_blacklist(self, path: str | Path, *, below: int | None = None) -> int:
+        return await self._run(
+            self._store.export_to_file,
+            Path(path),
+            max_stable=self._purge_below if below is None else below,
+        )
+
+    async def write_pool_file(self, path: str | Path) -> int:
+        """Пишет merge.txt — файл пула проверки (для внешних потребителей)."""
+        from script.downloader import write_merge_from_pool
+
+        return await self._run(write_merge_from_pool, self._store, Path(path))
+
+    @property
+    def store(self):
+        """Доступ к низкоуровневому ServerStore (CLI, API, миграции)."""
+        return self._store
