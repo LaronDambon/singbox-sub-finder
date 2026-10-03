@@ -3,7 +3,7 @@
 Один объект создаётся в ``main.py` и проходит через все этапы: чекеры получают
 из него базу, настройки и логгер, а движок — список чекеров и счётчики.
 
-Все настройки приходят из окружения (config/env.py), но любое значение можно
+Все настройки приходят из окружения (config/settings.py), но любое значение можно
 переопределить прямо в коде:
 
     PipelineContext(settings={"checkers": "url_probe", "batch_size": 50})
@@ -44,34 +44,39 @@ class Settings(dict):
 
 
 def default_settings() -> Settings:
-    """Настройки pipeline из окружения (значения по умолчанию — в config/env)."""
-    from config import env
+    """Настройки pipeline, собранные из объекта настроек (config/settings).
+
+    Источник значений — объект Settings, который main.py создаёт один раз.
+    Раньше здесь был from config import env и 25 обращений к константам,
+    то есть значения читались на уровне модуля и не поддавались перекрытию.
+    """
+    from config.settings import setting
 
     return Settings(
         # файлы
-        urls_file=env.URLS_FILE,
-        merge_file=env.MERGE_FILE,
-        whitelist_file=env.WHITELIST_FILE,
-        blacklist_file=env.BLACKLIST_FILE,
+        urls_file=setting("URLS_FILE"),
+        merge_file=setting("MERGE_FILE"),
+        whitelist_file=setting("WHITELIST_FILE"),
+        blacklist_file=setting("BLACKLIST_FILE"),
         # проверка
-        checkers=env.PIPELINE_CHECKERS,
-        batch_size=env.PIPELINE_BATCH_SIZE,
-        check_workers=env.PIPELINE_CHECK_WORKERS,
-        check_timeout=env.PIPELINE_CHECK_TIMEOUT,
-        enrich_timeout=env.PIPELINE_ENRICH_TIMEOUT,
-        batch_startup=env.PIPELINE_BATCH_STARTUP,
-        max_attempts=env.PIPELINE_MAX_ATTEMPTS,
-        max_retries=env.PIPELINE_MAX_RETRIES,
-        queue_persist=env.PIPELINE_QUEUE_PERSIST,
+        checkers=setting("PIPELINE_CHECKERS"),
+        batch_size=setting("PIPELINE_BATCH_SIZE"),
+        check_workers=setting("PIPELINE_CHECK_WORKERS"),
+        check_timeout=setting("PIPELINE_CHECK_TIMEOUT"),
+        enrich_timeout=setting("PIPELINE_ENRICH_TIMEOUT"),
+        batch_startup=setting("PIPELINE_BATCH_STARTUP"),
+        max_attempts=setting("PIPELINE_MAX_ATTEMPTS"),
+        max_retries=setting("PIPELINE_MAX_RETRIES"),
+        queue_persist=setting("PIPELINE_QUEUE_PERSIST"),
         # поиск
-        discovery=env.PIPELINE_DISCOVERY,
-        discovery_concurrency=env.PIPELINE_DISCOVERY_CONCURRENCY,
+        discovery=setting("PIPELINE_DISCOVERY"),
+        discovery_concurrency=setting("PIPELINE_DISCOVERY_CONCURRENCY"),
         # экспорт
-        export_lists=env.PIPELINE_EXPORT_LISTS,
-        write_merge=env.PIPELINE_WRITE_MERGE,
+        export_lists=setting("PIPELINE_EXPORT_LISTS"),
+        write_merge=setting("PIPELINE_WRITE_MERGE"),
         # sing-box
-        singbox_path=Path(env.SING_BOX_PATH),
-        global_tag=env.REACHABILITY_GLOBAL_TAG,
+        singbox_path=Path(setting("SING_BOX_PATH")),
+        global_tag=setting("REACHABILITY_GLOBAL_TAG"),
     )
 
 

@@ -12,9 +12,7 @@
 
 from __future__ import annotations
 
-import os
-
-from config.env import SERVICE_CHECKER
+from config.settings import setting
 from pipeline.logging_setup import get_logger
 from pipeline.services.base import Service
 
@@ -38,7 +36,7 @@ class CheckerService(Service):
         from pipeline.services.sinks import QueuedSink
         from pipeline.stages.check import CheckStage
 
-        self.enabled = SERVICE_CHECKER and bool(self._checkers)
+        self.enabled = setting("SERVICE_CHECKER") and bool(self._checkers)
         self._stage = CheckStage(self.ctx, self._checkers, sink=QueuedSink(self.db))
         if self.enabled:
             LOGGER.info(

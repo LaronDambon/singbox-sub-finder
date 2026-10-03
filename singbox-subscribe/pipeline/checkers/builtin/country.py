@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from config.env import COUNTRY_CHECK_CONCURRENCY, COUNTRY_CHECK_ENABLED
+from config.settings import setting
 from pipeline.checkers.base import CheckContext, CheckOutcome, CheckResult, Checker
 from pipeline.checkers.builtin._runner import run_exclusive
 from pipeline.logging_setup import get_logger
@@ -29,8 +29,10 @@ class CountryChecker(Checker):
     decides_availability = False
 
     def __init__(self) -> None:
-        self.enabled = bool(COUNTRY_CHECK_ENABLED)
-        self.concurrency = int(COUNTRY_CHECK_CONCURRENCY)
+        # Значения по умолчанию: setup() ниже перечитывает их из контекста
+        # по настоящим именам, но wants()/check() могут быть вызваны и без него.
+        self.enabled = bool(setting("COUNTRY_CHECK_ENABLED"))
+        self.concurrency = int(setting("COUNTRY_CHECK_CONCURRENCY"))
         self._known: dict[str, str] = {}
 
     async def setup(self, ctx) -> None:

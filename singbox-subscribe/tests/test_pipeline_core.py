@@ -364,9 +364,14 @@ async def test_real_checkers_setup() -> None:
     db = Database(TMP / "setup.db")
     await db.upsert_lines(LINES)
     ctx = PipelineContext(settings=default_settings(), db=db)
-    checkers = build_checkers("url_probe,country,reachability")
+    # ВСЕ четыре, а не три. Раньше speed был исключён из списка, и
+    # тесты были зелёными при модуле чекера скорости, который не импортируется
+    # вообще: ошибка в нём обнаружилась лишь на живом запуске. Список задан
+    # явно и неполон ровно настолько, чтобы это повторить.
+    checkers = build_checkers("url_probe,country,reachability,speed")
     names = [c.name for c in checkers]
-    check("реестр отдал все три чекера", names == ["url_probe", "country", "reachability"], names)
+    check("реестр отдал все четыре чекера",
+          names == ["url_probe", "country", "reachability", "speed"], names)
 
     failures = []
     for checker in checkers:
@@ -376,6 +381,37 @@ async def test_real_checkers_setup() -> None:
             failures.append(checker.name + ": " + type(exc).__name__ + ": " + str(exc))
     check("setup всех штатных чекеров проходит", not failures, failures)
     await db.close()
+
+
+async def test_every_module_imports() -> None:
+    """Каждый модуль проекта обязан импортироваться.
+
+    Тесты проверяют поведение выбранных модулей и молчат, если какой-то
+    модуль не импортируется вовсе. Именно так уехала ошибка в чекере
+    скорости: 265 проверок проходили, а прямой импорт модуля падал. Модуль
+    настроек держит список настроек, и опечатка в имени даёт ошибку только
+    в том, кто это имя читает, — то есть позже всего.
+    """
+    print("\n--- импорт всех модулей ---")
+    import importlib
+
+    root = Path(__file__).resolve().parent.parent
+    broken: list[str] = []
+    checked = 0
+    for path in sorted(root.rglob("*.py")):
+        if ".venv" in str(path) or path.name == "__init__.py":
+            continue
+        rel = path.relative_to(root)
+        if rel.parts[0] == "tests":
+            continue
+        mod = ".".join(rel.with_suffix("").parts)
+        checked += 1
+        try:
+            importlib.import_module(mod)
+        except Exception as exc:  # noqa: BLE001
+            broken.append(mod + ": " + type(exc).__name__ + ": " + str(exc)[:90])
+    check("модулей проверено", checked > 50, checked)
+    check("все модули импортируются", not broken, broken)
 
 
 async def test_discovery_local() -> None:
@@ -551,25 +587,15 @@ async def test_settings_loading() -> None:
     check("init_settings отдаёт объект", isinstance(got, Settings))
     check("get_settings отдаёт тот же объект", get_settings() is got)
 
-    # Старый доступ через config.env работает, но помечен как устаревший.
-    import warnings
-
-    import config.env as env_shim
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        value = env_shim.PIPELINE_CHECK_WORKERS
-    check("config.env отдаёт то же значение", value == got.PIPELINE_CHECK_WORKERS,
-          (value, got.PIPELINE_CHECK_WORKERS))
-    check("config.env предупреждает об устаревании",
-          any(issubclass(w.category, DeprecationWarning) for w in caught),
-          [w.category.__name__ for w in caught])
-
-    try:
-        env_shim.НЕТ_ТАКОЙ_НАСТРОЙКИ
-        check("чужая настройка даёт понятную ошибку", False, "исключения не было")
-    except AttributeError as exc:
-        check("чужая настройка даёт понятную ошибку",
-              "больше не содержит" in str(exc), str(exc))
+    # Повторный init_settings() без перекрытий обязан вернуть тот же объект,
+    # а не пересобрать его: иначе второй вызов тихо отменил бы перекрытия
+    # первого (например аргументы командной строки).
+    check("повторный init_settings() не пересобирает",
+          init_settings() is got)
+    check("перекрытие переживает повторный вызов",
+          init_settings(PIPELINE_BATCH_SIZE=77).PIPELINE_BATCH_SIZE == 77,
+          "перекрытие потерялось: повторный вызов его обнулил")
+    init_settings(PIPELINE_BATCH_SIZE=s.URLTEST_BATCH_SIZE)
 
 
 async def test_best_tags() -> None:
@@ -1579,6 +1605,7 @@ async def _amain() -> None:
     await test_enrichment_keeps_stable()
     await test_singbox_lock()
     await test_database()
+    await test_every_module_imports()
     await test_real_checkers_setup()
     await test_discovery_local()
     await test_queued_sink_defers_write()

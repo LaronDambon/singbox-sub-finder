@@ -44,12 +44,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from config.env import (
-    NEW_SERVER_STABLE,
-    PURGE_STABLE_BELOW,
-    SERVERS_DB_FILE,
-    SHIELD_CYCLES,
-)
+from config.settings import setting
 from utils.tool import set_country_in_name
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -153,8 +148,8 @@ def compute_next_state(
     stable = NEW_SERVER_STABLE (5) — у него есть несколько попыток доказать
     жизнеспособность, после чего он умирает.
     """
-    shield = int(SHIELD_CYCLES if shield_cycles is None else shield_cycles)
-    alive_min = int(PURGE_STABLE_BELOW if alive_min is None else alive_min)
+    shield = int(setting("SHIELD_CYCLES") if shield_cycles is None else shield_cycles)
+    alive_min = int(setting("PURGE_STABLE_BELOW") if alive_min is None else alive_min)
     prev = int(prev_stable)
     if ok:
         return max(prev, shield)
@@ -238,7 +233,7 @@ class ServerStore:
         дойдя до порога - 1 (по умолчанию -1), сервер выпадает из цикла
         проверки и больше не импортируется из базы.
         """
-        return int(PURGE_STABLE_BELOW) - 1
+        return int(setting("PURGE_STABLE_BELOW")) - 1
 
     @staticmethod
     def _ensure_ever_pinged_column(conn: sqlite3.Connection) -> None:
@@ -420,7 +415,7 @@ class ServerStore:
                         "INSERT INTO servers"
                         " (key, line, stable, ever_pinged, first_seen, last_seen)"
                         " VALUES (?, ?, ?, 0, ?, ?)",
-                        (key, clean, int(NEW_SERVER_STABLE), now, now),
+                        (key, clean, int(setting("NEW_SERVER_STABLE")), now, now),
                     )
         return {"added": added, "updated": updated, "skipped": skipped}
 
@@ -595,7 +590,7 @@ class ServerStore:
                 WHERE excluded = 0 AND stable >= ?
                 ORDER BY stable DESC, ping_ms IS NULL, ping_ms ASC, key ASC
                 """,
-                (int(PURGE_STABLE_BELOW),),
+                (int(setting("PURGE_STABLE_BELOW")),),
             ).fetchall()
 
     def export_lines(
@@ -810,7 +805,7 @@ class ServerStore:
         hard=True физически удаляет.
         """
         if below is None:
-            below = int(PURGE_STABLE_BELOW)
+            below = int(setting("PURGE_STABLE_BELOW"))
         with self._connect() as conn:
             if hard:
                 cur = conn.execute("DELETE FROM servers WHERE stable < ?", (below,))
@@ -835,12 +830,12 @@ class ServerStore:
                     stable = CASE WHEN ever_pinged = 1 THEN ? ELSE ? END
                 WHERE excluded = 1
                 """,
-                (int(SHIELD_CYCLES), int(NEW_SERVER_STABLE)),
+                (int(setting("SHIELD_CYCLES")), int(setting("NEW_SERVER_STABLE"))),
             )
             return cur.rowcount
 
     def stats(self) -> dict:
-        alive_min = int(PURGE_STABLE_BELOW)
+        alive_min = int(setting("PURGE_STABLE_BELOW"))
         with self._connect() as conn:
             total, active, excluded = conn.execute(
                 "SELECT COUNT(*), SUM(excluded = 0), SUM(excluded = 1) FROM servers"
@@ -902,10 +897,10 @@ class ServerStore:
             revived = conn.execute(
                 "UPDATE servers SET excluded = 0 "
                 "WHERE excluded = 1 AND stable >= ?",
-                (int(PURGE_STABLE_BELOW),),
+                (int(setting("PURGE_STABLE_BELOW")),),
             ).rowcount
         marker.write_text(
-            json.dumps({"revived": revived, "purge_below": int(PURGE_STABLE_BELOW)}, ensure_ascii=False),
+            json.dumps({"revived": revived, "purge_below": int(setting("PURGE_STABLE_BELOW"))}, ensure_ascii=False),
             encoding="utf-8",
         )
 
@@ -928,7 +923,7 @@ class ServerStore:
             shielded = conn.execute(
                 "UPDATE servers SET stable = MAX(stable, ?) "
                 "WHERE ever_pinged = 1 AND stable >= ?",
-                (int(SHIELD_CYCLES), int(PURGE_STABLE_BELOW)),
+                (int(setting("SHIELD_CYCLES")), int(setting("PURGE_STABLE_BELOW"))),
             ).rowcount
         marker.write_text(
             json.dumps({"ever_pinged": marked, "shielded": shielded}, ensure_ascii=False),
@@ -963,7 +958,7 @@ class ServerStore:
         verb = "INSERT OR IGNORE" if ignore_existing else "INSERT OR REPLACE"
         # Whitelist — серверы, пинговавшиеся в прошлой жизни: полный щит и
         # ever_pinged=1. Blacklist — умершие (ниже нижнего порога).
-        stable = self._dead_stable() if excluded else int(SHIELD_CYCLES)
+        stable = self._dead_stable() if excluded else int(setting("SHIELD_CYCLES"))
         ever_pinged = 0 if excluded else 1
         available = 0 if excluded else 1
         with self._connect() as conn:
@@ -988,7 +983,7 @@ class ServerStore:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Central server store CLI")
-    parser.add_argument("--db", default=str(SERVERS_DB_FILE))
+    parser.add_argument("--db", default=setting("SERVERS_DB_FILE"))
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("stats")
@@ -998,7 +993,7 @@ def main() -> int:
     p_export.add_argument("--limit", type=int, default=None)
     p_export.add_argument("--out", default=None)
     p_purge = sub.add_parser("purge")
-    p_purge.add_argument("--below", type=int, default=int(PURGE_STABLE_BELOW))
+    p_purge.add_argument("--below", type=int, default=int(setting("PURGE_STABLE_BELOW")))
     p_purge.add_argument("--hard", action="store_true")
     sub.add_parser("reset-excluded")
 

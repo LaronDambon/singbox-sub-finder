@@ -271,7 +271,7 @@ publisher  <--(раз в N минут)--  servers  --> whitelist/merge/депл�
 | `publisher` | обновляет whitelist/blacklist/merge свежими рабочими серверами; деплой по расписанию выключен | `SERVICE_PUBLISHER_INTERVAL` = 1800 с (полчаса) |
 
 Значения по умолчанию — из
-[singbox-subscribe/config/env.py](singbox-subscribe/config/env.py). У `checker`
+[singbox-subscribe/config/settings.py](singbox-subscribe/config/settings.py). У `checker`
 интервала нет вовсе (`SERVICE_CHECKER_INTERVAL` в env.py не существует): служба
 крутится без остановки и лишь ждёт, когда очередь опустеет; настраивают её
 общие `PIPELINE_BATCH_SIZE`, `PIPELINE_CHECK_WORKERS` и `PIPELINE_CHECKERS`.
@@ -351,7 +351,7 @@ LOGGER.info("Сервер %s жив, пинг %s мс", name, ping)
 свой уровень** (`info.log` — только INFO, и т.д.). Файлы ниже `LOG_LEVEL` не
 создаются вовсе.
 
-Настройки — в [singbox-subscribe/config/env.py](singbox-subscribe/config/env.py)
+Настройки — в [singbox-subscribe/config/settings.py](singbox-subscribe/config/settings.py)
 (раздел «ЛОГИРОВАНИЕ»), примеры в [`.env.example`](.env.example):
 `LOG_LEVEL`, `LOG_CONSOLE_LEVEL` (уровень консоли отдельно от файлов),
 `LOG_MAX_BYTES`/`LOG_BACKUP_COUNT` (ротация по размеру), `LOG_RETENTION_DAYS`
@@ -468,8 +468,8 @@ python singbox-subscribe/main.py --json                         # отчёт в 
 нормальными и молча не выпускает наружу трафик.
 ## Конфигурация
 - Все настройки — переменные окружения: скопируйте `.env.example` в `.env` и заполните
-  свои значения. Читаются модулем [singbox-subscribe/config/env.py](singbox-subscribe/config/env.py#L1);
-  приоритет: системное окружение (setx/export) > `.env` > значение по умолчанию.
+  свои значения. Читаются модулем [singbox-subscribe/config/settings.py](singbox-subscribe/config/settings.py) (в коде — setting("ИМЯ"));
+  приоритет: перекрытия из кода > системное окружение (setx/export) > `.env` > значение по умолчанию.
 - Файлы источников URL: `singbox-subscribe/config/subs/*.json`.
 - Шаблоны конфигураций: `singbox-subscribe/config/templates/`.
 

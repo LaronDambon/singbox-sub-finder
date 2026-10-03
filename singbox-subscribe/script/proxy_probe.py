@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-from config.env import SING_BOX_PATH
+from config.settings import setting
 from script.logger_utils import get_project_logger
 
 LOGGER = get_project_logger("proxy_probe")
@@ -144,7 +144,7 @@ def start_singbox(config: dict, config_path: Path):
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
         return subprocess.Popen(
-            [str(SING_BOX_PATH), "run", "-c", str(config_path)], **kwargs
+            [str(setting("SING_BOX_PATH")), "run", "-c", str(config_path)], **kwargs
         )
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("Не удалось запустить sing-box: %s", exc)

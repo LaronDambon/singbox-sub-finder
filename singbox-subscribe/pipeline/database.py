@@ -33,11 +33,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from config.env import (
-    PURGE_STABLE_BELOW,
-    SERVERS_DB_FILE,
-    SHIELD_CYCLES,
-)
+from config.settings import setting
 from pipeline.logging_setup import get_logger
 
 LOGGER = get_logger("database")
@@ -181,7 +177,7 @@ def read_queue_stats(db_path: str | Path | None = None) -> QueueStats:
     нужно поднимать пул потоков. Если таблицы очереди ещё нет (база ещё не
     открывалась ядром) — возвращаются нули, а не ошибка.
     """
-    path = Path(db_path or SERVERS_DB_FILE)
+    path = Path(db_path or setting("SERVERS_DB_FILE"))
     stats = QueueStats()
     if not path.exists():
         return stats
@@ -219,11 +215,11 @@ class Database:
         executor_workers: int = 4,
         shield_cycles: int | None = None,
     ) -> None:
-        # Импорт внутри конструктора: server_store тянет config.env, а тот не
+        # Импорт внутри конструктора: server_store тянет настройки, а он не
         # должен импортировать pipeline (иначе циклическая зависимость).
         from script.server_store import ServerStore
 
-        self.path = Path(db_path or SERVERS_DB_FILE)
+        self.path = Path(db_path or setting("SERVERS_DB_FILE"))
         self._store = ServerStore(self.path)
         self._executor = ThreadPoolExecutor(
             max_workers=max(1, executor_workers),
@@ -232,8 +228,10 @@ class Database:
         # Одна запись за раз: SQLite допускает одного писателя, а батчи идут
         # параллельно. Замок не даёт получать SQLITE_BUSY.
         self._write_lock = asyncio.Lock()
-        self._purge_below = int(PURGE_STABLE_BELOW)
-        self._shield_cycles = int(SHIELD_CYCLES if shield_cycles is None else shield_cycles)
+        self._purge_below = int(setting("PURGE_STABLE_BELOW"))
+        self._shield_cycles = int(
+            setting("SHIELD_CYCLES") if shield_cycles is None else shield_cycles,
+        )
         self._ensure_queue_schema()
 
     # ------------------------------------------------------------------ util

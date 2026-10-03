@@ -13,7 +13,7 @@ from parsers.clash2base64 import clash2v2ray
 
 ROOT = Path(__file__).resolve().parents[1]
 
-from config.env import CONFIG_TEMPLATE_DIR
+from config.settings import setting
 from script.logger_utils import get_project_logger
 
 warnings.filterwarnings("ignore", category=requests.packages.urllib3.exceptions.DependencyWarning)
@@ -42,7 +42,7 @@ def init_parsers():
 
 
 def get_template():
-    template_dir = CONFIG_TEMPLATE_DIR
+    template_dir = setting("CONFIG_TEMPLATE_DIR")
     template_files = os.listdir(template_dir)
     template_list = [os.path.splitext(file)[0] for file in template_files if
                      file.endswith('.json')]

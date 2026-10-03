@@ -19,20 +19,7 @@
 
 from __future__ import annotations
 
-from config.env import (
-    SPEED_CONCURRENCY,
-    SPEED_ENABLED,
-    SPEED_GOOD_MBPS,
-    SPEED_MIN_MBPS,
-    SPEED_MIN_SOURCES,
-    SPEED_PROBE_BYTES,
-    SPEED_READ_SECONDS,
-    SPEED_SITE_URL,
-    SPEED_SOURCES,
-    SPEED_TAG_PREFIX,
-    SPEED_TIER_TAGS,
-    SPEED_UPLOAD_BYTES,
-)
+from config.settings import setting
 from pipeline.checkers.base import CheckContext, CheckOutcome, CheckResult, Checker
 from pipeline.checkers.builtin._runner import run_exclusive
 from pipeline.logging_setup import get_logger
@@ -48,26 +35,31 @@ class SpeedChecker(Checker):
     decides_availability = False
 
     def __init__(self) -> None:
-        self.enabled = bool(SPEED_ENABLED)
+        self.enabled = bool(setting("SPEED_ENABLED"))
         self.cfg = None
 
     def _make_cfg(self, ctx):
         from script.speed_check import SpeedConfig
 
         s = ctx.settings
+        # Настройки прогона приходят короткими ключами (их задаёт main.py
+        # аргументами командной строки), а дефолты — по настоящим именам
+        # из .env. Читаем их здесь, в точке использования.
+        default_site_url = setting("SPEED_SITE_URL")
+        default_sources = setting("SPEED_SOURCES")
         # Поля SpeedConfig обязаны совпадать с её сигнатурой: у замера
         # скорости их набор менялся вместе с переходом на несколько
         # источников, и чекер обязан идти следом.
         return SpeedConfig(
-            site_url=str(s.get("site_url", SPEED_SITE_URL) or SPEED_SITE_URL),
-            sources=str(s.get("sources", SPEED_SOURCES) or ""),
-            probe_bytes=int(s.get("probe_bytes", SPEED_PROBE_BYTES)),
-            upload_bytes=int(s.get("upload_bytes", SPEED_UPLOAD_BYTES)),
-            min_sources=int(s.get("min_sources", SPEED_MIN_SOURCES)),
-            read_seconds=float(s.get("read_seconds", SPEED_READ_SECONDS)),
-            min_mbps=float(s.get("min_mbps", SPEED_MIN_MBPS)),
-            good_mbps=float(s.get("good_mbps", SPEED_GOOD_MBPS)),
-            concurrency=int(s.get("concurrency", SPEED_CONCURRENCY)),
+            site_url=str(s.get("site_url", default_site_url) or default_site_url),
+            sources=str(s.get("sources", default_sources) or ""),
+            probe_bytes=int(s.get("probe_bytes", setting("SPEED_PROBE_BYTES"))),
+            upload_bytes=int(s.get("upload_bytes", setting("SPEED_UPLOAD_BYTES"))),
+            min_sources=int(s.get("min_sources", setting("SPEED_MIN_SOURCES"))),
+            read_seconds=float(s.get("read_seconds", setting("SPEED_READ_SECONDS"))),
+            min_mbps=float(s.get("min_mbps", setting("SPEED_MIN_MBPS"))),
+            good_mbps=float(s.get("good_mbps", setting("SPEED_GOOD_MBPS"))),
+            concurrency=int(s.get("concurrency", setting("SPEED_CONCURRENCY"))),
             batch_size=int(s.get("batch_size", 40)),
         )
 
@@ -104,7 +96,8 @@ class SpeedChecker(Checker):
         # Под замком запуска sing-box: транспорт пишет общий временный конфиг.
         results = await run_exclusive(batch_speed_check, sorted(lines), cfg=cfg)
 
-        tiers = dict(SPEED_TIER_TAGS)
+        tiers = dict(setting("SPEED_TIER_TAGS") or {})
+        tag_prefix = setting("SPEED_TAG_PREFIX")
         outcomes: dict[str, CheckOutcome] = {}
         counts: dict[str, int] = {}
         for line in lines:
@@ -124,7 +117,7 @@ class SpeedChecker(Checker):
                 ok=None,
                 capabilities=tiers.get(tier, ""),
                 # Категория одна: новая метка заменяет старую, а не дописывается.
-                capabilities_replace=(SPEED_TAG_PREFIX,),
+                capabilities_replace=(tag_prefix,),
                 detail=payload.get("error") or "; ".join(detail_parts) or None,
                 data={
                     "speed_mbps": mbps,

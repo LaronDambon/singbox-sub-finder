@@ -11,12 +11,7 @@
 
 from __future__ import annotations
 
-from config.env import (
-    REACHABILITY_ENABLED,
-    REACHABILITY_GLOBAL_TAG,
-    REACHABILITY_MIN_STABLE,
-    REACHABILITY_MAX_PING_MS,
-)
+from config.settings import setting
 from pipeline.checkers.base import CheckContext, CheckOutcome, CheckResult, Checker
 from pipeline.checkers.builtin._runner import run_exclusive
 from pipeline.logging_setup import get_logger
@@ -32,11 +27,11 @@ class ReachabilityChecker(Checker):
     decides_availability = False
 
     def __init__(self) -> None:
-        self.enabled = bool(REACHABILITY_ENABLED)
-        self.min_stable = int(REACHABILITY_MIN_STABLE)
-        self.global_tag = REACHABILITY_GLOBAL_TAG
+        self.enabled = bool(setting("REACHABILITY_ENABLED"))
+        self.min_stable = int(setting("REACHABILITY_MIN_STABLE"))
+        self.global_tag = setting("REACHABILITY_GLOBAL_TAG")
         # Порог задержки до цели (TTFB, мс). None = у каждой цели свой
-        # max_ping_ms, а где его нет — значение из config/env.py.
+        # max_ping_ms, а где его нет — значение из настроек.
         self.max_ping_ms: int | None = None
         self._targets: list[dict] = []
         self._alive: set[str] = set()
@@ -48,14 +43,17 @@ class ReachabilityChecker(Checker):
         )
         self.global_tag = ctx.value("REACHABILITY_GLOBAL_TAG")
         raw_ping = ctx.value("REACHABILITY_MAX_PING_MS")
+        # Нужно дважды ниже — в запасном значении и в тексте сообщения, —
+        # поэтому читаем один раз здесь, локально.
+        default_ping = setting("REACHABILITY_MAX_PING_MS")
         if raw_ping is None:
             self.max_ping_ms = None
         else:
             try:
                 self.max_ping_ms = max(1, int(raw_ping))
             except (TypeError, ValueError):
-                LOGGER.warning("Некорректный порог пинга %r, беру %s", raw_ping, REACHABILITY_MAX_PING_MS)
-                self.max_ping_ms = int(REACHABILITY_MAX_PING_MS) if REACHABILITY_MAX_PING_MS else None
+                LOGGER.warning("Некорректный порог пинга %r, беру %s", raw_ping, default_ping)
+                self.max_ping_ms = int(default_ping) if default_ping else None
         if not self.enabled:
             return
         from script.reachability_check import load_targets
@@ -70,7 +68,7 @@ class ReachabilityChecker(Checker):
                 "Reachability: %d целей, профиль для stable >= %d, порог TTFB: %s",
                 len(self._targets), self.min_stable,
                 f"{self.max_ping_ms} мс (всем целям)" if self.max_ping_ms
-                else f"{REACHABILITY_MAX_PING_MS} мс по умолчанию, у целей свои",
+                else f"{default_ping} мс по умолчанию, у целей свои",
             )
 
     async def check(self, ctx: CheckContext) -> CheckResult:

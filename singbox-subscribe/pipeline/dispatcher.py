@@ -359,30 +359,20 @@ def make_dispatcher(
     sink=None,
 ) -> BatchDispatcher:
     """Собирает диспетчер с настройками по умолчанию из конфигурации."""
-    from config.env import (
-        PIPELINE_BATCH_SIZE,
-        PIPELINE_BATCH_STARTUP,
-        PIPELINE_CHECK_TIMEOUT,
-        PIPELINE_MAX_ATTEMPTS,
-        PIPELINE_MAX_RETRIES,
-        SING_BOX_OUTPUT_DIR,
-        SING_BOX_PATH,
-        URLTEST_TEMPLATE,
-        URLTEST_URL,
-    )
+    from config.settings import setting
 
     return BatchDispatcher(
         db,
-        batch_size=batch_size or PIPELINE_BATCH_SIZE,
+        batch_size=batch_size or setting("PIPELINE_BATCH_SIZE"),
         slots=slots,
-        timeout=timeout or PIPELINE_CHECK_TIMEOUT,
-        startup=startup or PIPELINE_BATCH_STARTUP,
-        max_attempts=max_attempts or PIPELINE_MAX_ATTEMPTS,
-        max_retries=max_retries or PIPELINE_MAX_RETRIES,
-        singbox_path=Path(SING_BOX_PATH),
-        template_path=Path(URLTEST_TEMPLATE),
-        config_dir=Path(SING_BOX_OUTPUT_DIR),
-        urltest=urltest or URLTEST_URL,
+        timeout=timeout or setting("PIPELINE_CHECK_TIMEOUT"),
+        startup=startup or setting("PIPELINE_BATCH_STARTUP"),
+        max_attempts=max_attempts or setting("PIPELINE_MAX_ATTEMPTS"),
+        max_retries=max_retries or setting("PIPELINE_MAX_RETRIES"),
+        singbox_path=Path(setting("SING_BOX_PATH")),
+        template_path=Path(setting("URLTEST_TEMPLATE")),
+        config_dir=Path(setting("SING_BOX_OUTPUT_DIR")),
+        urltest=urltest or setting("URLTEST_URL"),
         sink=sink,
     )
 

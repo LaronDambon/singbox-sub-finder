@@ -15,11 +15,7 @@ from __future__ import annotations
 
 import asyncio
 
-from config.env import (
-    PIPELINE_CHECKERS,
-    PIPELINE_CUSTOM_CHECKERS_DIR,
-    PIPELINE_QUEUE_PERSIST,
-)
+from config.settings import init_settings, setting
 from pipeline.checkers.registry import build as build_checkers
 from pipeline.context import PipelineContext, default_settings
 from pipeline.database import QUEUE_FAILED, QUEUE_IN_PROGRESS, Database
@@ -59,18 +55,21 @@ async def serve(
     duration: float | None = None,
 ) -> None:
     """Поднимает службы и держит их, пока не остановят или не выйдет duration."""
+    # Настройки собираем здесь, явно и до всего остального: дальше их
+    # читают и логирование, и сборка чекеров, и службы.
+    init_settings()
     setup_logging()
     # Настройки берём те же, что и обычный прогон: иначе этапы получат
     # пустые пути (urls_file, whitelist_file) и упадут на первом же проходе.
     resolved = default_settings().merged(settings)
     if checkers:
         resolved["checkers"] = checkers
-    built = build_checkers(resolved.get("checkers") or PIPELINE_CHECKERS,
-                           custom_dir=PIPELINE_CUSTOM_CHECKERS_DIR)
+    built = build_checkers(resolved.get("checkers") or setting("PIPELINE_CHECKERS"),
+                           custom_dir=setting("PIPELINE_CUSTOM_CHECKERS_DIR"))
     db = Database(db_path) if db_path else Database()
     ctx = PipelineContext(settings=resolved, db=db, checkers=built, logger=LOGGER)
 
-    if PIPELINE_QUEUE_PERSIST:
+    if setting("PIPELINE_QUEUE_PERSIST"):
         # Процесс мог быть убит посреди батча — без этого строки залипли бы
         # в in_progress навсегда.
         requeued = await db.requeue_stale(statuses=(QUEUE_IN_PROGRESS, QUEUE_FAILED))

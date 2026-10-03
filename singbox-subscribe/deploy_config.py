@@ -66,7 +66,7 @@ import requests
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-# Локальные секреты/настройки из .env в корне репозитория (как в config/env.py):
+# Локальные секреты/настройки из .env в корне репозитория:
 # GH_DEPLOY_TOKEN, GH_READ_TOKEN, DEPLOY_IP_SOURCE и т.д. override=False —
 # переменные системного окружения имеют приоритет.
 try:
@@ -132,11 +132,11 @@ def _apply_server_filter(uris: list[str], template_dict) -> list[str]:
     flt = build_filter(spec)
     if flt.is_empty:
         return uris
-    from config.env import SERVERS_DB_FILE
+    from config.settings import setting
     from script.downloader import normalize_proxy_key
     from script.server_store import ServerStore
 
-    store = ServerStore(SERVERS_DB_FILE)
+    store = ServerStore(setting("SERVERS_DB_FILE"))
     records = store.server_records_by_key(uris)
     kept = []
     for uri in uris:
@@ -168,15 +168,14 @@ def _load_source_uris(args) -> list[str]:
 
     # Источник по умолчанию — whitelist центральной базы: серверы,
     # пинговавшиеся в последней проверке (available=1).
-    from config.env import SERVERS_DB_FILE
+    from config.settings import setting
     from script.server_store import ServerStore
 
-    store = ServerStore(SERVERS_DB_FILE)
+    store = ServerStore(setting("SERVERS_DB_FILE"))
     # export_whitelist_lines добавляет capability-тэги ([name] / [Global]) к строкам
     # на этапе экспорта для генерации итогового конфига.
-    from config.env import BEST_TOP, REACHABILITY_GLOBAL_TAG
     lines = store.export_whitelist_lines(
-        global_tag=REACHABILITY_GLOBAL_TAG, best_top=BEST_TOP,
+        global_tag=setting("REACHABILITY_GLOBAL_TAG"), best_top=setting("BEST_TOP"),
     )
     if not lines:
         raise RuntimeError(
@@ -546,7 +545,10 @@ def deploy(
       token      — ДЕПЛОЙ-ключ (write), только для пуша, наружу не выдаётся;
       read_token — READ-ключ (read-only), вшивается в ссылку на скачивание.
 
-    Параметры по умолчанию берутся из переменных окружения (.env / config.env):
+    Параметры по умолчанию берутся из переменных окружения (.env или
+    системное окружение) напрямую через os.getenv — токены намеренно НЕ
+    являются полями Settings: этот объект печатают целиком при отладке, и
+    секрет в нём утекал бы в лог.
       GH_DEPLOY_TOKEN, GH_READ_TOKEN. Авто-деплой после цикла проверки:
         from deploy_config import deploy
         deploy(silent=True)

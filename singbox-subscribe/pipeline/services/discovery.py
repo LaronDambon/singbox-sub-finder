@@ -7,9 +7,7 @@
 
 from __future__ import annotations
 
-import os
-
-from config.env import SERVICE_DISCOVERY, SERVICE_DISCOVERY_INTERVAL
+from config.settings import setting
 from pipeline.logging_setup import get_logger
 from pipeline.services.base import Service
 
@@ -23,7 +21,9 @@ class DiscoveryService(Service):
 
     def __init__(self, ctx, *, interval: float | None = None) -> None:
         super().__init__(ctx)
-        self.interval = SERVICE_DISCOVERY_INTERVAL if interval is None else interval
+        self.interval = (
+            setting("SERVICE_DISCOVERY_INTERVAL") if interval is None else interval
+        )
         self._stage = None
 
     async def setup(self) -> None:
@@ -32,7 +32,7 @@ class DiscoveryService(Service):
         self._stage = DiscoveryStage(self.ctx)
         self.enabled = bool(
             self.ctx.settings.get("discovery", True)
-        ) and SERVICE_DISCOVERY
+        ) and setting("SERVICE_DISCOVERY")
         if self.enabled:
             LOGGER.info("Поиск: каждые %.0f сек", self.interval or 0)
 

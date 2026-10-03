@@ -48,20 +48,16 @@ import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 
-from config.env import (
-    SING_BOX_PATH,
-    COUNTRYTEST_TEMPLATE,
-    COUNTRY_CHECK_TIMEOUT,
-)
+from config.settings import setting
 
 from script.logger_utils import get_project_logger
 
 LOGGER = get_project_logger("country_check")
 
 # --- Параметры probing -------------------------------------------------------
-# Таймауты одного geo-запроса: (connect, read), сек.
+# Таймаут CONNECT одного geo-запроса, сек. Таймаут READ (COUNTRY_CHECK_TIMEOUT)
+# приходит из настроек и читается в точке использования, см. _probe_port.
 PROBE_CONNECT_TIMEOUT = 4.0
-PROBE_READ_TIMEOUT = float(COUNTRY_CHECK_TIMEOUT) if COUNTRY_CHECK_TIMEOUT else 6.0
 # Ожидание готовности inbound-портов при старте sing-box, сек.
 STARTUP_WAIT_SECONDS = 10.0
 # Максимум inbound'ов (и прокси) в одном процессе sing-box.
@@ -270,7 +266,7 @@ def _start_singbox(config: dict, config_path: Path):
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
-        return subprocess.Popen([str(SING_BOX_PATH), "run", "-c", str(config_path)], **kwargs)
+        return subprocess.Popen([str(setting("SING_BOX_PATH")), "run", "-c", str(config_path)], **kwargs)
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("Не удалось запустить sing-box: %s", exc)
         return None
@@ -302,13 +298,15 @@ def _probe_port(port: int) -> dict:
     session = requests.Session()
     session.trust_env = False  # игнорировать системные HTTP(S)_PROXY
     last_error = "неизвестная ошибка"
+    # Таймаут READ одного geo-запроса, сек (COUNTRY_CHECK_TIMEOUT).
+    read_timeout = float(setting("COUNTRY_CHECK_TIMEOUT") or 6.0)
     for name, url, parser in GEO_PROBES:
         start = time.monotonic()
         try:
             resp = session.get(
                 url,
                 proxies=proxies,
-                timeout=(PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT),
+                timeout=(PROBE_CONNECT_TIMEOUT, read_timeout),
                 headers={"User-Agent": BROWSER_UA},
             )
             if resp.status_code != 200:
@@ -362,7 +360,7 @@ def _run_batch(items: list[tuple[str, int]], results: dict[str, dict],
     for e, p in zip(active, ports):
         e["port"] = p
 
-    config = _build_batch_config(active, ROOT / COUNTRYTEST_TEMPLATE)
+    config = _build_batch_config(active, ROOT / str(setting("COUNTRYTEST_TEMPLATE")))
     config_path = ROOT / "source" / "tests" / f"country_batch_{items[0][1]}_{len(items)}.json"
     proc = _start_singbox(config, config_path)
 
@@ -427,10 +425,8 @@ def batch_country_check(proxy_lines: list[str], *, concurrency: int | None = Non
     Возвращает dict {proxy_line: результат-словарь} с ключами:
     country, country_code, emoji, server_name, latency_ms, error.
     """
-    from config.env import COUNTRY_CHECK_CONCURRENCY
-
     if concurrency is None:
-        concurrency = COUNTRY_CHECK_CONCURRENCY
+        concurrency = setting("COUNTRY_CHECK_CONCURRENCY")
     concurrency = max(1, int(concurrency))
 
     results: dict[str, dict] = {}

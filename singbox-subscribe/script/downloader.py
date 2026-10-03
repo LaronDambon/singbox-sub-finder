@@ -16,6 +16,7 @@ from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 
+from config.settings import setting
 from script.logger_utils import get_project_logger
 from utils import tool
 
@@ -341,10 +342,8 @@ def _download_sources_parallel(urls: list[str], download_dir: Path,
     """Параллельно скачивает все источники; возвращает список существующих файлов."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    from config.env import SUB_DOWNLOAD_CONCURRENCY
-
     results: list[dict] = []
-    workers = max(1, min(int(SUB_DOWNLOAD_CONCURRENCY), len(urls)))
+    workers = max(1, min(int(setting("SUB_DOWNLOAD_CONCURRENCY")), len(urls)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(_download_source, idx, url, download_dir): idx
@@ -465,13 +464,9 @@ def build_merge_from_urls(
         }
 
     # --- Центральная база: регистрируем всё скачанное и собираем пул проверки ---
-    from config.env import (
-        SERVERS_DB_FILE,
-        WHITELIST_FILE,
-    )
     from script.server_store import ServerStore
 
-    store = ServerStore(SERVERS_DB_FILE)
+    store = ServerStore(setting("SERVERS_DB_FILE"))
 
     source_lines: list[str] = []
     seen_keys: set[str] = set()
@@ -541,10 +536,9 @@ def build_merge_from_urls(
 
     # Экспорт whitelist.txt — файловая проекция базы: серверы, ПИНГОВАВШИЕСЯ
     # в последней проверке (available=1), для внешних потребителей.
-    from config.env import REACHABILITY_GLOBAL_TAG
     exported = store.export_whitelist_to_file(
-        WHITELIST_FILE,
-        global_tag=REACHABILITY_GLOBAL_TAG,
+        setting("WHITELIST_FILE"),
+        global_tag=setting("REACHABILITY_GLOBAL_TAG"),
     )
     logger.info(
         "Экспорт whitelist.txt из базы: %d серверов, пинговавшихся в последней проверке",

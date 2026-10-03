@@ -27,12 +27,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from config.env import (
-    PIPELINE_BATCH_SIZE,
-    PIPELINE_CHECK_TIMEOUT,
-    PIPELINE_MAX_ATTEMPTS,
-    URLTEST_URL,
-)
+from config.settings import setting
 from pipeline.checkers.base import CheckContext, CheckOutcome, CheckResult, Checker
 from pipeline.collector import Verdict
 from pipeline.dispatcher import BatchDispatcher, make_dispatcher
@@ -53,10 +48,12 @@ class UrlProbeChecker(Checker):
     uses_dispatcher = True
 
     def __init__(self) -> None:
-        self.batch_size = PIPELINE_BATCH_SIZE
-        self.timeout = PIPELINE_CHECK_TIMEOUT
-        self.max_attempts = PIPELINE_MAX_ATTEMPTS
-        self.urltest = URLTEST_URL
+        # Значения по умолчанию: setup() ниже перечитывает их из контекста
+        # по настоящим именам, но check() может быть вызван и без него.
+        self.batch_size = setting("PIPELINE_BATCH_SIZE")
+        self.timeout = setting("PIPELINE_CHECK_TIMEOUT")
+        self.max_attempts = setting("PIPELINE_MAX_ATTEMPTS")
+        self.urltest = setting("URLTEST_URL")
         self.slots = 1
         self._dispatcher: BatchDispatcher | None = None
 

@@ -10,14 +10,9 @@
 
 from __future__ import annotations
 
-import os
 import time
 
-from config.env import (
-    SERVICE_PUBLISHER,
-    SERVICE_PUBLISHER_DEPLOY,
-    SERVICE_PUBLISHER_INTERVAL,
-)
+from config.settings import setting
 from pipeline.logging_setup import get_logger
 from pipeline.services.base import Service
 
@@ -32,8 +27,10 @@ class PublisherService(Service):
     def __init__(self, ctx, *, interval: float | None = None,
                  deploy: bool | None = None) -> None:
         super().__init__(ctx)
-        self.interval = SERVICE_PUBLISHER_INTERVAL if interval is None else interval
-        self.deploy = SERVICE_PUBLISHER_DEPLOY if deploy is None else deploy
+        self.interval = (
+            setting("SERVICE_PUBLISHER_INTERVAL") if interval is None else interval
+        )
+        self.deploy = setting("SERVICE_PUBLISHER_DEPLOY") if deploy is None else deploy
         self._stage = None
         self.publishes = 0
 
@@ -41,7 +38,7 @@ class PublisherService(Service):
         from pipeline.stages.export import ExportStage
 
         self._stage = ExportStage(self.ctx)
-        self.enabled = SERVICE_PUBLISHER
+        self.enabled = setting("SERVICE_PUBLISHER")
         if self.enabled:
             LOGGER.info(
                 "Публикатор: каждые %.0f сек, деплой %s",

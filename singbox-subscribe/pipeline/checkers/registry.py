@@ -77,9 +77,9 @@ def _iter_checker_classes(module, source: Path):
 
 def discover(custom_dir: str | Path | None = None) -> list[Checker]:
     """Находит все чекеры в папках builtin/ и custom/, создаёт экземпляры."""
-    from config.env import PIPELINE_CUSTOM_CHECKERS_DIR
+    from config.settings import setting
 
-    folders = [BUILTIN_DIR, Path(custom_dir or PIPELINE_CUSTOM_CHECKERS_DIR)]
+    folders = [BUILTIN_DIR, Path(custom_dir or setting("PIPELINE_CUSTOM_CHECKERS_DIR"))]
     found: dict[str, Checker] = {}
 
     for path in discover_checker_files(*folders):

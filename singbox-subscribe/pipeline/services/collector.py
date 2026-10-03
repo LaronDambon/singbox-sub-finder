@@ -12,9 +12,7 @@
 
 from __future__ import annotations
 
-import os
-
-from config.env import SERVICE_COLLECTOR, SERVICE_COLLECTOR_INTERVAL
+from config.settings import setting
 from pipeline.logging_setup import get_logger
 from pipeline.services.base import Service
 
@@ -29,9 +27,11 @@ class CollectorService(Service):
     def __init__(self, ctx, *, interval: float | None = None,
                  enabled: bool | None = None) -> None:
         super().__init__(ctx)
-        self.interval = SERVICE_COLLECTOR_INTERVAL if interval is None else interval
+        self.interval = (
+            setting("SERVICE_COLLECTOR_INTERVAL") if interval is None else interval
+        )
         self.added = 0
-        self._enabled = SERVICE_COLLECTOR if enabled is None else bool(enabled)
+        self._enabled = setting("SERVICE_COLLECTOR") if enabled is None else bool(enabled)
 
     async def setup(self) -> None:
         self.enabled = self._enabled

@@ -21,14 +21,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from config.env import (
-    DEPLOY_ENABLED,
-    DEPLOY_PATH,
-    DEPLOY_TEMPLATE,
-    DEPLOY_TEMPLATES,
-    GH_DEPLOY_REPO,
-    PURGE_STABLE_BELOW,
-)
+from config.settings import setting
 from pipeline.logging_setup import get_logger
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -64,10 +57,10 @@ class ExportStage:
         деплой выключает.
         """
         result: dict = {"purged": 0, "whitelist": 0, "deploy": None}
-        want_deploy = DEPLOY_ENABLED if deploy is None else bool(deploy)
+        want_deploy = setting("DEPLOY_ENABLED") if deploy is None else bool(deploy)
 
         # --- умершие выпадают из ротации ------------------------------------
-        result["purged"] = await db.purge_dead(PURGE_STABLE_BELOW)
+        result["purged"] = await db.purge_dead(setting("PURGE_STABLE_BELOW"))
         LOGGER.info("Из проверки исключено серверов: %d", result["purged"])
 
         # --- whitelist: единственная файловая выгрузка ------------------------
@@ -89,18 +82,24 @@ class ExportStage:
         """Деплой собранного конфига. Ошибки не поднимаются: цикл не ломаем."""
         from deploy_config import deploy, deploy_multi
 
-        templates = [t for t in DEPLOY_TEMPLATES.replace(",", " ").split() if t]
+        # Настройки читаются здесь, в точке использования. Константы на
+        # уровне модуля вернули бы имя каждой настройки в коде вторым разом —
+        # ровно ту связь, которую убирает config.settings.
+        repo = setting("GH_DEPLOY_REPO")
+        path = setting("DEPLOY_PATH")
+        templates = [t for t in setting("DEPLOY_TEMPLATES").replace(",", " ").split() if t]
         try:
             if templates:
-                LOGGER.info("Деплой (мульти): repo=%s templates=%s", GH_DEPLOY_REPO, templates)
+                LOGGER.info("Деплой (мульти): repo=%s templates=%s", repo, templates)
                 res = deploy_multi(
-                    repo=GH_DEPLOY_REPO, templates=templates, path=DEPLOY_PATH, silent=True,
+                    repo=repo, templates=templates, path=path, silent=True,
                 )
             else:
-                LOGGER.info("Деплой: repo=%s template=%s", GH_DEPLOY_REPO, DEPLOY_TEMPLATE)
+                template = setting("DEPLOY_TEMPLATE")
+                LOGGER.info("Деплой: repo=%s template=%s", repo, template)
                 res = deploy(
-                    repo=GH_DEPLOY_REPO, template=DEPLOY_TEMPLATE,
-                    path=DEPLOY_PATH, silent=True,
+                    repo=repo, template=template,
+                    path=path, silent=True,
                 )
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Деплой не выполнен: %s", exc)

@@ -37,7 +37,7 @@ import asyncio
 import time
 from typing import TYPE_CHECKING, Sequence
 
-from config.env import NEW_SERVER_STABLE, URLTEST_URL
+from config.settings import setting
 from pipeline.batch import BatchOutcome
 from pipeline.checkers.base import CheckContext, CheckResult
 from pipeline.collector import Verdict
@@ -84,7 +84,9 @@ class CheckStage:
         # трёх серверах. Смешивать его с коротким таймаутом батча нельзя.
         self.enrich_timeout = float(ctx.setting("enrich_timeout", 180))
         self.startup = float(ctx.setting("batch_startup", 10.0))
-        self.urltest = str(ctx.setting("urltest", URLTEST_URL) or URLTEST_URL)
+        # Сначала настройки прогона (их задаёт main.py аргументами командной
+        # строки), и только если их нет — настройка из окружения.
+        self.urltest = str(ctx.setting("urltest") or setting("URLTEST_URL"))
         self.max_retries = int(ctx.setting("max_retries", MAX_BATCH_RETRIES))
         # Служба 1 (диспетчер) умеет гонять батчи только через sing-box. Если
         # решающий чекер — свой алгоритм (uses_dispatcher не выставлен), идём
@@ -363,7 +365,7 @@ class CheckStage:
             items, result,
             stable_map=self.stable_map,
             start_serial=start_serial,
-            new_server_stable=int(NEW_SERVER_STABLE),
+            new_server_stable=int(setting("NEW_SERVER_STABLE")),
         )
         await self.db.record_results(rows)
 

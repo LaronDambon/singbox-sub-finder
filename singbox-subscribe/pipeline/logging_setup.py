@@ -16,7 +16,8 @@
     всё, что прошло порог, а per-level файлы — ТОЛЬКО свой уровень
     (ExactLevelFilter). Один и тот же лог больше не хранится четыре раза.
   * Настраиваемость. Уровни, формат, ротация, количество копий и очистка по
-    возрасту задаются переменными окружения (см. config/env.py, раздел ЛОГИРОВАНИЕ).
+    возрасту задаются переменными окружения — их читает `setting()`
+    (см. config/settings.py, раздел «значения из окружения»).
   * `LOG_LEVEL` — это ПОРОГ, а не "какой файл смотреть": при LOG_LEVEL=ERROR в
     логи попадают только ошибки, при LOG_LEVEL=INFO — info и всё более серьёзное.
   * Защита от "пулемёта": ThrottleFilter гасит тысячи одинаковых сообщений,
@@ -44,20 +45,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Iterator
 
-from config.env import (
-    LOG_BACKUP_COUNT,
-    LOG_CAPTURE_STDOUT,
-    LOG_CONSOLE_LEVEL,
-    LOG_DIR_PATH,
-    LOG_FILE_NAME,
-    LOG_FORMAT,
-    LOG_LEVEL,
-    LOG_MAX_BYTES,
-    LOG_PER_LEVEL_FILES,
-    LOG_RETENTION_DAYS,
-    LOG_THROTTLE_LIMIT,
-    LOG_THROTTLE_WINDOW,
-)
+# Настройки логирования берутся лениво, через setting(): этот модуль
+# настраивается ПЕРВЫМ, раньше init_settings() в точке входа, поэтому
+# фиксировать их импортом нельзя — настройки просто ещё не собраны.
+from config.settings import setting
 
 # Корневой логгер проекта. Дочерние логгеры берут имя от модуля
 # (get_logger(__name__)), поэтому в записи видно, откуда пришло сообщение.
@@ -296,8 +287,8 @@ def cleanup_old_logs(log_dir: Path | None = None, retention_days: int | None = N
     ``retention_days=0`` отключает очистку (остаётся только ротация по размеру).
     Возвращает список удалённых файлов — их стоит упомянуть в логе.
     """
-    directory = Path(log_dir or LOG_DIR_PATH)
-    days = int(retention_days if retention_days is not None else LOG_RETENTION_DAYS)
+    directory = Path(log_dir or setting("LOG_DIR_PATH"))
+    days = int(retention_days if retention_days is not None else setting("LOG_RETENTION_DAYS"))
     if days <= 0 or not directory.is_dir():
         return []
     cutoff = (now if now is not None else time.time()) - days * 86400
@@ -363,19 +354,27 @@ def setup_logging(
         if _configured and not force:
             return root
 
-        cfg_level = LOG_LEVEL if level is None else int(level)
-        cfg_console = (LOG_CONSOLE_LEVEL if console_level is None else int(console_level))
-        cfg_dir = Path(log_dir or LOG_DIR_PATH)
-        cfg_file = file_name or LOG_FILE_NAME
-        cfg_max_bytes = int(max_bytes if max_bytes is not None else LOG_MAX_BYTES)
-        cfg_backups = int(backup_count if backup_count is not None else LOG_BACKUP_COUNT)
-        cfg_days = int(retention_days if retention_days is not None else LOG_RETENTION_DAYS)
-        cfg_per_level = (
-            bool(per_level_files) if per_level_files is not None else bool(LOG_PER_LEVEL_FILES)
+        cfg_level = setting("LOG_LEVEL") if level is None else int(level)
+        cfg_console = (
+            setting("LOG_CONSOLE_LEVEL") if console_level is None else int(console_level)
         )
-        cfg_format = (log_format or LOG_FORMAT or "text").lower()
+        cfg_dir = Path(log_dir or setting("LOG_DIR_PATH"))
+        cfg_file = file_name or setting("LOG_FILE_NAME")
+        cfg_max_bytes = int(max_bytes if max_bytes is not None else setting("LOG_MAX_BYTES"))
+        cfg_backups = int(
+            backup_count if backup_count is not None else setting("LOG_BACKUP_COUNT")
+        )
+        cfg_days = int(
+            retention_days if retention_days is not None else setting("LOG_RETENTION_DAYS")
+        )
+        cfg_per_level = (
+            bool(per_level_files)
+            if per_level_files is not None else bool(setting("LOG_PER_LEVEL_FILES"))
+        )
+        cfg_format = (log_format or setting("LOG_FORMAT") or "text").lower()
         cfg_capture = (
-            bool(capture_stdout) if capture_stdout is not None else bool(LOG_CAPTURE_STDOUT)
+            bool(capture_stdout)
+            if capture_stdout is not None else bool(setting("LOG_CAPTURE_STDOUT"))
         )
 
         # Чистый срез: сначала снимаем старые обработчики, иначе повторные
@@ -399,7 +398,9 @@ def setup_logging(
         file_formatter: logging.Formatter = (
             JsonFormatter() if cfg_format == "json" else TextFormatter(with_module=True)
         )
-        throttle = ThrottleFilter(LOG_THROTTLE_LIMIT, LOG_THROTTLE_WINDOW)
+        throttle = ThrottleFilter(
+            setting("LOG_THROTTLE_LIMIT"), setting("LOG_THROTTLE_WINDOW"),
+        )
 
         # --- главный файл: всё, что прошло порог LOG_LEVEL -------------------
         main_file = _make_file_handler(

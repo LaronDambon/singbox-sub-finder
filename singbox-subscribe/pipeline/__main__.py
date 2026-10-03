@@ -19,6 +19,7 @@ import json
 import logging
 import sys
 
+from config.settings import init_settings, setting
 from pipeline.logging_setup import get_logger, setup_logging
 
 
@@ -98,7 +99,6 @@ def _cmd_checkers(args) -> int:
     if args.verbose:
         _dump(describe())
         return 0
-    from config.env import PIPELINE_CHECKERS
 
     active = {c.name for c in build_checkers()}
     print(f"{'ИМЯ':<18} {'РОЛЬ':<10} ОПИСАНИЕ")
@@ -108,7 +108,7 @@ def _cmd_checkers(args) -> int:
         mark = "*" if item["name"] in active else " "
         print(f"{mark}{item['name']:<17} {role:<10} {item['description']}")
     print()
-    print(f"* — включён в PIPELINE_CHECKERS={PIPELINE_CHECKERS!r}")
+    print(f"* — включён в PIPELINE_CHECKERS={setting('PIPELINE_CHECKERS')!r}")
     return 0
 
 
@@ -124,11 +124,10 @@ def _cmd_status(args) -> int:
 
 
 def _cmd_queue(args) -> int:
-    from config.env import SERVERS_DB_FILE
     from pipeline.database import Database
 
     async def main():
-        db = Database(args.db or SERVERS_DB_FILE)
+        db = Database(args.db or setting("SERVERS_DB_FILE"))
         try:
             stats = await db.queue_stats()
             if args.clear_done:
@@ -144,22 +143,17 @@ def _cmd_queue(args) -> int:
 
 
 def _cmd_logs(args) -> int:
-    from config.env import (
-        LOG_BACKUP_COUNT,
-        LOG_DIR_PATH,
-        LOG_LEVEL,
-        LOG_MAX_BYTES,
-        LOG_RETENTION_DAYS,
-    )
+    # Каталог нужен трижды подряд — читаем один раз, локально.
+    log_dir = setting("LOG_DIR_PATH")
 
-    print(f"Каталог:        {LOG_DIR_PATH}")
-    print(f"Уровень:        {logging.getLevelName(LOG_LEVEL)}")
-    print(f"Ротация:        {LOG_MAX_BYTES} байт × {LOG_BACKUP_COUNT} копий")
-    print(f"Очистка:        файлы старше {LOG_RETENTION_DAYS} дней")
+    print(f"Каталог:        {log_dir}")
+    print(f"Уровень:        {logging.getLevelName(setting('LOG_LEVEL'))}")
+    print(f"Ротация:        {setting('LOG_MAX_BYTES')} байт × {setting('LOG_BACKUP_COUNT')} копий")
+    print(f"Очистка:        файлы старше {setting('LOG_RETENTION_DAYS')} дней")
     print()
     total = 0
-    if LOG_DIR_PATH.is_dir():
-        for path in sorted(LOG_DIR_PATH.glob("*.log*")):
+    if log_dir.is_dir():
+        for path in sorted(log_dir.glob("*.log*")):
             size = path.stat().st_size
             total += size
             print(f"  {path.name:<24} {size / 1024 / 1024:>8.2f} МБ")
@@ -213,6 +207,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Точка входа: настройки собираем явно и до всего остального — дальше
+    # их читают и разбор аргументов, и логирование, и команды.
+    init_settings()
     setup_logging()
     args = build_parser().parse_args(argv)
     return int(args.func(args) or 0)
