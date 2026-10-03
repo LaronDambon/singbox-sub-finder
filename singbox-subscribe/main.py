@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from config.settings import init_settings
 from pipeline import Pipeline, get_logger, setup_logging
 
 LOGGER = get_logger("main")
@@ -70,16 +71,37 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def settings_from_args(args: argparse.Namespace) -> dict:
-    """Перекрытия настроек из аргументов командной строки."""
-    overrides = {
-        "discovery": False if args.no_discovery else None,
-        "write_merge": False if args.no_export else None,
-        "export_lists": False if args.no_export else None,
-        "batch_size": args.batch_size,
-        "check_workers": args.workers,
+#: Имя настройки в .env -> ключ в настройках pipeline.
+#: Два мира пока не слиты: Settings знает про переменные окружения,
+#: а этапы pipeline — про короткие ключи настроек. Слияние — отдельная
+#: задача; здесь важно, что перекрытия уходят в объект настроек, а не
+#: теряются по дороге.
+_ENV_TO_PIPELINE_KEY = {
+    "PIPELINE_DISCOVERY": "discovery",
+    "PIPELINE_EXPORT_LISTS": "export_lists",
+    "PIPELINE_BATCH_SIZE": "batch_size",
+    "PIPELINE_CHECK_WORKERS": "check_workers",
+}
+
+
+def env_overrides(args: argparse.Namespace) -> dict:
+    """Перекрытия настроек из аргументов командной строки -> переменные окружения."""
+    direct = {
+        "PIPELINE_DISCOVERY": False if args.no_discovery else None,
+        "PIPELINE_EXPORT_LISTS": False if args.no_export else None,
+        "PIPELINE_BATCH_SIZE": args.batch_size,
+        "PIPELINE_CHECK_WORKERS": args.workers,
     }
-    return {k: v for k, v in overrides.items() if v is not None}
+    out = {k: v for k, v in direct.items() if v is not None}
+    return out
+
+
+def settings_from_args(args: argparse.Namespace, settings) -> dict:
+    """Настройки этапов pipeline, собранные из общего объекта Settings."""
+    return {
+        key: getattr(settings, env_name)
+        for env_name, key in _ENV_TO_PIPELINE_KEY.items()
+    }
 
 
 async def run_once(pipeline: Pipeline, *, discovery: bool, export: bool) -> dict:
@@ -107,13 +129,23 @@ async def run_forever(pipeline: Pipeline, *, interval: float, discovery: bool,
 
 
 def main(argv: list[str] | None = None) -> int:
-    setup_logging()
     args = build_parser().parse_args(argv)
-    LOGGER.info("Запуск main.py (логирование настроено)")
+
+    # Настройки собираются ЗДЕСЬ и ровно один раз: из .env, системного
+    # окружения и перекрытий аргументов командной строки. Дальше объект
+    # передаётся вниз явно. Раньше значения появлялись сами при импорте
+    # config.env, из-за чего перекрытия аргументов применялись позже и
+    # молча терялись.
+    settings = init_settings(**env_overrides(args))
+    setup_logging()
+    LOGGER.info(
+        "Запуск main.py: батч %d, воркеров %d, чекеры из .env",
+        settings.PIPELINE_BATCH_SIZE, settings.PIPELINE_CHECK_WORKERS,
+    )
 
     async def amain() -> int:
         async with Pipeline(
-            settings=settings_from_args(args), checkers=args.checkers,
+            settings=settings_from_args(args, settings), checkers=args.checkers,
         ) as pipeline:
             if args.json:
                 report = await run_once(

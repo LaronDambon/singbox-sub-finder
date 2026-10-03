@@ -42,14 +42,12 @@ class ReachabilityChecker(Checker):
         self._alive: set[str] = set()
 
     async def setup(self, ctx) -> None:
-        self.enabled = bool(ctx.settings.get("reachability_enabled", REACHABILITY_ENABLED))
+        self.enabled = bool(ctx.value("REACHABILITY_ENABLED"))
         self.min_stable = int(
-            ctx.settings.get("reachability_min_stable", REACHABILITY_MIN_STABLE)
+            ctx.value("REACHABILITY_MIN_STABLE")
         )
-        self.global_tag = ctx.settings.get("global_tag", REACHABILITY_GLOBAL_TAG)
-        raw_ping = ctx.settings.get(
-            "reachability_max_ping_ms", ctx.settings.get("max_ping_ms")
-        )
+        self.global_tag = ctx.value("REACHABILITY_GLOBAL_TAG")
+        raw_ping = ctx.value("REACHABILITY_MAX_PING_MS")
         if raw_ping is None:
             self.max_ping_ms = None
         else:

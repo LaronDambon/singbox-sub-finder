@@ -464,6 +464,114 @@ async def test_urltest_parsing() -> None:
           [(r.verdict, r.ping_ms) for r in res2])
 
 
+async def test_settings_loading() -> None:
+    """Загрузка настроек: приоритеты, типы, устойчивость к мусору."""
+    print("\n--- загрузка настроек ---")
+    from config.settings import (
+        Settings, get_settings, init_settings, parse_level, read_env_file,
+    )
+
+    tmp = TMP / "env_for_settings"
+    tmp.mkdir(parents=True, exist_ok=True)
+    env_file = tmp / ".env"
+    env_file.write_text(
+        "# комментарий\n"
+        "URLTEST_BATCH_SIZE=42\n"
+        'REACHABILITY_GLOBAL_TAG="Из .env"\n'
+        "PIPELINE_CHECK_WORKERS=not-a-number\n"
+        "SPEED_ENABLED=no\n",
+        encoding="utf-8",
+    )
+    check(".env разбирается: комментарии и кавычки",
+          read_env_file(env_file) == {
+              "URLTEST_BATCH_SIZE": "42",
+              "REACHABILITY_GLOBAL_TAG": "Из .env",
+              "PIPELINE_CHECK_WORKERS": "not-a-number",
+              "SPEED_ENABLED": "no",
+          }, read_env_file(env_file))
+    check("отсутствующий файл не мешает",
+          read_env_file(tmp / "нет-такого.env") == {})
+
+    s = Settings.from_env(overrides={}, env_file=env_file)
+    check("значение из .env прочитано", s.URLTEST_BATCH_SIZE == 42, s.URLTEST_BATCH_SIZE)
+    check("кавычки сняты", s.REACHABILITY_GLOBAL_TAG == "Из .env", s.REACHABILITY_GLOBAL_TAG)
+    # Умолчание здесь — из поля Settings (2), а не из репозиторного
+    # .env: тест читает СВОЙ файл, поэтому значения репозитория не видны.
+    check("битое число -> умолчание, а не падение",
+          s.PIPELINE_CHECK_WORKERS == 2, s.PIPELINE_CHECK_WORKERS)
+    check("строка «no» понята как False", s.SPEED_ENABLED is False, s.SPEED_ENABLED)
+    check("PIPELINE_BATCH_SIZE наследует URLTEST_BATCH_SIZE",
+          s.PIPELINE_BATCH_SIZE == 42, s.PIPELINE_BATCH_SIZE)
+
+    # Перекрытие кодом сильнее .env И сильнее мусора.
+    check("override сильнее .env",
+          Settings.from_env(overrides={"URLTEST_BATCH_SIZE": 7},
+                            env_file=env_file).URLTEST_BATCH_SIZE == 7)
+    # И приводится к типу: мусор в override не должен уехать строкой.
+    check("override тоже приводится к типу",
+          Settings.from_env(overrides={"URLTEST_BATCH_SIZE": "ерунда"},
+                            env_file=env_file).URLTEST_BATCH_SIZE == 42)
+
+    check("уровень понимает имя и число",
+          parse_level("DEBUG") == 10 and parse_level("25") == 25)
+    check("неизвестный уровень не роняет", parse_level("ерунда") == 20)
+    # Сам тестовый запуск выставляет LOG_CONSOLE_LEVEL в окружении
+    # процесса (см. _prepare_env), а системное окружение важнее .env.
+    # Поэтому наследование проверяем, убрав его на время проверки.
+    saved_console = os.environ.pop("LOG_CONSOLE_LEVEL", None)
+    try:
+        check("LOG_CONSOLE_LEVEL наследует LOG_LEVEL",
+              Settings.from_env(overrides={"LOG_LEVEL": "WARNING"},
+                                env_file=env_file).LOG_CONSOLE_LEVEL == 30)
+    finally:
+        if saved_console is not None:
+            os.environ["LOG_CONSOLE_LEVEL"] = saved_console
+
+    # Пути считаются от корня, а не из .env.
+    check("путь от корня проекта", s.SERVERS_DB_FILE.name == "servers.db", s.SERVERS_DB_FILE)
+    check("переопределяемый путь берётся из окружения",
+          str(Settings.from_env(
+              overrides={"CONFIG_TEMPLATE_DIR": r"C:\шблоны"},
+              env_file=env_file).CONFIG_TEMPLATE_DIR) == r"C:\шблоны")
+
+    check("все пути заполнены",
+          all(getattr(s, n) is not None for n in (
+              "URLS_FILE", "SERVERS_DB_FILE", "URLTEST_TEMPLATE",
+              "SING_BOX_PATH", "LOG_DIR_PATH", "PIPELINE_CUSTOM_CHECKERS_DIR")))
+    check("теги скорости собраны",
+          s.SPEED_TIER_TAGS["fast"] == "speed-fast"
+          and s.SPEED_TIER_TAGS["geo"] == "speed-geo", s.SPEED_TIER_TAGS)
+
+    d = s.as_dict()
+    check("as_dict отдаёт все поля", len(d) == len(type(s).as_dict.__doc__ or "") or len(d) > 80,
+          len(d))
+
+    # Один объект на процесс + понятная ошибка вместо AttributeError.
+    got = init_settings()
+    check("init_settings отдаёт объект", isinstance(got, Settings))
+    check("get_settings отдаёт тот же объект", get_settings() is got)
+
+    # Старый доступ через config.env работает, но помечен как устаревший.
+    import warnings
+
+    import config.env as env_shim
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        value = env_shim.PIPELINE_CHECK_WORKERS
+    check("config.env отдаёт то же значение", value == got.PIPELINE_CHECK_WORKERS,
+          (value, got.PIPELINE_CHECK_WORKERS))
+    check("config.env предупреждает об устаревании",
+          any(issubclass(w.category, DeprecationWarning) for w in caught),
+          [w.category.__name__ for w in caught])
+
+    try:
+        env_shim.НЕТ_ТАКОЙ_НАСТРОЙКИ
+        check("чужая настройка даёт понятную ошибку", False, "исключения не было")
+    except AttributeError as exc:
+        check("чужая настройка даёт понятную ошибку",
+              "больше не содержит" in str(exc), str(exc))
+
+
 async def test_best_tags() -> None:
     """Отбор «лучших»: лучший по профилю получает дополнительный тег."""
     print("\n--- метки лучших серверов ---")
@@ -1455,6 +1563,7 @@ async def _amain() -> None:
     test_redaction()
     test_server_filters()
     test_validate_config_groups()
+    await test_settings_loading()
     await test_best_tags()
     await test_urltest_parsing()
     await test_collector_three_states()

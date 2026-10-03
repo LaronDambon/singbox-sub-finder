@@ -67,7 +67,7 @@ class UrlProbeChecker(Checker):
         self.batch_size = int(settings.get("batch_size", self.batch_size))
         self.timeout = float(settings.get("timeout", self.timeout))
         self.max_attempts = int(settings.get("max_attempts", self.max_attempts))
-        self.urltest = ctx.settings.get("url", URLTEST_URL) or URLTEST_URL
+        self.urltest = ctx.value("URLTEST_URL")
         # Один батч на вызов check(): параллелизмом занимается диспетчер,
         # когда он сам набирает серверы из базы.
         self.slots = 1

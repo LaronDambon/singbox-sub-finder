@@ -34,9 +34,9 @@ class CountryChecker(Checker):
         self._known: dict[str, str] = {}
 
     async def setup(self, ctx) -> None:
-        self.enabled = bool(ctx.settings.get("country_enabled", COUNTRY_CHECK_ENABLED))
+        self.enabled = bool(ctx.value("COUNTRY_CHECK_ENABLED"))
         self.concurrency = max(1, int(
-            ctx.settings.get("country_concurrency", COUNTRY_CHECK_CONCURRENCY)
+            ctx.value("COUNTRY_CHECK_CONCURRENCY")
         ))
         # Карта «ключ -> страна» из базы: позволяет не проверять заново то,
         # что уже определено в прошлых циклах.

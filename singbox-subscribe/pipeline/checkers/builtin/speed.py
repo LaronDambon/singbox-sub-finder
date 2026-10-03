@@ -72,7 +72,7 @@ class SpeedChecker(Checker):
         )
 
     async def setup(self, ctx) -> None:
-        self.enabled = bool(ctx.settings.get("speed_enabled", SPEED_ENABLED))
+        self.enabled = bool(ctx.value("SPEED_ENABLED"))
         if self.enabled:
             self.cfg = self._make_cfg(ctx)
             # Список источников показываем явно: от него зависит, во что

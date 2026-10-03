@@ -96,6 +96,25 @@ class PipelineContext:
         value = self.settings.get(name)
         return default if value is None else value
 
+    def value(self, name: str, default: Any = None) -> Any:
+        """Настройка по её настоящему имени, как в .env (SPEED_ENABLED).
+
+        Сначала настройки прогона (их задаёт main.py аргументами командной
+        строки), затем общий объект Settings.
+
+        Зачем это, а не ctx.setting("speed_enabled", SPEED_ENABLED): такая
+        запись повторяла имя настройки дважды — в .env как SPEED_ENABLED и
+        в чекере как speed_enabled. Стоит одному из них измениться, и
+        перекрытие молча перестаёт действовать: чекер тихо берёт значение по
+        умолчанию. Здесь имя называется ровно один раз.
+        """
+        if name in self.settings:
+            return self.settings[name]
+        from config.settings import get_settings
+
+        found = getattr(get_settings(), name, None)
+        return default if found is None else found
+
     # ------------------------------------------------------------ помощники
     @staticmethod
     async def run_sync(func, *args, **kwargs):
