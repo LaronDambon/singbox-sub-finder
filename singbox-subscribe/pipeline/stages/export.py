@@ -104,10 +104,22 @@ class ExportStage:
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Деплой не выполнен: %s", exc)
             return None
+        failed_items = [i for i in (res.get("results") or [])
+                        if isinstance(i, dict) and not i.get("ok")]
         if res.get("ok"):
             LOGGER.info("Деплой выполнен: %s", redact(res.get("url") or res.get("deployed")))
         else:
             LOGGER.warning("Деплой не выполнен: %s", res.get("error"))
+        # Причина сбоя каждого шаблона — отдельно: сводное сообщение
+        # говорит ЧИСЛО упавших, но не говорит ПОЧЕМУ, а причины у всех
+        # шаблонов обычно общие и показывают, что чинить.
+        for item in failed_items:
+            LOGGER.warning(
+                "  не выложен %s -> %s: %s",
+                item.get("template") or "?",
+                item.get("path") or "?",
+                item.get("error") or "причина не указана",
+            )
         # В отчёте наружу уходит тоже замаскированным: сырой URL с токеном
         # не должен попасть ни в лог, ни в stdout (--json).
         for item in res.get("results") or []:

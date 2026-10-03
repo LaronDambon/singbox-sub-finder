@@ -255,6 +255,32 @@ def _expand_template_list(templates) -> list[str]:
     return out
 
 
+def _multi_failure_summary(results: list[dict], failed: int) -> str:
+    """Причины, по которым не выложились шаблоны, одной строкой.
+
+    Раньше в error уходило только число: "не задеплоено шаблонов: 7".
+    На сервере, где нет доступа к серверу, это сообщение бесполезно —
+    причины лежали в results, но до лога не доходили никуда.
+
+    Одинаковые причины группируются: обычно сбой один и общий для всех
+    шаблонов (недоступен IP-файл, неверный токен), и семь одинаковых
+    строк в логе только шумят.
+    """
+    groups: dict[str, list[str]] = {}
+    for r in results:
+        if r.get("ok"):
+            continue
+        reason = str(r.get("error") or "причина не указана")
+        groups.setdefault(reason, []).append(str(r.get("template") or "?"))
+
+    head = f"не задеплоено шаблонов: {failed} из {len(results)}"
+    if not groups:
+        return head
+    parts = [f"{name}: {', '.join(sorted(set(names)))}"
+             for name, names in sorted(groups.items(), key=lambda kv: -len(kv[1]))]
+    return head + " | " + "; ".join(parts)
+
+
 def _multi_path_for(base_path: str, template_name: str) -> str:
     """Путь итогового файла при мульти-деплое: каталог из base_path + ИМЯ ШАБЛОНА.
 
@@ -728,7 +754,8 @@ def deploy_multi(
             print("ВНИМАНИЕ: GH_READ_TOKEN не задан — ссылки содержат ДЕПЛОЙ-токен (write). "
                   "НЕ раздавайте их наружу.", file=sys.stderr)
     return {"ok": ok, "deployed": deployed, "failed": failed, "repo": repo,
-            "branch": use_branch, "error": None if ok else f"не задеплоено шаблонов: {failed}",
+            "branch": use_branch,
+            "error": None if ok else _multi_failure_summary(results, failed),
             "results": results}
 
 

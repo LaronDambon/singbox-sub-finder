@@ -1025,6 +1025,104 @@ async def test_reach_empty_profile_clears_stale_tags() -> None:
           _st2.get_capabilities(_k1))
 
 
+async def test_multi_deploy_reports_why_it_failed() -> None:
+    """Мульти-деплой обязан называть ПРИЧИНУ, а не только число шаблонов.
+
+    На сервере, где нет доступа, лог ограничивался строкой
+    "не задеплоено шаблонов: 7". Причины при этом вычислялись и лежали
+    в results, но наверх уходило только число — чинить было не по чему.
+    GitHub в тесте не трогается: подменены и клиент, и сам deploy.
+    """
+    import shutil as _sh
+    import tempfile as _tf
+
+    from config.settings import get_settings as _gs
+
+    import deploy_config as _dc
+
+    # Ищем папку с шаблонами там, где её реально ищет сам деплой.
+    # Настройка config_template_dir указывает на config_template, которого
+    # нет, а шаблоны лежат в config/templates.
+    _folders = [Path(d) for d in _dc.TEMPLATE_DIRS if Path(d).exists()]
+    _found = [_f / "sbc-1.14.json" for _f in _folders
+              if (_f / "sbc-1.14.json").exists()]
+    check("найдена папка с шаблонами", bool(_found),
+          [str(x) for x in _dc.TEMPLATE_DIRS])
+    if not _found:
+        return
+    _src = _found[0]
+
+    _dir = Path(_tf.mkdtemp()) / "templates"
+    _dir.mkdir(parents=True)
+    for _n in ("sbc-1.14.json", "sbc-1.14-ray.json"):
+        _sh.copy2(_src, _dir / _n)
+
+    _old_dirs = _dc.TEMPLATE_DIRS
+    _old_gh = _dc.GitHubDeploy
+    _old_load = _dc._load_source_uris
+    _old_deploy = _dc.deploy
+    _dc.TEMPLATE_DIRS = [_dir]
+
+    class _FakeGH:
+        def __init__(self, _tok):
+            pass
+
+        def _default_branch(self, _repo):
+            return "main"
+
+    _dc.GitHubDeploy = _FakeGH
+    _dc._load_source_uris = lambda a: [
+        "vless://4643976f-85fa-40cf-9e58-ea28b50f253b@1.2.3.4:443?type=tcp#A"]
+
+    def _boom(**kw):
+        raise FileNotFoundError(
+            "Файл с текущим IP не найден: %s" % kw.get("ip_source"))
+
+    _dc.deploy = _boom
+    try:
+        _res = _dc.deploy_multi(repo="local/test", templates=["all"],
+                                path="config.json", silent=True,
+                                ip_source="/home/ray/ubuntu_server_ip/current_ip.txt")
+        check("оба шаблона упали", _res["failed"] == 2 and not _res["ok"],
+              (_res["deployed"], _res["failed"]))
+        check("в сводке есть ПРИЧИНА, а не только число",
+              "current_ip.txt" in str(_res["error"]), _res["error"])
+        check("в сводке названы оба шаблона",
+                  all(n in str(_res["error"])
+                      for n in ("sbc-1.14.json", "sbc-1.14-ray.json")),
+                  _res["error"])
+        check("причины остались и в results",
+                  all("current_ip.txt" in str(i.get("error"))
+                      for i in _res["results"]), _res["results"])
+
+        # один из двух падает — второй всё равно должен уехать
+        _state = {"n": 0}
+
+        def _flaky(**kw):
+            _state["n"] += 1
+            if _state["n"] == 1:
+                raise RuntimeError("После сборки не осталось реальных outbound-узлов")
+            return {"ok": True, "url": "u", "commit_sha": "c", "bytes": 1,
+                    "path": kw.get("path"), "error": None,
+                    "url_uses_write_token": False}
+
+        _dc.deploy = _flaky
+        _r2 = _dc.deploy_multi(repo="local/test", templates=["all"],
+                               path="config.json", silent=True,
+                               ip_source="1.2.3.4")
+        check("сбой одного шаблона не мешает остальным",
+              _r2["deployed"] == 1 and _r2["failed"] == 1,
+              (_r2["deployed"], _r2["failed"]))
+        check("имя упавшего шаблона названо",
+              "sbc-1.14-ray.json" in str(_r2["error"]), _r2["error"])
+    finally:
+        _dc.TEMPLATE_DIRS = _old_dirs
+        _dc.GitHubDeploy = _old_gh
+        _dc._load_source_uris = _old_load
+        _dc.deploy = _old_deploy
+        _sh.rmtree(_dir.parent, ignore_errors=True)
+
+
 async def test_best_tags() -> None:
     """Отбор «лучших»: лучший по профилю получает дополнительный тег."""
     print("\n--- метки лучших серверов ---")
@@ -2022,6 +2120,7 @@ async def _amain() -> None:
     await test_batch_helpers_actually_run()
     await test_reach_profile_replaces_its_own_tags()
     await test_reach_empty_profile_clears_stale_tags()
+    await test_multi_deploy_reports_why_it_failed()
     await test_best_tags()
     await test_urltest_parsing()
     await test_collector_three_states()
