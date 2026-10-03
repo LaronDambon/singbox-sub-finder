@@ -12,11 +12,18 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import subprocess
 import time
 from pathlib import Path
 
+from config.settings import get_settings
 from script.core import reserve_ports
+from script.logger_utils import get_project_logger
+
+LOGGER = get_project_logger("batch_singbox")
+
 
 def normalize_key(raw_line: str) -> str:
     """Стабильный ключ прокси без учёта имени/тэга (для кэша)."""

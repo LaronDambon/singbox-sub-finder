@@ -771,13 +771,15 @@ async def test_checkers_share_batch_helpers() -> None:
     различались только докстрингами — на глаз это не видно.
     """
     import script.country_check as _cc
+    import script.proxy_probe as _pp
     import script.reachability_check as _rc
 
     _shared = ["normalize_key", "parse_outbound", "build_batch_config",
                "start_singbox", "ports_ready"]
+    _mods = (_rc, _cc, _pp)
 
     _dupes = []
-    for _mod in (_rc, _cc):
+    for _mod in _mods:
         _left = [n for n in _shared
                  if hasattr(_mod, n)
                  and getattr(_mod, n).__module__ == _mod.__name__]
@@ -785,14 +787,78 @@ async def test_checkers_share_batch_helpers() -> None:
             _dupes.append("%s: %s" % (_mod.__name__, _left))
     check("в чекерах нет своих копий", not _dupes, _dupes)
 
-    _same = [n for n in _shared
-             if getattr(_rc, n) is not getattr(_cc, n)]
-    check("оба чекера берут одну и ту же функцию", not _same, _same)
+    _pairs = [(a.__name__, b.__name__, n)
+              for i, a in enumerate(_mods) for b in _mods[i + 1:]
+              for n in _shared if hasattr(a, n) and hasattr(b, n)
+              and getattr(a, n) is not getattr(b, n)]
+    check("все берут одну и ту же функцию", not _pairs, _pairs)
 
     import script.batch_singbox as _bs
 
     check("общий модуль — источник этих функций",
-          all(getattr(_rc, n).__module__ == "script.batch_singbox" for n in _shared))
+          all(getattr(_m, n).__module__ == "script.batch_singbox"
+              for _m in _mods for n in _shared if hasattr(_m, n)))
+
+
+async def test_batch_helpers_actually_run() -> None:
+    """Функции общего модуля ВЫЗЫВАЮТСЯ, а не просто импортируются.
+
+    Модуль собран переносом копий из чекеров, и при переносе потерялись
+    импорты: os, socket, get_settings, LOGGER. Импорт модуля это не
+    показывает — модуль импортировался, падало только тело функции. Поймал
+    это живой прогон: reachability отвалился с NameError.
+
+    Поэтому здесь каждая функция выполняется по-настоящему.
+    """
+    import tempfile
+    from pathlib import Path as _P
+
+    import script.batch_singbox as _bs
+
+    # normalize_key
+    _k = _bs.normalize_key("vless://u@h:443?x=1#Name")
+    check("normalize_key отбрасывает имя", "#Name" not in _k, _k)
+
+    # parse_outbound
+    _ob, _err = _bs.parse_outbound(
+        "vless://4643976f-85fa-40cf-9e58-ea28b50f253b@1.2.3.4:443"
+        "?type=tcp&security=none#S", 0, set())
+    check("parse_outbound разбирает строку", _err is None and bool(_ob),
+          (_err, _ob))
+
+    # build_batch_config на настоящем шаблоне
+    _tpl = _P(_bs.get_settings().paths.urltest_template)
+    _ports = _bs.reserve_ports(2)
+    _cfg = _bs.build_batch_config(
+        [{"index": i, "port": _p, "outbound": _ob}
+         for i, _p in enumerate(_ports) if _ob], _tpl)
+    check("build_batch_config собирает конфиг",
+          isinstance(_cfg, dict) and len(_cfg.get("inbounds", [])) == 2,
+          sorted(_cfg) if isinstance(_cfg, dict) else _cfg)
+
+    # start_singbox: подменяем путь на несуществующий, чтобы отработала
+    # ветка сбоя. Так проверяются ровно те имена, что терялись при переносе
+    # (os.name, subprocess.Popen, get_settings, LOGGER) — и ничего не
+    # запускается.
+    _fake = type("F", (), {
+        "paths": type("P", (), {"sing_box_path": "Z:/нет/такого/sing-box.exe"}),
+    })
+    _orig = _bs.get_settings
+    _bs.get_settings = lambda: _fake
+    try:
+        with tempfile.TemporaryDirectory() as _d:
+            _cfg_file = _P(_d) / "cfg.json"
+            _res = _bs.start_singbox({"x": 1}, _cfg_file)
+            _written = _cfg_file.exists()
+        check("start_singbox отрабатывает и на отказе запуска",
+              _res is None, _res)
+        check("start_singbox записал конфиг перед попыткой старта", _written)
+    finally:
+        _bs.get_settings = _orig
+
+    # ports_ready на портах, которых никто не слушает
+    check("ports_ready возвращает False на мёртвых портах",
+          _bs.ports_ready(_bs.reserve_ports(2), 0.5) is False)
 
 
 async def test_best_tags() -> None:
@@ -1789,6 +1855,7 @@ async def _amain() -> None:
     await test_settings_loading()
     await test_reserve_ports()
     await test_checkers_share_batch_helpers()
+    await test_batch_helpers_actually_run()
     await test_best_tags()
     await test_urltest_parsing()
     await test_collector_three_states()
