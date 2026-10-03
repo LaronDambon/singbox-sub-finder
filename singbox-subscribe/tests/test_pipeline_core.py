@@ -908,6 +908,23 @@ async def test_reach_profile_replaces_its_own_tags() -> None:
         del _rc.ReachabilityChecker.filter_lines
 
     _out = list(_res.outcomes.values())[0]
+    # а ответ без достигнутых целей — наоборот, на очистку
+    async def _fake_empty(_fn, _lines, **_kw):
+        return {_LINE: {"targets": {n: {"ok": False} for n in _NAMES}}}
+
+    _rc.ReachabilityChecker.filter_lines = lambda self, ctx: [_LINE]
+    _rc.run_exclusive = _fake_empty
+    try:
+        _res2 = await _c.check(None)
+    finally:
+        _rc.run_exclusive = _orig_run
+        del _rc.ReachabilityChecker.filter_lines
+    _out2 = list(_res2.outcomes.values())[0]
+    check("ответ без целей ПРОМЕЧЕН на очистку",
+          _out2.capabilities_clear, _out2)
+    check("ответ без целей не даёт профиля",
+          not _out2.capabilities, _out2.capabilities)
+
     _repl = set(_out.capabilities_replace or ())
     check("чекер вытесняет и цели, и Global",
           _repl == set(_NAMES) | {"Global"}, sorted(_repl))
@@ -915,6 +932,12 @@ async def test_reach_profile_replaces_its_own_tags() -> None:
           not any(x.startswith("speed") for x in _repl), sorted(_repl))
     check("профиль двух целей не помечен Global",
           _out.capabilities == "openrouter,gemini", _out.capabilities)
+    # ОЧЕНЬ важная проверка. Флаг очистки ставится по факту ответа
+    # чекера, а не по факту наличия тегов. Со значением "ответили" флаг
+    # срабатывал и на нормальном профиле, и очистка стирала только что
+    # посчитанные метки: прогон обнулил все целевые теги у 96 серверов.
+    check("нормальный профиль НЕ помечен на очистку",
+          not _out.capabilities_clear, _out.capabilities_clear)
 
     # --- часть 2: с таким префиксом прошлый Global исчезает
     _db = TMP / "replace_tags.db"

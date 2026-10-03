@@ -122,7 +122,6 @@ class ReachabilityChecker(Checker):
             # неправды, и их надо снять. Молча оставить их нельзя: пустой
             # профиль раньше просто не писался в базу, и метки, полученные
             # в каком-то прошлом прогоне, жили вечно.
-            clear = bool(targets_res)
             if targets_res:
                 if profile_is_global(self._targets, targets_res):
                     capabilities = self.global_tag
@@ -131,6 +130,12 @@ class ReachabilityChecker(Checker):
                 if capabilities:
                     tagged += 1
                     LOGGER.info("Reachability [%s]: %s", capabilities, line[:70])
+            # Затирать надо только когда профиля НЕТ: ответили, но ни одной
+            # цели не достигли. Флаг ставится после вычисления capabilities,
+            # иначе он срабатывает и на нормальном профиле — тогда
+            # очистка стирает только что посчитанные теги. На прогоне это
+            # обнулило все целевые метки у 96 серверов.
+            clear = bool(targets_res) and not capabilities
             outcomes[line] = CheckOutcome(
                 ok=None,
                 capabilities=capabilities,
