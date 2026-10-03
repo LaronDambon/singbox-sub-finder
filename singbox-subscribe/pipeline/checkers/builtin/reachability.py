@@ -117,6 +117,12 @@ class ReachabilityChecker(Checker):
             result = results.get(line) or {}
             targets_res = result.get("targets") or {}
             capabilities = ""
+            # Чекер отработал (sing-box ответил), а профиля нет — значит
+            # сервер не достиг ни одной цели. Прежние метки тогда
+            # неправды, и их надо снять. Молча оставить их нельзя: пустой
+            # профиль раньше просто не писался в базу, и метки, полученные
+            # в каком-то прошлом прогоне, жили вечно.
+            clear = bool(targets_res)
             if targets_res:
                 if profile_is_global(self._targets, targets_res):
                     capabilities = self.global_tag
@@ -136,6 +142,7 @@ class ReachabilityChecker(Checker):
                 # целей имел ОДИН. Теги скорости не трогаем — их пишет
                 # другой чекер, и у него свой префикс вытеснения.
                 capabilities_replace=self._target_tags,
+                capabilities_clear=clear,
                 detail=result.get("error"),
             )
         return CheckResult(outcomes=outcomes, summary=f"{tagged}/{len(lines)} с тэгами")

@@ -545,30 +545,43 @@ class ServerStore:
                     _as_float(row.get("speed_down")),
                     _as_float(row.get("speed_up")),
                 )
-                if not country and not capabilities and not any(s is not None for s in speed):
+                replace = tuple(row.get("capabilities_replace") or ())
+                # Затирание — тоже запись профиля, поэтому строка не пустая
+                # даже когда capabilities == "".
+                clearing = bool(row.get("capabilities_clear") and replace)
+                if (not country and not capabilities and not clearing
+                        and not any(s is not None for s in speed)):
                     continue
-                if capabilities:
+                current = ""
+                if capabilities or (row.get("capabilities_clear") and replace):
                     current = conn.execute(
                         "SELECT capabilities FROM servers WHERE key = ?",
                         (row["key"],),
                     ).fetchone()
-                    capabilities = _merge_tags(
-                        (current["capabilities"] if current else "") or "",
-                        capabilities,
-                        replace=row.get("capabilities_replace") or (),
-                    )
+                    current = (current["capabilities"] if current else "") or ""
+                if row.get("capabilities_clear") and replace:
+                    # Ответили, но профиля нет: снимаем метки этого класса,
+                    # оставляя чужие (speed- пишет другой чекер).
+                    capabilities = _merge_tags(current, "", replace=replace)
+                elif capabilities:
+                    capabilities = _merge_tags(current, capabilities,
+                                               replace=replace)
+                # Флаг записи профиля отдельным параметром: очистка даёт
+                # пустую строку, и проверка <> '' её бы не пропустила —
+                # метки вернулись бы в следующем же прогоне.
+                write_caps = 1 if (capabilities or clearing) else 0
                 cursor = conn.execute(
                     """
                     UPDATE servers SET
                         country = CASE WHEN ? <> '' THEN ? ELSE country END,
-                        capabilities = CASE WHEN ? <> '' THEN ? ELSE capabilities END,
+                        capabilities = CASE WHEN ? THEN ? ELSE capabilities END,
                         speed_mbps = COALESCE(?, speed_mbps),
                         speed_down = COALESCE(?, speed_down),
                         speed_up = COALESCE(?, speed_up),
                         last_seen = ?
                     WHERE key = ?
                     """,
-                    (country, country, capabilities, capabilities,
+                    (country, country, write_caps, capabilities,
                      speed[0], speed[1], speed[2], now, row["key"]),
                 )
                 updated += cursor.rowcount or 0

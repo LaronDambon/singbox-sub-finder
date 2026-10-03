@@ -942,6 +942,66 @@ async def test_reach_profile_replaces_its_own_tags() -> None:
           "speed-slow" in _got, _got)
 
 
+async def test_reach_empty_profile_clears_stale_tags() -> None:
+    """Пустой профиль ЗАТИРАЕТ метки своей категории, а не оставляет их.
+
+    Сервер ответил, но не достиг ни одной цели. Раньше такой результат
+    просто не писался в базу (пустая capabilities пропускалась строкой
+    записи), и метки прошлого прогона жили вечно.
+
+    На боевой базе после прогона оставалось 9 серверов с [Global],
+    которых ни один прогон уже не подтверждал.
+
+    Чужие теги (speed-*) при этом сохраняются: их пишет другой чекер.
+    """
+    from script.server_store import ServerStore as _SS2
+
+    _names = ("openrouter", "openai", "gemini", "youtube",
+              "telegram", "github", "microsoft", "yandex")
+    from pipeline.checkers.builtin.reachability import (
+        ReachabilityChecker as _RC2,
+    )
+
+    _repl = list(_RC2.compute_target_tags([{"name": n} for n in _names], "Global"))
+
+    _db2 = TMP / "clear_tags.db"
+    if _db2.exists():
+        _db2.unlink()
+    _st2 = _SS2(_db2)
+    _st2.upsert_lines(["vless://4643976f-85fa-40cf-9e58-ea28b50f253b@1.2.3.4:443"
+                       "?type=tcp#A",
+                       "vless://b1111111-1111-4111-8111-111111111111@5.6.7.8:443"
+                       "?type=tcp#B"])
+    _keys = list(_st2.load_stable_map())
+    _k1, _k2 = _keys[0], _keys[1]
+
+    _st2.record_results([{"key": _k1, "available": 1, "stable": 10,
+                          "capabilities": "Global,speed-slow"}])
+    _st2.record_results([{"key": _k2, "available": 1, "stable": 10,
+                          "capabilities": "openrouter,openai,speed-blocked"}])
+
+    # профиль пуст: ответили, но не достигли ничего
+    _st2.record_enrichment([{"key": _k1, "capabilities": "",
+                             "capabilities_replace": _repl,
+                             "capabilities_clear": True}])
+    _st2.record_enrichment([{"key": _k2, "capabilities": "",
+                             "capabilities_replace": _repl,
+                             "capabilities_clear": True}])
+
+    _g1, _g2 = _st2.get_capabilities(_k1), _st2.get_capabilities(_k2)
+    check("Global снят при пустом профиле", "Global" not in _g1, _g1)
+    check("теги скорости уцелели (сервер 1)", _g1 == "speed-slow", _g1)
+    check("старые цели сняты (сервер 2)", "openrouter" not in _g2, _g2)
+    check("теги скорости уцелели (сервер 2)", _g2 == "speed-blocked", _g2)
+
+    # а если флага очистки нет, пустая строка не должна затирать
+    _st2.record_enrichment([{"key": _k1, "capabilities": "",
+                             "capabilities_replace": _repl}])
+    check("без флага очистки профиль не трогается",
+          _st2.get_capabilities(_k1) == "speed-slow",
+          _st2.get_capabilities(_k1))
+
+
 async def test_best_tags() -> None:
     """Отбор «лучших»: лучший по профилю получает дополнительный тег."""
     print("\n--- метки лучших серверов ---")
@@ -1938,6 +1998,7 @@ async def _amain() -> None:
     await test_checkers_share_batch_helpers()
     await test_batch_helpers_actually_run()
     await test_reach_profile_replaces_its_own_tags()
+    await test_reach_empty_profile_clears_stale_tags()
     await test_best_tags()
     await test_urltest_parsing()
     await test_collector_three_states()

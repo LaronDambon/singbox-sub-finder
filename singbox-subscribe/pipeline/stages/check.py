@@ -287,13 +287,17 @@ class CheckStage:
                 speed_down = data.get("speed_down")
                 speed_up = data.get("speed_up")
                 has_speed = any(v is not None for v in (speed_mbps, speed_down, speed_up))
-                if not (outcome.country or outcome.capabilities or has_speed):
+                clearing = bool(outcome.capabilities_clear
+                                and outcome.capabilities_replace)
+                if not (outcome.country or outcome.capabilities or has_speed
+                        or clearing):
                     continue
                 row = {
                     "key": _key_of(line),
                     "country": outcome.country or "",
                     "capabilities": outcome.capabilities or "",
                     "capabilities_replace": list(outcome.capabilities_replace or ()),
+                    "capabilities_clear": clearing,
                 }
                 if has_speed:
                     row["speed_mbps"] = speed_mbps
