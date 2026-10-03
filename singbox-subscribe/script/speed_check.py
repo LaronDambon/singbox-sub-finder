@@ -26,7 +26,7 @@ from pathlib import Path
 
 import requests
 
-from config.settings import setting
+from config.settings import get_settings
 from script.logger_utils import get_project_logger
 from script.proxy_probe import probe_lines
 from script.speed_sources import describe as speed_describe
@@ -314,8 +314,8 @@ def batch_speed_check(
         probe=lambda port, line: probe_server(port, cfg),
         concurrency=cfg.concurrency,
         batch_size=cfg.batch_size,
-        template_path=Path(str(setting("COUNTRYTEST_TEMPLATE"))),
-        config_dir=Path(str(setting("SING_BOX_OUTPUT_DIR"))),
+        template_path=Path(str(get_settings().paths.countrytest_template)),
+        config_dir=Path(str(get_settings().paths.sing_box_output_dir)),
         tag_prefix="speed",
     )
     tiers: dict[str, int] = {}

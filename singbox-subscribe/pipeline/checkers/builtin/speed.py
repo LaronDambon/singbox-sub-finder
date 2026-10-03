@@ -19,7 +19,7 @@
 
 from __future__ import annotations
 
-from config.settings import setting
+from config.settings import get_settings
 from pipeline.checkers.base import CheckContext, CheckOutcome, CheckResult, Checker
 from pipeline.checkers.builtin._runner import run_exclusive
 from pipeline.logging_setup import get_logger
@@ -35,7 +35,7 @@ class SpeedChecker(Checker):
     decides_availability = False
 
     def __init__(self) -> None:
-        self.enabled = bool(setting("SPEED_ENABLED"))
+        self.enabled = bool(get_settings().speed.enabled)
         self.cfg = None
 
     def _make_cfg(self, ctx):
@@ -45,26 +45,26 @@ class SpeedChecker(Checker):
         # Настройки прогона приходят короткими ключами (их задаёт main.py
         # аргументами командной строки), а дефолты — по настоящим именам
         # из .env. Читаем их здесь, в точке использования.
-        default_site_url = setting("SPEED_SITE_URL")
-        default_sources = setting("SPEED_SOURCES")
+        default_site_url = get_settings().speed.site_url
+        default_sources = get_settings().speed.sources
         # Поля SpeedConfig обязаны совпадать с её сигнатурой: у замера
         # скорости их набор менялся вместе с переходом на несколько
         # источников, и чекер обязан идти следом.
         return SpeedConfig(
             site_url=str(s.get("site_url", default_site_url) or default_site_url),
             sources=str(s.get("sources", default_sources) or ""),
-            probe_bytes=int(s.get("probe_bytes", setting("SPEED_PROBE_BYTES"))),
-            upload_bytes=int(s.get("upload_bytes", setting("SPEED_UPLOAD_BYTES"))),
-            min_sources=int(s.get("min_sources", setting("SPEED_MIN_SOURCES"))),
-            read_seconds=float(s.get("read_seconds", setting("SPEED_READ_SECONDS"))),
-            min_mbps=float(s.get("min_mbps", setting("SPEED_MIN_MBPS"))),
-            good_mbps=float(s.get("good_mbps", setting("SPEED_GOOD_MBPS"))),
-            concurrency=int(s.get("concurrency", setting("SPEED_CONCURRENCY"))),
+            probe_bytes=int(s.get("probe_bytes", get_settings().speed.probe_bytes)),
+            upload_bytes=int(s.get("upload_bytes", get_settings().speed.upload_bytes)),
+            min_sources=int(s.get("min_sources", get_settings().speed.min_sources)),
+            read_seconds=float(s.get("read_seconds", get_settings().speed.read_seconds)),
+            min_mbps=float(s.get("min_mbps", get_settings().speed.min_mbps)),
+            good_mbps=float(s.get("good_mbps", get_settings().speed.good_mbps)),
+            concurrency=int(s.get("concurrency", get_settings().speed.concurrency)),
             batch_size=int(s.get("batch_size", 40)),
         )
 
     async def setup(self, ctx) -> None:
-        self.enabled = bool(ctx.value("SPEED_ENABLED"))
+        self.enabled = bool(get_settings().speed.enabled)
         if self.enabled:
             self.cfg = self._make_cfg(ctx)
             # Список источников показываем явно: от него зависит, во что
@@ -96,8 +96,8 @@ class SpeedChecker(Checker):
         # Под замком запуска sing-box: транспорт пишет общий временный конфиг.
         results = await run_exclusive(batch_speed_check, sorted(lines), cfg=cfg)
 
-        tiers = dict(setting("SPEED_TIER_TAGS") or {})
-        tag_prefix = setting("SPEED_TAG_PREFIX")
+        tiers = dict(get_settings().speed.tier_tags or {})
+        tag_prefix = get_settings().speed.tag_prefix
         outcomes: dict[str, CheckOutcome] = {}
         counts: dict[str, int] = {}
         for line in lines:

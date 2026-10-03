@@ -50,33 +50,33 @@ def default_settings() -> Settings:
     Раньше здесь был from config import env и 25 обращений к константам,
     то есть значения читались на уровне модуля и не поддавались перекрытию.
     """
-    from config.settings import setting
+    from config.settings import get_settings
 
     return Settings(
         # файлы
-        urls_file=setting("URLS_FILE"),
-        merge_file=setting("MERGE_FILE"),
-        whitelist_file=setting("WHITELIST_FILE"),
-        blacklist_file=setting("BLACKLIST_FILE"),
+        urls_file=get_settings().paths.urls_file,
+        merge_file=get_settings().paths.merge_file,
+        whitelist_file=get_settings().paths.whitelist_file,
+        blacklist_file=get_settings().paths.blacklist_file,
         # проверка
-        checkers=setting("PIPELINE_CHECKERS"),
-        batch_size=setting("PIPELINE_BATCH_SIZE"),
-        check_workers=setting("PIPELINE_CHECK_WORKERS"),
-        check_timeout=setting("PIPELINE_CHECK_TIMEOUT"),
-        enrich_timeout=setting("PIPELINE_ENRICH_TIMEOUT"),
-        batch_startup=setting("PIPELINE_BATCH_STARTUP"),
-        max_attempts=setting("PIPELINE_MAX_ATTEMPTS"),
-        max_retries=setting("PIPELINE_MAX_RETRIES"),
-        queue_persist=setting("PIPELINE_QUEUE_PERSIST"),
+        checkers=get_settings().pipeline.checkers,
+        batch_size=get_settings().pipeline.batch_size,
+        check_workers=get_settings().pipeline.check_workers,
+        check_timeout=get_settings().pipeline.check_timeout,
+        enrich_timeout=get_settings().pipeline.enrich_timeout,
+        batch_startup=get_settings().pipeline.batch_startup,
+        max_attempts=get_settings().pipeline.max_attempts,
+        max_retries=get_settings().pipeline.max_retries,
+        queue_persist=get_settings().pipeline.queue_persist,
         # поиск
-        discovery=setting("PIPELINE_DISCOVERY"),
-        discovery_concurrency=setting("PIPELINE_DISCOVERY_CONCURRENCY"),
+        discovery=get_settings().pipeline.discovery,
+        discovery_concurrency=get_settings().pipeline.discovery_concurrency,
         # экспорт
-        export_lists=setting("PIPELINE_EXPORT_LISTS"),
-        write_merge=setting("PIPELINE_WRITE_MERGE"),
+        export_lists=get_settings().pipeline.export_lists,
+        write_merge=get_settings().pipeline.write_merge,
         # sing-box
-        singbox_path=Path(setting("SING_BOX_PATH")),
-        global_tag=setting("REACHABILITY_GLOBAL_TAG"),
+        singbox_path=Path(get_settings().paths.sing_box_path),
+        global_tag=get_settings().reach.global_tag,
     )
 
 
@@ -100,27 +100,6 @@ class PipelineContext:
     def setting(self, name: str, default: Any = None) -> Any:
         value = self.settings.get(name)
         return default if value is None else value
-
-    def value(self, name: str, default: Any = None) -> Any:
-        """Настройка по её настоящему имени, как в .env (SPEED_ENABLED).
-
-        Сначала настройки прогона (их задаёт main.py аргументами командной
-        строки), затем общий объект Settings.
-
-        Зачем это, а не ctx.setting("speed_enabled", SPEED_ENABLED): такая
-        запись повторяла имя настройки дважды — в .env как SPEED_ENABLED и
-        в чекере как speed_enabled. Стоит одному из них измениться, и
-        перекрытие молча перестаёт действовать: чекер тихо берёт значение по
-        умолчанию. Здесь имя называется ровно один раз.
-        """
-        if name in self.settings:
-            return self.settings[name]
-        # Через setting(), а НЕ через getattr(get_settings(), name):
-        # значения больше не лежат плоскими атрибутами, а getattr по имени
-        # из .env возвращал None молча — чекер уходил в int(None).
-        from config.settings import setting
-
-        return setting(name, default)
 
     # ------------------------------------------------------------ помощники
     @staticmethod

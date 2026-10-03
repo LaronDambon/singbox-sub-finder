@@ -4,6 +4,53 @@
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версионирование — [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [2.5.2]
+
+### Changed
+- **Чтение настроек переведено с имён-строк на атрибуты.** 90 настроек
+  разложены по 12 тематическим секциям (paths, core, urltest, sub, country,
+  reach, speed, web, deploy, log, pipeline, services), каждая — замороженный
+  дата-класс. Раньше: setting("SPEED_ENABLED"). Теперь:
+  get_settings().speed.enabled
+  - Имена в .env НЕ изменились: SPEED_ENABLED остаётся SPEED_ENABLED.
+  - Связь «имя поля <-> имя в .env» живёт в одной таблице _LAYOUT в
+    config/settings.py. 87 полей выводятся по префиксу, 3 перечислены явно
+    (PIPELINE_CUSTOM_CHECKERS_DIR, GH_DEPLOY_REPO, пара FLASK_*).
+  - Переведены все 165 мест чтения в 27 модулях. Чтений по строке в проекте
+    не осталось ни одного, и это проверяет тест, а не разовая ревизия.
+- **Опечатка в имени настройки падает вместо тихого None.** Функция
+  setting("ИМЯ") удалена, атрибутный доступ ловит опечатку сам.
+  - Почему это важно. Именно так терялись настройки: поле не попадало в
+    таблицу соответствия, значение None уезжало в сравнение, и ошибка
+    обнаруживалась позже и в другом месте. Так пропал SPEED_TIER_TAGS —
+    модуль speed.py не импортировался при живых зелёных тестах.
+  - ctx.value("ИМЯ") удалён из PipelineContext и CheckContext по той же
+    причине: он искал настройку через getattr(get_settings(), ИМЯ), а после
+    разложения по секциям такого атрибута нет — getattr возвращал None
+    МОЛЧА, и чекеры падали в int(None).
+  - ctx.setting("короткое_имя") остался: это другое, настройки прогона
+    (batch_size, check_workers, discovery). Их перекрывают аргументы командной
+    строки, и живут они в другом пространстве имён.
+
+### Fixed
+- **as_dict() терял 10 настроек.** Словарь ключевался именами полей, а имена
+  полей повторяются между секциями: timeout есть в country/reach/urltest,
+  enabled — в speed/reach/country/deploy. Ключом теперь служит имя из .env,
+  оно уникально; as_dict отдаёт все 90.
+- **checkers/base.py и pipeline/context.py читали настройки неверно** после
+  разложения по секциям: getattr(get_settings(), ИМЯ) давал None молча, и
+  country/reachability падали с «int() argument must be ... not NoneType».
+  Теперь идёт проверяемое чтение.
+
+### Verified
+- Все 90 значений сверены со старой реализацией на реальном .env:
+  расхождений 0 — и по значениям, и по типам.
+- 275/275 тестов (было 266/266).
+- Импортируются все 61 модуль проекта.
+- Работают все точки входа: main.py, pipeline checkers, pipeline status,
+  pipeline serve, script.server_store, deploy_config, gensub_api.
+- python -m pipeline checkers печатает все четыре чекера.
+
 ## [2.5.1]
 
 ### Changed

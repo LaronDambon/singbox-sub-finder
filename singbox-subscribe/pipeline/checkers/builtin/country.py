@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from config.settings import setting
+from config.settings import get_settings
 from pipeline.checkers.base import CheckContext, CheckOutcome, CheckResult, Checker
 from pipeline.checkers.builtin._runner import run_exclusive
 from pipeline.logging_setup import get_logger
@@ -31,14 +31,14 @@ class CountryChecker(Checker):
     def __init__(self) -> None:
         # Значения по умолчанию: setup() ниже перечитывает их из контекста
         # по настоящим именам, но wants()/check() могут быть вызваны и без него.
-        self.enabled = bool(setting("COUNTRY_CHECK_ENABLED"))
-        self.concurrency = int(setting("COUNTRY_CHECK_CONCURRENCY"))
+        self.enabled = bool(get_settings().country.enabled)
+        self.concurrency = int(get_settings().country.concurrency)
         self._known: dict[str, str] = {}
 
     async def setup(self, ctx) -> None:
-        self.enabled = bool(ctx.value("COUNTRY_CHECK_ENABLED"))
+        self.enabled = bool(get_settings().country.enabled)
         self.concurrency = max(1, int(
-            ctx.value("COUNTRY_CHECK_CONCURRENCY")
+            get_settings().country.concurrency
         ))
         # Карта «ключ -> страна» из базы: позволяет не проверять заново то,
         # что уже определено в прошлых циклах.

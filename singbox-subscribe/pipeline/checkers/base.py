@@ -133,27 +133,6 @@ class CheckContext:
         self.db = db
         self.logger = logger or get_logger("checker")
 
-    def value(self, name: str, default: Any = None) -> Any:
-        """Настройка по её НАСТОЯЩЕМУ имени, как в .env.
-
-        Сначала смотрим в настройки прогона (их задаёт main.py аргументами
-        командной строки), затем в общий объект Settings.
-
-        Зачем это, а не ctx.settings.get("speed_enabled", SPEED_ENABLED):
-        такая запись повторяла имя настройки дважды — в .env как
-        SPEED_ENABLED и в чекере как speed_enabled. Стоит одному из них
-        измениться, и перекрытие молча перестаёт действовать: чекер тихо
-        берёт значение по умолчанию. Здесь имя называется ровно один раз.
-        """
-        if name in self.settings:
-            return self.settings[name]
-        # Через setting(), а не getattr(get_settings(), name): значения
-        # лежат в секциях, и getattr по имени из .env возвращал None
-        # МОЛЧА — чекер уходил в int(None) вместо падения на опечатке.
-        from config.settings import setting
-
-        return setting(name, default)
-
     @staticmethod
     async def run_sync(func, *args, **kwargs):
         """Запускает блокирующую функцию в потоке, не блокируя event loop.

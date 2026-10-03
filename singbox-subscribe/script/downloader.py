@@ -16,7 +16,7 @@ from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 
-from config.settings import setting
+from config.settings import get_settings
 from script.logger_utils import get_project_logger
 from utils import tool
 
@@ -343,7 +343,7 @@ def _download_sources_parallel(urls: list[str], download_dir: Path,
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     results: list[dict] = []
-    workers = max(1, min(int(setting("SUB_DOWNLOAD_CONCURRENCY")), len(urls)))
+    workers = max(1, min(int(get_settings().sub.concurrency), len(urls)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(_download_source, idx, url, download_dir): idx
@@ -466,7 +466,7 @@ def build_merge_from_urls(
     # --- Центральная база: регистрируем всё скачанное и собираем пул проверки ---
     from script.server_store import ServerStore
 
-    store = ServerStore(setting("SERVERS_DB_FILE"))
+    store = ServerStore(get_settings().paths.servers_db_file)
 
     source_lines: list[str] = []
     seen_keys: set[str] = set()
@@ -537,8 +537,8 @@ def build_merge_from_urls(
     # Экспорт whitelist.txt — файловая проекция базы: серверы, ПИНГОВАВШИЕСЯ
     # в последней проверке (available=1), для внешних потребителей.
     exported = store.export_whitelist_to_file(
-        setting("WHITELIST_FILE"),
-        global_tag=setting("REACHABILITY_GLOBAL_TAG"),
+        get_settings().paths.whitelist_file,
+        global_tag=get_settings().reach.global_tag,
     )
     logger.info(
         "Экспорт whitelist.txt из базы: %d серверов, пинговавшихся в последней проверке",

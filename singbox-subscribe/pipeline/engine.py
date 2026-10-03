@@ -39,7 +39,7 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
-from config.settings import setting
+from config.settings import get_settings
 from pipeline.checkers import build_checkers
 from pipeline.context import PipelineContext, Settings, default_settings
 from pipeline.database import (
@@ -75,12 +75,12 @@ class Pipeline:
             selection = checkers if isinstance(checkers, str) else ",".join(checkers)
             self.settings["checkers"] = selection
         else:
-            selection = self.settings.get("checkers") or setting("PIPELINE_CHECKERS")
+            selection = self.settings.get("checkers") or get_settings().pipeline.checkers
 
         self.checkers = build_checkers(
-            selection, custom_dir=custom_dir or setting("PIPELINE_CUSTOM_CHECKERS_DIR"),
+            selection, custom_dir=custom_dir or get_settings().paths.custom_checkers_dir,
         )
-        self.db = db or Database(db_path or setting("SERVERS_DB_FILE"))
+        self.db = db or Database(db_path or get_settings().paths.servers_db_file)
         self.ctx = PipelineContext(
             settings=self.settings, db=self.db, checkers=self.checkers, logger=self.logger,
         )
@@ -120,7 +120,7 @@ class Pipeline:
 
         self.report = {"started_at": started, "ok": True, "error": None}
         try:
-            if self.settings.get("queue_persist", setting("PIPELINE_QUEUE_PERSIST")):
+            if self.settings.get("queue_persist", get_settings().pipeline.queue_persist):
                 requeued = await self.db.requeue_stale(
                     statuses=(QUEUE_IN_PROGRESS, QUEUE_FAILED),
                 )
@@ -215,7 +215,7 @@ class Pipeline:
             "checkers": self.checker_names,
             "queue": queue.as_dict(),
             "db": stats,
-            "purge_stable_below": int(setting("PURGE_STABLE_BELOW")),
+            "purge_stable_below": int(get_settings().core.purge_stable_below),
         }
 
     async def fill_queue(self, *, limit: int | None = None) -> int:

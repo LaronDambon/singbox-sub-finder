@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from config.settings import setting
+from config.settings import get_settings
 from pipeline.checkers.base import CheckContext, CheckOutcome, CheckResult, Checker
 from pipeline.checkers.builtin._runner import run_exclusive
 from pipeline.logging_setup import get_logger
@@ -27,9 +27,9 @@ class ReachabilityChecker(Checker):
     decides_availability = False
 
     def __init__(self) -> None:
-        self.enabled = bool(setting("REACHABILITY_ENABLED"))
-        self.min_stable = int(setting("REACHABILITY_MIN_STABLE"))
-        self.global_tag = setting("REACHABILITY_GLOBAL_TAG")
+        self.enabled = bool(get_settings().reach.enabled)
+        self.min_stable = int(get_settings().reach.min_stable)
+        self.global_tag = get_settings().reach.global_tag
         # Порог задержки до цели (TTFB, мс). None = у каждой цели свой
         # max_ping_ms, а где его нет — значение из настроек.
         self.max_ping_ms: int | None = None
@@ -37,15 +37,15 @@ class ReachabilityChecker(Checker):
         self._alive: set[str] = set()
 
     async def setup(self, ctx) -> None:
-        self.enabled = bool(ctx.value("REACHABILITY_ENABLED"))
+        self.enabled = bool(get_settings().reach.enabled)
         self.min_stable = int(
-            ctx.value("REACHABILITY_MIN_STABLE")
+            get_settings().reach.min_stable
         )
-        self.global_tag = ctx.value("REACHABILITY_GLOBAL_TAG")
-        raw_ping = ctx.value("REACHABILITY_MAX_PING_MS")
+        self.global_tag = get_settings().reach.global_tag
+        raw_ping = get_settings().reach.max_ping_ms
         # Нужно дважды ниже — в запасном значении и в тексте сообщения, —
         # поэтому читаем один раз здесь, локально.
-        default_ping = setting("REACHABILITY_MAX_PING_MS")
+        default_ping = get_settings().reach.max_ping_ms
         if raw_ping is None:
             self.max_ping_ms = None
         else:

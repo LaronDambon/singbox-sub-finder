@@ -39,7 +39,7 @@ import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 
-from config.settings import setting
+from config.settings import get_settings
 
 from script.logger_utils import get_project_logger
 
@@ -70,7 +70,7 @@ def load_targets(path: str | Path | None = None) -> list[dict]:
     Каждая цель: {name, tag, url, max_ping_ms, timeout_ms, expected_statuses, headers}
     Пороги по умолчанию подставляются, если не заданы.
     """
-    path = Path(path) if path else Path(str(setting("REACHABILITY_TARGETS_FILE")))
+    path = Path(path) if path else Path(str(get_settings().paths.reachability_targets_file))
     if not path.exists():
         raise FileNotFoundError(f"Файл целевых сайтов не найден: {path}")
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -79,7 +79,7 @@ def load_targets(path: str | Path | None = None) -> list[dict]:
         raise ValueError(f"Неверный формат {path}: ожидается список 'targets'")
     out = []
     # Порог TTFB по умолчанию, если цель не задала max_ping_ms.
-    default_ping = int(setting("REACHABILITY_MAX_PING_MS") or 500)
+    default_ping = int(get_settings().reach.max_ping_ms or 500)
     for t in targets:
         if not isinstance(t, dict):
             continue
@@ -223,7 +223,7 @@ def _start_singbox(config: dict, config_path: Path):
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
-        return subprocess.Popen([str(setting("SING_BOX_PATH")), "run", "-c", str(config_path)], **kwargs)
+        return subprocess.Popen([str(get_settings().paths.sing_box_path), "run", "-c", str(config_path)], **kwargs)
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("Не удалось запустить sing-box: %s", exc)
         return None
@@ -276,16 +276,16 @@ def _probe_target(port: int, target: dict, *, max_ping_ms: int | None = None) ->
     """
     connect_to = PROBE_CONNECT_TIMEOUT
     # Таймаут READ одного целевого запроса, сек (REACHABILITY_TIMEOUT).
-    read_to = float(setting("REACHABILITY_TIMEOUT") or 6.0)
+    read_to = float(get_settings().reach.timeout or 6.0)
     tm = target.get("timeout_ms")
     if tm:
         read_to = max(0.5, tm / 1000.0)
     # Тело ответа нужно только чтобы убедиться, что соединение живое: читаем
     # первые ~64 КБ и обрываем (тот же приём, что _drain в script/speed_check.py).
-    body_max_bytes = int(setting("REACHABILITY_BODY_BYTES") or 65536)
-    body_max_seconds = float(setting("REACHABILITY_BODY_SECONDS") or 2.0)
+    body_max_bytes = int(get_settings().reach.body_bytes or 65536)
+    body_max_seconds = float(get_settings().reach.body_seconds or 2.0)
     # Порог TTFB по умолчанию, если не заданы ни явный порог, ни порог цели.
-    default_ping = int(setting("REACHABILITY_MAX_PING_MS") or 500)
+    default_ping = int(get_settings().reach.max_ping_ms or 500)
     # Явный max_ping_ms (настройка конвейера) важнее порога цели; если его
     # нет — берём max_ping_ms цели, иначе REACHABILITY_MAX_PING_MS.
     threshold = int(max_ping_ms or target.get("max_ping_ms") or default_ping)
@@ -397,7 +397,7 @@ def _run_batch(items: list[tuple[str, int]], results: dict[str, dict],
     for e, p in zip(active, ports):
         e["port"] = p
 
-    config = _build_batch_config(active, ROOT / str(setting("COUNTRYTEST_TEMPLATE")))
+    config = _build_batch_config(active, ROOT / str(get_settings().paths.countrytest_template))
     config_path = ROOT / "source" / "tests" / f"reach_batch_{items[0][1]}_{len(items)}.json"
     proc = _start_singbox(config, config_path)
 
@@ -447,7 +447,7 @@ def _run_batch(items: list[tuple[str, int]], results: dict[str, dict],
         # раз больше настоящей задержки до сайта, и ни один живой сервер не
         # проходит порог. По умолчанию — одна цель за раз на прокси, а
         # параллелизм остаётся между прокси.
-        per_proxy = max(1, int(setting("REACHABILITY_PER_PROXY_CONCURRENCY") or 1))
+        per_proxy = max(1, int(get_settings().reach.per_proxy_concurrency or 1))
         gates = {e["port"]: threading.Semaphore(per_proxy) for e in active}
         jobs = [(line, port, target) for line, port in pairs for target in targets]
         # Потоков нужно ровно столько, сколько одновременных соединений держит
@@ -503,7 +503,7 @@ def batch_reachability_check(proxy_lines: list[str], *,
     ttfb_ms/latency_ms, body_bytes, error}}}}.
     """
     if concurrency is None:
-        concurrency = setting("REACHABILITY_CONCURRENCY")
+        concurrency = get_settings().reach.concurrency
     concurrency = max(1, int(concurrency))
 
     all_targets = targets if targets is not None else load_targets()
@@ -575,7 +575,7 @@ def _log_probe_stats(results: dict[str, dict], targets: list[dict],
             body_bytes += int(entry.get("body_bytes") or 0)
     default_ping = (
         max_ping_ms if max_ping_ms is not None
-        else int(setting("REACHABILITY_MAX_PING_MS") or 500)
+        else int(get_settings().reach.max_ping_ms or 500)
     )
     detail = ", ".join(
         f"{name}={ok_by_target[name]}/{len(results)} (порог "

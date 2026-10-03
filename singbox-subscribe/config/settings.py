@@ -713,36 +713,3 @@ def get_settings() -> Settings:
     if _SETTINGS is None:
         _SETTINGS = Settings.from_env()
     return _SETTINGS
-
-
-def setting(name: str, default: Any = None) -> Any:
-    """Настройка по имени из .env: setting("PIPELINE_BATCH_SIZE").
-
-    ВРЕМЕННЫЙ СПОСОБ. Основной сейчас — атрибутный:
-        get_settings().speed.enabled
-    Он ловит опечатку сам (AttributeError), а этот способ — только
-    проверкой ниже. Функция нужна, пока идёт перевод мест чтения;
-    когда строковых вызовов не останется, она удаляется.
-
-    На неизвестное имя — исключение, а не None. Молчаливый None означал бы,
-    что опечатка в имени уезжает в сравнение и всплывает позже, в другом
-    месте и с другим симптомом. Именно так потерялся SPEED_TIER_TAGS:
-    поля не было в таблице синонимов, и ошибка обнаружилась на живом
-    запуске, а не в тестах.
-    """
-    where = _BY_ENV_NAME.get(name)
-    if where is None:
-        raise KeyError(
-            "нет настройки %r. Похожие: %s. Правильный путь обычно "
-            "виден в config/settings.py в таблице _LAYOUT"
-            % (name, ", ".join(_closest(name)) or "совпадений нет")
-        )
-    section, field = where
-    return getattr(getattr(get_settings(), section), field)
-
-
-def _closest(name: str, limit: int = 3) -> list[str]:
-    """Ближайшие по написанию имена настроек — для подсказки в ошибке."""
-    import difflib
-
-    return difflib.get_close_matches(name, _BY_ENV_NAME, n=limit, cutoff=0.6)

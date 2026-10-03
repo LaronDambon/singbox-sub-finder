@@ -505,7 +505,7 @@ async def test_settings_loading() -> None:
     print("\n--- загрузка настроек ---")
     from config.settings import (
         Settings, get_settings, init_settings, parse_level, read_env_file,
-        setting, _BY_ENV_NAME,
+        _BY_ENV_NAME,
     )
 
     tmp = TMP / "env_for_settings"
@@ -606,31 +606,43 @@ async def test_settings_loading() -> None:
           "перекрытие потерялось: повторный вызов его обнулил")
     init_settings(PIPELINE_BATCH_SIZE=s.urltest.batch_size)
 
-    # Неизвестное имя должно ПАдать. Раньше setting() возвращал None, и
-    # опечатка уезжала в сравнение и всплывала позже, в другом месте.
+    # Опечатка должна ПАДАТЬ. Раньше чтение шло по строке и возвращало None,
+    # и опечатка уезжала в сравнение, всплывая позже и в другом месте.
     # Именно так потерялся SPEED_TIER_TAGS: поля не было в таблице
     # синонимов, и ошибка обнаружилась на живом запуске, а не в тестах.
-    try:
-        setting("SPEED_ENABLE")
-        check("опечатка в имени падает", False, "исключения не было")
-    except KeyError as exc:
-        check("опечатка в имени падает", True)
-        check("в ошибке есть подсказка", "SPEED_ENABLED" in str(exc), str(exc)[:120])
+    # Теперь чтения по строке нет вовсе, а атрибут ловит опечатку сам.
+    for wrong in ("s.speed.enabld", "s.sped.enabled", "s.log.consol_level"):
+        try:
+            eval(wrong)
+            check("опечатка падает: " + wrong, False, "исключения не было")
+        except AttributeError:
+            check("опечатка падает: " + wrong, True)
 
-    # Атрибутный доступ ловит опечатку сам, без всякой проверки строк.
-    try:
-        s.speed.enabld
-        check("опечатка в атрибуте падает сама", False, "исключения не было")
-    except AttributeError:
-        check("опечатка в атрибуте падает сама", True)
+    # Чтения по строке в проекте не осталось ни одного.
+    import re as _re
 
-    # Каждая настройка .env доступна и по секции, и по имени — значения те же.
-    # Сравниваем с s — он собран из файла теста. got получен раньше, ДО
-    # перекрытия PIPELINE_BATCH_SIZE=77, и к этому моменту уже другой.
+    _root = Path(__file__).resolve().parent.parent
+    stale = []
+    for _f in _root.rglob("*.py"):
+        if ".venv" in str(_f):
+            continue
+        _txt = _f.read_text(encoding="utf-8", errors="replace")
+        if _re.search(r'(?:^|[^\w.])setting\("[A-Z0-9_]+"', _txt):
+            stale.append(_f.relative_to(_root).as_posix())
+    check("строковых чтений настроек не осталось", not stale, stale)
+
+    # Каждая настройка из .env доступна по своему пути через секцию, и путь
+    # этот ровно один на настройку.
     _g = get_settings()
-    check("секции и имена дают одно значение",
-          all(setting(n) == getattr(getattr(_g, sec), fld)
-              for n, (sec, fld) in _BY_ENV_NAME.items()), "расхождение секций")
+    check("каждая настройка лежит по своему пути",
+          all(getattr(getattr(_g, sec), fld) is not None
+              for sec, fld in _BY_ENV_NAME.values()),
+          "какое-то поле оказалось None")
+    check("число настроек совпадает с числом путей",
+          len(_BY_ENV_NAME) == 90, len(_BY_ENV_NAME))
+    check("в as_dict все 90", len(_g.as_dict()) == 90, len(_g.as_dict()))
+
+
 
 async def test_best_tags() -> None:
     """Отбор «лучших»: лучший по профилю получает дополнительный тег."""

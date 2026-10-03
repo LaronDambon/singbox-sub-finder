@@ -48,7 +48,7 @@ import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 
-from config.settings import setting
+from config.settings import get_settings
 
 from script.logger_utils import get_project_logger
 
@@ -266,7 +266,7 @@ def _start_singbox(config: dict, config_path: Path):
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
-        return subprocess.Popen([str(setting("SING_BOX_PATH")), "run", "-c", str(config_path)], **kwargs)
+        return subprocess.Popen([str(get_settings().paths.sing_box_path), "run", "-c", str(config_path)], **kwargs)
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("Не удалось запустить sing-box: %s", exc)
         return None
@@ -299,7 +299,7 @@ def _probe_port(port: int) -> dict:
     session.trust_env = False  # игнорировать системные HTTP(S)_PROXY
     last_error = "неизвестная ошибка"
     # Таймаут READ одного geo-запроса, сек (COUNTRY_CHECK_TIMEOUT).
-    read_timeout = float(setting("COUNTRY_CHECK_TIMEOUT") or 6.0)
+    read_timeout = float(get_settings().country.timeout or 6.0)
     for name, url, parser in GEO_PROBES:
         start = time.monotonic()
         try:
@@ -360,7 +360,7 @@ def _run_batch(items: list[tuple[str, int]], results: dict[str, dict],
     for e, p in zip(active, ports):
         e["port"] = p
 
-    config = _build_batch_config(active, ROOT / str(setting("COUNTRYTEST_TEMPLATE")))
+    config = _build_batch_config(active, ROOT / str(get_settings().paths.countrytest_template))
     config_path = ROOT / "source" / "tests" / f"country_batch_{items[0][1]}_{len(items)}.json"
     proc = _start_singbox(config, config_path)
 
@@ -426,7 +426,7 @@ def batch_country_check(proxy_lines: list[str], *, concurrency: int | None = Non
     country, country_code, emoji, server_name, latency_ms, error.
     """
     if concurrency is None:
-        concurrency = setting("COUNTRY_CHECK_CONCURRENCY")
+        concurrency = get_settings().country.concurrency
     concurrency = max(1, int(concurrency))
 
     results: dict[str, dict] = {}

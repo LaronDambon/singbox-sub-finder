@@ -21,7 +21,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from config.settings import setting
+from config.settings import get_settings
 from pipeline.logging_setup import get_logger
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -57,10 +57,10 @@ class ExportStage:
         деплой выключает.
         """
         result: dict = {"purged": 0, "whitelist": 0, "deploy": None}
-        want_deploy = setting("DEPLOY_ENABLED") if deploy is None else bool(deploy)
+        want_deploy = get_settings().deploy.enabled if deploy is None else bool(deploy)
 
         # --- умершие выпадают из ротации ------------------------------------
-        result["purged"] = await db.purge_dead(setting("PURGE_STABLE_BELOW"))
+        result["purged"] = await db.purge_dead(get_settings().core.purge_stable_below)
         LOGGER.info("Из проверки исключено серверов: %d", result["purged"])
 
         # --- whitelist: единственная файловая выгрузка ------------------------
@@ -85,9 +85,9 @@ class ExportStage:
         # Настройки читаются здесь, в точке использования. Константы на
         # уровне модуля вернули бы имя каждой настройки в коде вторым разом —
         # ровно ту связь, которую убирает config.settings.
-        repo = setting("GH_DEPLOY_REPO")
-        path = setting("DEPLOY_PATH")
-        templates = [t for t in setting("DEPLOY_TEMPLATES").replace(",", " ").split() if t]
+        repo = get_settings().deploy.repo
+        path = get_settings().deploy.path
+        templates = [t for t in get_settings().deploy.templates.replace(",", " ").split() if t]
         try:
             if templates:
                 LOGGER.info("Деплой (мульти): repo=%s templates=%s", repo, templates)
@@ -95,7 +95,7 @@ class ExportStage:
                     repo=repo, templates=templates, path=path, silent=True,
                 )
             else:
-                template = setting("DEPLOY_TEMPLATE")
+                template = get_settings().deploy.template
                 LOGGER.info("Деплой: repo=%s template=%s", repo, template)
                 res = deploy(
                     repo=repo, template=template,

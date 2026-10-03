@@ -8,7 +8,7 @@ UTILS = ROOT / "utils"
 
 from flask import Flask, jsonify, request, render_template_string
 
-from config.settings import setting
+from config.settings import get_settings
 from functools import lru_cache
 
 from script.server_store import ServerStore
@@ -24,7 +24,7 @@ app = Flask(__name__)
 @lru_cache(maxsize=1)
 def _get_store() -> ServerStore:
     """Один экземпляр хранилища на процесс: schema/clamp выполняются однократно."""
-    return ServerStore(setting("SERVERS_DB_FILE"))
+    return ServerStore(get_settings().paths.servers_db_file)
 
 HTML_PAGE = """
 <!doctype html>
@@ -376,7 +376,7 @@ def _load_template_from_payload(payload_template):
             raise ValueError("template is empty")
         return json.loads(payload_template)
     if payload_template is None:
-        template_path = Path(setting("URLTEST_TEMPLATE"))
+        template_path = Path(get_settings().paths.urltest_template)
         if not template_path.exists():
             raise FileNotFoundError(f"Default template not found: {template_path}")
         return json.loads(template_path.read_text(encoding="utf-8"))
@@ -452,13 +452,13 @@ def api_whitelist():
     try:
         store = _get_store()
         lines = store.export_whitelist_lines(
-            global_tag=setting("REACHABILITY_GLOBAL_TAG"),
+            global_tag=get_settings().reach.global_tag,
         )
         if lines:
             return "\n".join(lines), 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception:
         LOGGER.exception("Чтение базы не удалось, отдаю файл whitelist.txt")
-    whitelist_path = Path(setting("WHITELIST_FILE"))
+    whitelist_path = Path(get_settings().paths.whitelist_file)
     if not whitelist_path.exists():
         return jsonify({"error": "Whitelist not found"}), 404
     return whitelist_path.read_text(encoding="utf-8")
@@ -485,7 +485,7 @@ def api_queue():
     from pipeline.database import read_queue_stats
 
     try:
-        return jsonify(read_queue_stats(setting("SERVERS_DB_FILE")).as_dict())
+        return jsonify(read_queue_stats(get_settings().paths.servers_db_file).as_dict())
     except Exception as exc:
         LOGGER.exception("Чтение очереди не удалось")
         return jsonify({"error": str(exc)}), 500
@@ -556,4 +556,4 @@ def gensub():
 
 
 if __name__ == "__main__":
-    app.run(host=setting("FLASK_HOST"), port=setting("FLASK_PORT"), debug=False)
+    app.run(host=get_settings().web.host, port=get_settings().web.port, debug=False)

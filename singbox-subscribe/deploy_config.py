@@ -132,11 +132,11 @@ def _apply_server_filter(uris: list[str], template_dict) -> list[str]:
     flt = build_filter(spec)
     if flt.is_empty:
         return uris
-    from config.settings import setting
+    from config.settings import get_settings
     from script.downloader import normalize_proxy_key
     from script.server_store import ServerStore
 
-    store = ServerStore(setting("SERVERS_DB_FILE"))
+    store = ServerStore(get_settings().paths.servers_db_file)
     records = store.server_records_by_key(uris)
     kept = []
     for uri in uris:
@@ -168,14 +168,14 @@ def _load_source_uris(args) -> list[str]:
 
     # Источник по умолчанию — whitelist центральной базы: серверы,
     # пинговавшиеся в последней проверке (available=1).
-    from config.settings import setting
+    from config.settings import get_settings
     from script.server_store import ServerStore
 
-    store = ServerStore(setting("SERVERS_DB_FILE"))
+    store = ServerStore(get_settings().paths.servers_db_file)
     # export_whitelist_lines добавляет capability-тэги ([name] / [Global]) к строкам
     # на этапе экспорта для генерации итогового конфига.
     lines = store.export_whitelist_lines(
-        global_tag=setting("REACHABILITY_GLOBAL_TAG"), best_top=setting("BEST_TOP"),
+        global_tag=get_settings().reach.global_tag, best_top=get_settings().core.best_top,
     )
     if not lines:
         raise RuntimeError(

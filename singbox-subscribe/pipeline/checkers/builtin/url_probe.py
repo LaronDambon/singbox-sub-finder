@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from config.settings import setting
+from config.settings import get_settings
 from pipeline.checkers.base import CheckContext, CheckOutcome, CheckResult, Checker
 from pipeline.collector import Verdict
 from pipeline.dispatcher import BatchDispatcher, make_dispatcher
@@ -50,10 +50,10 @@ class UrlProbeChecker(Checker):
     def __init__(self) -> None:
         # Значения по умолчанию: setup() ниже перечитывает их из контекста
         # по настоящим именам, но check() может быть вызван и без него.
-        self.batch_size = setting("PIPELINE_BATCH_SIZE")
-        self.timeout = setting("PIPELINE_CHECK_TIMEOUT")
-        self.max_attempts = setting("PIPELINE_MAX_ATTEMPTS")
-        self.urltest = setting("URLTEST_URL")
+        self.batch_size = get_settings().pipeline.batch_size
+        self.timeout = get_settings().pipeline.check_timeout
+        self.max_attempts = get_settings().pipeline.max_attempts
+        self.urltest = get_settings().urltest.url
         self.slots = 1
         self._dispatcher: BatchDispatcher | None = None
 
@@ -64,7 +64,7 @@ class UrlProbeChecker(Checker):
         self.batch_size = int(settings.get("batch_size", self.batch_size))
         self.timeout = float(settings.get("timeout", self.timeout))
         self.max_attempts = int(settings.get("max_attempts", self.max_attempts))
-        self.urltest = ctx.value("URLTEST_URL")
+        self.urltest = get_settings().urltest.url
         # Один батч на вызов check(): параллелизмом занимается диспетчер,
         # когда он сам набирает серверы из базы.
         self.slots = 1

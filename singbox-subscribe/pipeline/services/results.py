@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 
-from config.settings import setting
+from config.settings import get_settings
 from pipeline.logging_setup import get_logger
 from pipeline.services.base import Service
 
@@ -30,7 +30,7 @@ class ResultsService(Service):
         super().__init__(ctx)
         # Пауза между разборами; если очередь пуста, ждём этой же паузы.
         self.interval = (
-            setting("SERVICE_RESULTS_INTERVAL") if interval is None else interval
+            get_settings().services.results_interval if interval is None else interval
         )
         self.limit = limit
         self.applied = 0
@@ -38,7 +38,7 @@ class ResultsService(Service):
         self.dead = 0
 
     async def setup(self) -> None:
-        self.enabled = setting("SERVICE_RESULTS")
+        self.enabled = get_settings().services.results
         if self.enabled:
             LOGGER.info("Запись результатов: каждые %.0f сек", self.interval or 0)
 

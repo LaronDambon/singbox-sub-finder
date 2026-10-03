@@ -19,7 +19,7 @@ import json
 import logging
 import sys
 
-from config.settings import init_settings, setting
+from config.settings import get_settings, init_settings
 from pipeline.logging_setup import get_logger, setup_logging
 
 
@@ -108,7 +108,7 @@ def _cmd_checkers(args) -> int:
         mark = "*" if item["name"] in active else " "
         print(f"{mark}{item['name']:<17} {role:<10} {item['description']}")
     print()
-    print(f"* — включён в PIPELINE_CHECKERS={setting('PIPELINE_CHECKERS')!r}")
+    print(f"* — включён в PIPELINE_CHECKERS={get_settings().pipeline.checkers!r}")
     return 0
 
 
@@ -127,7 +127,7 @@ def _cmd_queue(args) -> int:
     from pipeline.database import Database
 
     async def main():
-        db = Database(args.db or setting("SERVERS_DB_FILE"))
+        db = Database(args.db or get_settings().paths.servers_db_file)
         try:
             stats = await db.queue_stats()
             if args.clear_done:
@@ -144,12 +144,12 @@ def _cmd_queue(args) -> int:
 
 def _cmd_logs(args) -> int:
     # Каталог нужен трижды подряд — читаем один раз, локально.
-    log_dir = setting("LOG_DIR_PATH")
+    log_dir = get_settings().log.dir_path
 
     print(f"Каталог:        {log_dir}")
-    print(f"Уровень:        {logging.getLevelName(setting('LOG_LEVEL'))}")
-    print(f"Ротация:        {setting('LOG_MAX_BYTES')} байт × {setting('LOG_BACKUP_COUNT')} копий")
-    print(f"Очистка:        файлы старше {setting('LOG_RETENTION_DAYS')} дней")
+    print(f"Уровень:        {logging.getLevelName(get_settings().log.level)}")
+    print(f"Ротация:        {get_settings().log.max_bytes} байт × {get_settings().log.backup_count} копий")
+    print(f"Очистка:        файлы старше {get_settings().log.retention_days} дней")
     print()
     total = 0
     if log_dir.is_dir():

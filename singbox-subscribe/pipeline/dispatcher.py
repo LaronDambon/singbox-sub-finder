@@ -359,20 +359,20 @@ def make_dispatcher(
     sink=None,
 ) -> BatchDispatcher:
     """Собирает диспетчер с настройками по умолчанию из конфигурации."""
-    from config.settings import setting
+    from config.settings import get_settings
 
     return BatchDispatcher(
         db,
-        batch_size=batch_size or setting("PIPELINE_BATCH_SIZE"),
+        batch_size=batch_size or get_settings().pipeline.batch_size,
         slots=slots,
-        timeout=timeout or setting("PIPELINE_CHECK_TIMEOUT"),
-        startup=startup or setting("PIPELINE_BATCH_STARTUP"),
-        max_attempts=max_attempts or setting("PIPELINE_MAX_ATTEMPTS"),
-        max_retries=max_retries or setting("PIPELINE_MAX_RETRIES"),
-        singbox_path=Path(setting("SING_BOX_PATH")),
-        template_path=Path(setting("URLTEST_TEMPLATE")),
-        config_dir=Path(setting("SING_BOX_OUTPUT_DIR")),
-        urltest=urltest or setting("URLTEST_URL"),
+        timeout=timeout or get_settings().pipeline.check_timeout,
+        startup=startup or get_settings().pipeline.batch_startup,
+        max_attempts=max_attempts or get_settings().pipeline.max_attempts,
+        max_retries=max_retries or get_settings().pipeline.max_retries,
+        singbox_path=Path(get_settings().paths.sing_box_path),
+        template_path=Path(get_settings().paths.urltest_template),
+        config_dir=Path(get_settings().paths.sing_box_output_dir),
+        urltest=urltest or get_settings().urltest.url,
         sink=sink,
     )
 
