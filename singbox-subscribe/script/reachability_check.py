@@ -43,6 +43,10 @@ from config.settings import get_settings
 
 from script.logger_utils import get_project_logger
 from script.core import reserve_ports
+from script.batch_singbox import (
+    build_batch_config, normalize_key, parse_outbound,
+    ports_ready, start_singbox,
+)
 
 LOGGER = get_project_logger("reachability_check")
 
@@ -105,125 +109,7 @@ _profile_cache: dict[str, dict | None] = {}
 _cache_lock = threading.Lock()
 
 
-def _normalize_key(raw_line: str) -> str:
-    from script.downloader import normalize_proxy_key
-
-    return normalize_proxy_key(raw_line)
-
-
 # --- Разбор прокси и сборка батч-конфига (как в country_check) --------------
-def _parse_outbound(proxy_line: str, index: int, used_tags: set[str]):
-    from script import core
-
-    previous_providers = core.providers
-    try:
-        core.init_parsers()
-        core.providers = {"exclude_protocol": "", "subscribes": []}
-
-        nodes = core.get_nodes(proxy_line)
-        if not nodes:
-            return None, "не удалось распарсить прокси"
-        node = nodes[0]
-        if not isinstance(node, dict):
-            return None, "не удалось распарсить прокси"
-
-        tag = str(node.get("tag") or "").strip() or f"c{index}"
-        base_tag = tag
-        n = 0
-        while tag in used_tags:
-            n += 1
-            tag = f"{base_tag}~{n}"
-        used_tags.add(tag)
-        node["tag"] = tag
-        return node, None
-    except Exception as exc:  # noqa: BLE001
-        return None, f"ошибка разбора: {exc}"
-    finally:
-        core.providers = previous_providers
-
-
-def _build_batch_config(entries: list[dict], template_path: Path) -> dict:
-    base = json.loads(Path(template_path).read_text(encoding="utf-8"))
-
-    inbounds: list[dict] = []
-    outbounds: list[dict] = []
-    endpoints: list[dict] = []
-    rules: list[dict] = []
-
-    for e in entries:
-        inbound_tag = f"cin-{e['index']}"
-        inbounds.append({
-            "tag": inbound_tag,
-            "type": "mixed",
-            "listen": "127.0.0.1",
-            "listen_port": e["port"],
-        })
-        ob = e["outbound"]
-        target_tag = ob["tag"]
-        if ob.get("type") == "wireguard":
-            endpoints.append(ob)
-        else:
-            outbounds.append(ob)
-        rules.append({"inbound": [inbound_tag], "outbound": target_tag})
-
-    outbounds.append({"tag": "direct", "type": "direct"})
-    rules.append({"protocol": "dns", "outbound": "direct"})
-
-    route = {
-        "default_domain_resolver": (base.get("route") or {}).get(
-            "default_domain_resolver", {"server": "dns-google-v4"}
-        ),
-        "auto_detect_interface": True,
-        "final": "direct",
-        "rules": rules,
-    }
-
-    config: dict = {
-        "log": {"level": "error", "timestamp": False},
-        "dns": base.get("dns"),
-        "inbounds": inbounds,
-        "outbounds": outbounds,
-        "route": route,
-    }
-    if endpoints:
-        config["endpoints"] = endpoints
-    return config
-
-
-
-
-def _start_singbox(config: dict, config_path: Path):
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    with config_path.open("w", encoding="utf-8") as fh:
-        json.dump(config, fh, ensure_ascii=False)
-    kwargs = {
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-        "stdin": subprocess.DEVNULL,
-    }
-    if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-    try:
-        return subprocess.Popen([str(get_settings().paths.sing_box_path), "run", "-c", str(config_path)], **kwargs)
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.error("Не удалось запустить sing-box: %s", exc)
-        return None
-
-
-def _ports_ready(ports: list[int], deadline_seconds: float) -> bool:
-    deadline = time.monotonic() + deadline_seconds
-    remaining = set(ports)
-    while time.monotonic() < deadline and remaining:
-        for p in list(remaining):
-            try:
-                with socket.create_connection(("127.0.0.1", p), timeout=0.35):
-                    remaining.discard(p)
-            except OSError:
-                pass
-        if remaining:
-            time.sleep(0.15)
-    return not remaining
-
 # --- Reachability-проба конкретного порта по всем целям ----------------------
 def _drain_body(resp, *, max_bytes: int, max_seconds: float) -> int:
     """Дочитывает первые max_bytes тела и обрывает его. Возвращает число байт.
@@ -364,7 +250,7 @@ def _run_batch(items: list[tuple[str, int]], results: dict[str, dict],
     used_tags: set[str] = set()
     entries: list[dict] = []
     for line, idx in items:
-        outbound, err = _parse_outbound(line, idx, used_tags)
+        outbound, err = parse_outbound(line, idx, used_tags)
         if err:
             results[line] = {"error": err, "targets": {}}
             continue
@@ -378,13 +264,13 @@ def _run_batch(items: list[tuple[str, int]], results: dict[str, dict],
     for e, p in zip(active, ports):
         e["port"] = p
 
-    config = _build_batch_config(active, ROOT / str(get_settings().paths.countrytest_template))
+    config = build_batch_config(active, ROOT / str(get_settings().paths.countrytest_template))
     config_path = ROOT / "source" / "tests" / f"reach_batch_{items[0][1]}_{len(items)}.json"
-    proc = _start_singbox(config, config_path)
+    proc = start_singbox(config, config_path)
 
     started_ok = False
     if proc is not None and proc.poll() is None:
-        started_ok = _ports_ready([e["port"] for e in active], STARTUP_WAIT_SECONDS)
+        started_ok = ports_ready([e["port"] for e in active], STARTUP_WAIT_SECONDS)
 
     if not started_ok:
         if proc is not None:
@@ -501,7 +387,7 @@ def batch_reachability_check(proxy_lines: list[str], *,
             line = str(raw).strip()
             if not line:
                 continue
-            key = _normalize_key(line)
+            key = normalize_key(line)
             if key in _profile_cache:
                 cached = _profile_cache[key]
                 results[line] = dict(cached) if cached else {"error": "кэш запуска", "targets": {}}
@@ -531,7 +417,7 @@ def batch_reachability_check(proxy_lines: list[str], *,
     with _cache_lock:
         for line in pending:
             res = results.get(line)
-            key = _normalize_key(line)
+            key = normalize_key(line)
             if res and res.get("targets"):
                 _profile_cache[key] = dict(res)
 

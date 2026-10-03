@@ -764,6 +764,37 @@ async def test_reserve_ports() -> None:
         _core.find_free_port = _orig
 
 
+async def test_checkers_share_batch_helpers() -> None:
+    """Пять функций батча лежат в script/batch_singbox, а не копией в чекерах.
+
+    Копии разъезжались: правка в одной не доезжала до другой, а тела
+    различались только докстрингами — на глаз это не видно.
+    """
+    import script.country_check as _cc
+    import script.reachability_check as _rc
+
+    _shared = ["normalize_key", "parse_outbound", "build_batch_config",
+               "start_singbox", "ports_ready"]
+
+    _dupes = []
+    for _mod in (_rc, _cc):
+        _left = [n for n in _shared
+                 if hasattr(_mod, n)
+                 and getattr(_mod, n).__module__ == _mod.__name__]
+        if _left:
+            _dupes.append("%s: %s" % (_mod.__name__, _left))
+    check("в чекерах нет своих копий", not _dupes, _dupes)
+
+    _same = [n for n in _shared
+             if getattr(_rc, n) is not getattr(_cc, n)]
+    check("оба чекера берут одну и ту же функцию", not _same, _same)
+
+    import script.batch_singbox as _bs
+
+    check("общий модуль — источник этих функций",
+          all(getattr(_rc, n).__module__ == "script.batch_singbox" for n in _shared))
+
+
 async def test_best_tags() -> None:
     """Отбор «лучших»: лучший по профилю получает дополнительный тег."""
     print("\n--- метки лучших серверов ---")
@@ -1757,6 +1788,7 @@ async def _amain() -> None:
     test_validate_config_groups()
     await test_settings_loading()
     await test_reserve_ports()
+    await test_checkers_share_batch_helpers()
     await test_best_tags()
     await test_urltest_parsing()
     await test_collector_three_states()
