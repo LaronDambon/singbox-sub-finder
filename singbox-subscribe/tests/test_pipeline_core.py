@@ -1123,6 +1123,52 @@ async def test_multi_deploy_reports_why_it_failed() -> None:
         _sh.rmtree(_dir.parent, ignore_errors=True)
 
 
+def test_capability_tags_do_not_break_url_parsing() -> None:
+    """Метки в конце whitelist-строки не должны ломать разбор ссылки.
+
+    Боевой симптом: на сервере перестал собираться ЛЮБОЙ конфиг,
+    все 7 шаблонов падали одинаково - "не задеплоено шаблонов: 7".
+    Причина - 39 строк из 258 вида
+        vmess://<base64>[openrouter][openai][microsoft][speed-slow]
+    urlparse видел в netloc скобки, принимал их за литерал IPv6 и бросал
+    ValueError("Invalid IPv6 URL"). Одна строка убивала всю сборку.
+
+    Ссылка ниже взята из боевой базы, base64 и метки настоящие.
+    """
+    from script.core import get_nodes, strip_capability_tags
+    from urllib.parse import urlparse
+
+    uri = ("vmess://eyJhZGQiOiAiMTE5LjQ2LjUxLjQ1IiwgImhvc3QiOiAiIiwgImlkIjogIjliNzZiYzMxLTE3YTUtNDQ1NC05MzRhLThkNWZiNjAyY2Q3MCIsICJuZXQiOiAibm9uZSIsICJwYXRoIjogIiIsICJwb3J0IjogIjM3NTE1IiwgInBzIjogIvCfh7nwn4etIDROaWthLTQ5OThmMWNmYTciLCAic2N5IjogImF1dG8iLCAic25pIjogIiIsICJ0ZXN0X25hbWUiOiAiMTExIiwgInRscyI6ICIiLCAidHlwZSI6ICIiLCAidiI6ICIyIn0="
+           "[openrouter][openai][microsoft][speed-slow]")
+
+    try:
+        urlparse(uri)
+        check("исходная строка действительно не разбирается", False,
+              "urlparse не упал - тест не проверяет то, что чиним")
+    except ValueError as exc:
+        check("исходная строка действительно не разбирается",
+              "IPv6" in str(exc), str(exc))
+
+    bare = strip_capability_tags(uri)
+    check("метки срезаны", bare.endswith("=") and "[" not in bare, bare[-40:])
+    try:
+        check("без меток ссылка разбирается", bool(urlparse(bare).scheme))
+    except ValueError as exc:
+        check("без меток ссылка разбирается", False, str(exc))
+
+    nodes = get_nodes(uri)
+    check("get_nodes вернул узел, а не упал", bool(nodes),
+          "узлов: %d" % len(nodes or []))
+
+    # IPv6 в скобках содержит двоеточие и режется быть не должен
+    v6 = "vless://4643976f-85fa-40cf-9e58-ea28b50f253b@[2001:db8::1]:443?type=tcp#A"
+    check("IPv6-адрес не срезан",
+          strip_capability_tags(v6) == v6, strip_capability_tags(v6))
+    v6tag = v6 + "[openai]"
+    check("IPv6 с меткой — адрес цел, метка снята",
+          strip_capability_tags(v6tag) == v6, strip_capability_tags(v6tag))
+
+
 async def test_best_tags() -> None:
     """Отбор «лучших»: лучший по профилю получает дополнительный тег."""
     print("\n--- метки лучших серверов ---")
@@ -2121,6 +2167,7 @@ async def _amain() -> None:
     await test_reach_profile_replaces_its_own_tags()
     await test_reach_empty_profile_clears_stale_tags()
     await test_multi_deploy_reports_why_it_failed()
+    test_capability_tags_do_not_break_url_parsing()
     await test_best_tags()
     await test_urltest_parsing()
     await test_collector_three_states()

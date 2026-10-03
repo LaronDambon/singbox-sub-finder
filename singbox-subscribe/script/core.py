@@ -146,10 +146,34 @@ def nodefilter(nodes, subscribe):
                     nodes.remove(node)
 
 
+# Хвостовые метки возможностей, которые export_whitelist_lines дописывает
+# к строке:  vmess://<base64>[openrouter][openai][speed-slow]
+# urllib такую строку не разбирает: в netloc появляются скобки, и он
+# принимает их за литерал IPv6 -> ValueError("Invalid IPv6 URL").
+_TAG_SUFFIX = re.compile(r"(?:\[[A-Za-z0-9_.\-]+\])+$")
+
+
+def strip_capability_tags(url):
+    """Отбрасывает хвостовые метки вида [openai][speed-slow].
+
+    IPv6-адрес в скобках содержит двоеточие, поэтому под шаблон не попадает
+    и сам адрес остаётся целым. Метки нужны только при отборе серверов,
+    для разбора ссылки они лишние.
+    """
+    return _TAG_SUFFIX.sub("", url or "").strip()
+
+
 def get_nodes(url):
     if url.startswith('sub://'):
         url = tool.b64Decode(url[6:]).decode('utf-8')
-    urlstr = urlparse(url)
+    url = strip_capability_tags(url)
+    try:
+        urlstr = urlparse(url)
+    except ValueError:
+        # Страховка для ссылок, которые не разбираются даже без меток.
+        # Одна негодная ссылка не должна ронять разбор целиком: на боевой
+        # базе из-за одной такой строки не собирался ни один конфиг.
+        return []
     if not urlstr.scheme:
         try:
             content = tool.b64Decode(url).decode('utf-8')

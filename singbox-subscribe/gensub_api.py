@@ -391,17 +391,31 @@ def build_config_from_uris(uris, template):
         core_mod.init_parsers()
 
     nodes = []
+    skipped: list[tuple[str, str]] = []
 
     for raw_uri in uris:
         if not raw_uri or not str(raw_uri).strip():
             continue
         uri = str(raw_uri).strip()
-        parsed_nodes = core_mod.get_nodes(uri)
+        try:
+            parsed_nodes = core_mod.get_nodes(uri)
+        except Exception as exc:  # noqa: BLE001
+            # Одна битая ссылка не должна отменять сборку всего конфига.
+            # Раньше исключение поднималось наружу и деплой 7 шаблонов
+            # подряд падал с одной и той же причиной.
+            skipped.append((uri, str(exc)))
+            continue
         if not parsed_nodes:
             continue
         for node in parsed_nodes:
             if isinstance(node, dict):
                 nodes.append(node)
+
+    if skipped:
+        LOGGER.warning(
+            "Пропущено негодных ссылок: %d из %d", len(skipped), len(uris))
+        for _uri, _why in skipped[:5]:
+            LOGGER.warning("  пропущена %s: %s", _uri[:90], _why[:90])
 
     if not nodes:
         return {
