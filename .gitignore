@@ -21,6 +21,7 @@ singbox-subscribe/source/tests/
 singbox-subscribe/.tmp_tests/
 singbox-subscribe/_bench_tmp/
 _pipeline_test_tmp/
+_pipeline_test_tmp_*
 *.db-wal
 *.db-shm
 *.db-journal

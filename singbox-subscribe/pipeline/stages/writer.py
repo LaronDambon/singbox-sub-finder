@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterable, Sequence
+from typing import TYPE_CHECKING, Sequence
 
 from script.downloader import build_clean_tag, normalize_proxy_key
 from script.server_store import compute_next_state
@@ -111,12 +111,3 @@ def count_results(outcomes: dict[str, CheckOutcome]) -> dict[str, int]:
         else:
             unknown += 1
     return {"ok": ok, "failed": failed, "unknown": unknown}
-
-
-def total_unparsable(results: Iterable[CheckResult]) -> list[str]:
-    """Собирает строки, которые нечем проверять, из всех чекеров батча."""
-    seen: dict[str, None] = {}
-    for result in results:
-        for line in result.unparsable:
-            seen.setdefault(line, None)
-    return list(seen)

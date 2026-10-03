@@ -1,150 +1,12 @@
 import base64
 import json
-import ipaddress
-import pathlib
 import random
 import re
-import socket
 import string
 import urllib.parse
-import urllib.request
-import warnings
 
-import chardet
 import requests
-from cryptography.utils import CryptographyDeprecationWarning
 from pathlib import Path
-
-with warnings.catch_warnings(action="ignore", category=CryptographyDeprecationWarning):
-    import paramiko
-from scp import SCPClient
-
-try:
-    import geoip2.database
-except ImportError:
-    geoip2 = None
-
-ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_GEOIP_DB = ROOT / "geoip" / "GeoLite2-Country.mmdb"
-GEOIP_DOWNLOAD_URLS = [
-    "https://git.io/GeoLite2-Country.mmdb",
-]
-GEOIP_API_ENDPOINTS = [
-    "https://ipmap-api.ripe.net/v1/locate/{ip}/best?client=singbox-sub-finder",
-    #"https://ipwhois.app/json/{ip}",
-    #"https://ip-api.com/json/{ip}?fields=countryCode",
-    #"https://ipapi.co/{ip}/country/",
-]
-_geoip_reader = None
-
-
-def get_geoip_db_path() -> Path | None:
-    if DEFAULT_GEOIP_DB.exists():
-        return DEFAULT_GEOIP_DB
-    return None
-
-
-def download_geoip_db(db_path: Path | str | None = None) -> bool:
-    path = Path(db_path) if db_path else DEFAULT_GEOIP_DB
-    path.parent.mkdir(parents=True, exist_ok=True)
-    for url in GEOIP_DOWNLOAD_URLS:
-        try:
-            request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(request, timeout=30) as response:
-                data = response.read()
-            if data:
-                path.write_bytes(data)
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def ensure_geoip_db(db_path: Path | str | None = None) -> Path | None:
-    existing = get_geoip_db_path()
-    if existing:
-        return existing
-    path = Path(db_path) if db_path else DEFAULT_GEOIP_DB
-    if download_geoip_db(path):
-        return path
-    return None
-
-
-def _load_geoip_reader(db_path: Path | str | None = None, download_if_missing: bool = False):
-    global _geoip_reader
-    if _geoip_reader is not None:
-        return _geoip_reader
-    if geoip2 is None:
-        return None
-    path = Path(db_path) if db_path else get_geoip_db_path()
-    if path is None and download_if_missing:
-        path = ensure_geoip_db(db_path)
-    if path is None or not path.exists():
-        return None
-    try:
-        _geoip_reader = geoip2.database.Reader(str(path))
-        return _geoip_reader
-    except Exception:
-        return None
-
-
-# Кэш определений страны по хосту/IP, чтобы не дёргать внешние API на каждый конфиг.
-# _SENTINEL — маркер "ещё не кэшировано" (т.к. None — тоже валидный результат кэша).
-_SENTINEL = object()
-_country_cache: dict[str, str | None] = {}
-
-
-def _resolve_country_code_by_ip_api(ip_address: str) -> str | None:
-    cached = _country_cache.get(ip_address, _SENTINEL)
-    if cached is not _SENTINEL:
-        return cached
-
-    result: str | None = None
-    for endpoint in GEOIP_API_ENDPOINTS:
-        try:
-            url = endpoint.format(ip=ip_address)
-            request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(request, timeout=5) as response:
-                data = response.read().decode("utf-8", errors="ignore").strip()
-            if not data:
-                continue
-            if endpoint.endswith("/country/"):
-                country_code = data.strip().upper()
-                if len(country_code) == 2:
-                    result = country_code
-                    break
-                continue
-            try:
-                payload = json.loads(data)
-                # RIPE IPmap: {"location": {"countryCodeAlpha2": "JP", ...}}
-                location = payload.get("location") if isinstance(payload, dict) else None
-                if isinstance(location, dict):
-                    cc = location.get("countryCodeAlpha2")
-                    if cc and len(cc) == 2:
-                        result = cc.upper()
-                        break
-                result = payload.get("countryCode") or payload.get("country_code") or payload.get("countrycode")
-                if result:
-                    break
-            except Exception:
-                continue
-        except Exception:
-            continue
-
-    _country_cache[ip_address] = result
-    return result
-
-
-def country_code_to_emoji(country_code: str | None) -> str | None:
-    if not country_code or len(country_code) != 2:
-        return None
-    try:
-        return ''.join(
-            chr(0x1F1E6 + ord(ch.upper()) - ord('A'))
-            for ch in country_code
-        )
-    except Exception:
-        return None
 
 
 def extract_proxy_host(raw_line: str) -> str | None:
@@ -185,49 +47,6 @@ def extract_proxy_host(raw_line: str) -> str | None:
     except Exception:
         return None
 
-
-def get_proxy_country_emoji(raw_line: str, db_path: Path | str | None = None) -> str | None:
-    host = extract_proxy_host(raw_line)
-    if not host:
-        return None
-    if host.startswith('[') and host.endswith(']'):
-        host = host[1:-1]
-    try:
-        ip_obj = ipaddress.ip_address(host)
-    except Exception:
-        return None
-
-    # Используем только онлайн API для определения страны
-    country_code = _resolve_country_code_by_ip_api(str(ip_obj))
-    if country_code:
-        return country_code_to_emoji(country_code)
-    return None
-
-
-def country_cache_stats() -> dict:
-    """Возвращает статистику кэша определений страны (для логирования)."""
-    return {
-        "cached_entries": len(_country_cache),
-        "resolved": sum(1 for v in _country_cache.values() if v),
-        "unresolved": sum(1 for v in _country_cache.values() if not v),
-    }
-
-
-def is_ip(str):
-    try:
-        ipaddress.ip_address(str)
-        return True
-    except Exception:
-        return False
-
-def get_encoding(file):
-    with open(file,'rb') as f:
-        return chardet.detect(f.read())['encoding']
-    
-def saveFile(path,content):
-    file = open(path, mode='w',encoding='utf-8')
-    file.write(content)
-    file.close()
 
 regex_patterns = {
     '🇭🇰': re.compile(r'香港|沪港|呼港|中港|HKT|HKBN|HGC|WTT|CMI|穗港|广港|京港|🇭🇰|HK|Hongkong|Hong Kong|HongKong|HONG KONG'),
@@ -432,6 +251,44 @@ def get_country_from_name(raw_line: str) -> str | None:
             return country_code
     return None
 
+
+def set_country_in_name(raw_line: str, emoji: str) -> str:
+    """Вписывает флаг страны в начало имени прокси, если его там ещё нет.
+
+    Нужно при экспорте: страна определяется ПОЗЖЕ, чем строка уже записана
+    в базу, поэтому в самой строке флага ещё нет — и фильтр по странам её
+    не находит, хотя в колонке country эмодзи лежит.
+
+    Для vmess имя лежит в base64-поле 'ps', у остальных — после '#'.
+    Возвращает исходную строку без изменений, если имя не удалось разобрать.
+    """
+    emoji = (emoji or "").strip()
+    line = (raw_line or "").strip()
+    if not emoji or not line:
+        return line
+    if get_country_from_name(line):
+        return line
+
+    if line.lower().startswith('vmess://'):
+        try:
+            payload = line[8:]
+            payload += (len(payload) % 4) * '='
+            obj = json.loads(base64.b64decode(payload).decode('utf-8', 'ignore'))
+            obj['ps'] = f"{emoji} {str(obj.get('ps') or '').strip()}".strip()
+            blob = base64.b64encode(
+                json.dumps(obj, ensure_ascii=False).encode('utf-8')
+            ).decode('ascii')
+            return 'vmess://' + blob
+        except Exception:
+            return line
+
+    if '#' in line:
+        head, _, name = line.partition('#')
+        return f"{head}#{emoji} {name.strip()}".rstrip()
+
+    return f"{line}#{emoji}"
+
+
 def b64Decode(str):
     str = urllib.parse.unquote(str.strip())
     str += (len(str)%4)*'='
@@ -455,12 +312,6 @@ def noblankLine(data):
                 newdata += '\n'
     return newdata
 
-def firstLine(data):
-    lines = data.splitlines()
-    for line in lines:
-        line = line.strip()
-        if line:
-            return line
 
 def genName(length=8):
     name = ''
@@ -468,8 +319,6 @@ def genName(length=8):
         name += random.choice(string.ascii_letters+string.digits)
     return name
 
-def is_ip(str):
-    return re.search(r'^\d+\.\d+\.\d+\.\d+$',str)
 
 def get_protocol(s):
     try:
@@ -491,33 +340,6 @@ def get_protocol(s):
             m = re.search(r'^(.+?)://', s)
         return m.group(1)
 
-def checkKeywords(keywords,str):
-    if not keywords:
-        return False
-    for keyword in keywords:
-        if str.find(keyword)>-1:
-            return True
-    return False
-
-def filterNodes(nodelist,keywords):
-    newlist = []
-    if not keywords:
-        return nodelist
-    for node in nodelist:
-        if not checkKeywords(keywords,node['name']):
-            newlist.append(node)
-        else:
-            print('Фильтрация имени узла '+node['name'])
-            print('Lọc tên proxy'+node['name'])
-    return newlist
-
-def replaceStr(nodelist,keywords):
-    if not keywords:
-        return nodelist
-    for node in nodelist:
-        for k in keywords:
-            node['name'] = node['name'].replace(k,'').strip()
-    return nodelist
 
 def proDuplicateNodeName(nodes):
     names = []
@@ -531,27 +353,6 @@ def proDuplicateNodeName(nodes):
                 index += 1
             names.append(node['tag'])
 
-def removeNodes(nodelist):
-    newlist = []
-    temp_list=[]
-    i=0
-    for node in nodelist:
-        _node = {'server':node['server'],'port':node['port']}
-        if _node in temp_list:
-            i+=1
-        else:
-            temp_list.append(_node)
-            newlist.append(node)
-    print('Удалено '+str(i)+' повторяющихся узлов')
-    print('Đã xóa các proxy trùng lặp '+str(i))
-    print('Фактически получено '+str(len(newlist))+' узлов')
-    print('Thực tế nhận được '+str(len(newlist))+' proxy')
-    return newlist
-
-def prefixStr(nodelist,prestr):
-    for node in nodelist:
-        node['name'] = prestr+node['name'].strip()
-    return nodelist
 
 def getResponse(url, custom_user_agent=None):
     response = None
@@ -567,33 +368,3 @@ def getResponse(url, custom_user_agent=None):
             return None
     except:
         return None
-    
-class ConfigSSH:
-    server = {'ip':None,'port':22,'user':None,'password':''}
-    def __init__(self,server:dict) -> None:
-        for k in self.server:
-            if k != 'port' and not k in server.keys():
-                return None
-            if k in server.keys():
-                self.server[k] = server[k]
-    def connect(self):
-        ssh = paramiko.SSHClient()
-        ssh.load_system_host_keys()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(hostname=self.server['ip'],port=22, username=self.server['user'], password=self.server['password'])
-        self.ssh = ssh
-
-    def execCMD(self,command:str):
-        stdin, stdout, stderr = self.ssh.exec_command(command) 
-        print(stdout.read().decode('utf-8')) 
-
-    def uploadFile(self,source:str,target:str):
-        scp = SCPClient(self.ssh.get_transport())
-        scp.put(source, recursive=True, remote_path=target)
-
-    def getFile(self,remote:str,local:str):
-        scp = SCPClient(self.ssh.get_transport())
-        scp.get(remote,local)
-
-    def close(self):
-        self.ssh.close()

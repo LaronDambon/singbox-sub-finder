@@ -1,9 +1,8 @@
 import json, os, time, requests, importlib, argparse, yaml, ruamel.yaml
 import re
 import socket
+import sys
 from utils import tool
-import subprocess
-import threading
 import warnings
 from copy import deepcopy
 from datetime import datetime
@@ -14,7 +13,7 @@ from parsers.clash2base64 import clash2v2ray
 
 ROOT = Path(__file__).resolve().parents[1]
 
-from config.env import SING_BOX_PATH, URLTEST_TEMPLATE, CONFIG_TEMPLATE_DIR, SING_BOX_PORT
+from config.env import CONFIG_TEMPLATE_DIR
 from script.logger_utils import get_project_logger
 
 warnings.filterwarnings("ignore", category=requests.packages.urllib3.exceptions.DependencyWarning)
@@ -24,59 +23,6 @@ parsers_mod = {}
 providers = None
 color_code = [31, 32, 33, 34, 35, 36, 91, 92, 93, 94, 95, 96]
 LOGGER = get_project_logger("main")
-
-# single allocated inbound port for this process (to avoid changing ports between runs)
-_ALLOCATED_SINGBOX_PORT: int | None = None
-
-
-def get_inbound_port(template_data: dict | None = None) -> int:
-    """Return a single inbound port to use for sing-box runs.
-
-    Priority:
-      1. ENV `SING_BOX_PORT`
-      2. `config.env.SING_BOX_PORT` if set (>0)
-      3. `listen_port` found in provided template_data (if any)
-      4. allocate a free ephemeral port and cache it for the lifetime of the process
-    """
-    global _ALLOCATED_SINGBOX_PORT
-    if _ALLOCATED_SINGBOX_PORT:
-        return _ALLOCATED_SINGBOX_PORT
-
-    # 1. environment variable
-    try:
-        env_val = os.getenv("SING_BOX_PORT")
-        if env_val:
-            port = int(env_val)
-            if port > 0:
-                _ALLOCATED_SINGBOX_PORT = port
-                return port
-    except Exception:
-        pass
-
-    # 2. config.env
-    try:
-        if isinstance(SING_BOX_PORT, int) and SING_BOX_PORT > 0:
-            _ALLOCATED_SINGBOX_PORT = int(SING_BOX_PORT)
-            return _ALLOCATED_SINGBOX_PORT
-    except Exception:
-        pass
-
-    # 3. template
-    try:
-        if isinstance(template_data, dict):
-            for inbound in template_data.get("inbounds", []):
-                if inbound.get("type") == "mixed" and inbound.get("listen") == "127.0.0.1":
-                    p = inbound.get("listen_port")
-                    if isinstance(p, int) and p > 0:
-                        _ALLOCATED_SINGBOX_PORT = p
-                        return p
-    except Exception:
-        pass
-
-    # 4. allocate once
-    port = find_free_port()
-    _ALLOCATED_SINGBOX_PORT = port
-    return port
 
 
 def loop_color(text):
@@ -305,9 +251,17 @@ def parse_content(content):
 
 
 def get_parser(node):
+    """Возвращает функцию разбора протокола или None.
+
+    providers может быть None: раньше это было причиной обязательного
+    «подкладывания» core.providers перед каждым разбором, а вместе с ним —
+    os.chdir() в шести местах. Сейчас отсутствие настроек просто значит
+    «исключений нет».
+    """
     proto = tool.get_protocol(node)
-    if providers.get('exclude_protocol'):
-        eps = providers['exclude_protocol'].split(',')
+    excluded = (providers or {}).get('exclude_protocol') or ''
+    if excluded:
+        eps = excluded.split(',')
         if len(eps) > 0:
             eps = [protocol.strip() for protocol in eps]
             if 'hy2' in eps:
@@ -707,6 +661,60 @@ def load_template(template_path):
     return load_json(str(template_path))
 
 
+def validate_config_groups(config, *, strict: bool = True) -> list:
+    """Проверяет, что в конфиге нет группы без участников, в которую ведёт маршрут.
+
+    Пустая группа не роняет sing-box при старте: он запускается и молча не
+    выпускает трафик. Раньше это доходило до репозитория — проверка в
+    deploy_config смотрела только «есть ли хоть один настоящий outbound»,
+    и этого хватало. Проверено на реальных данных: группа proxy с
+    include ["Global"] оставалась пустой, потому что ни один сервер не
+    достигает всех целей, а route.final указывал именно на неё.
+
+    Возвращает список описаний пустых групп. При strict=True бросает
+    ConfigError вместо возврата.
+    """
+    groups = {}
+    for ob in config.get("outbounds", []) or []:
+        if not isinstance(ob, dict):
+            continue
+        if ob.get("type") in ("urltest", "selector"):
+            groups[ob.get("tag")] = len(ob.get("outbounds") or [])
+
+    empty = {tag for tag, n in groups.items() if n == 0}
+    if not empty:
+        return []
+
+    route = config.get("route") or {}
+    referenced = set()
+    final = route.get("final")
+    if isinstance(final, str):
+        referenced.add(final)
+    for rule in route.get("rules", []) or []:
+        if not isinstance(rule, dict):
+            continue
+        out = rule.get("outbound")
+        if isinstance(out, str):
+            referenced.add(out)
+        elif isinstance(out, list):
+            referenced.update(o for o in out if isinstance(o, str))
+
+    broken = sorted(referenced & empty)
+    if not broken:
+        return sorted(empty)
+
+    detail = (
+        f"группы без участников, на которые ссылается маршрут: {broken}. "
+        f"Всего пустых групп: {sorted(empty)}. "
+        "Чаще всего причина — фильтр, который отсёк всё (например "
+        "include по тегу capabilities, которого нет ни у одного сервера)."
+    )
+    if strict:
+        raise ValueError("конфиг собрать нельзя: " + detail)
+    print("ВНИМАНИЕ sing-box: " + detail, file=sys.stderr)
+    return sorted(empty)
+
+
 def build_singbox_config_from_nodes(base_template, nodes):
     """Создаёт один sing-box конфиг из списка узлов."""
     config = deepcopy(base_template)
@@ -771,377 +779,3 @@ def find_free_port():
         return sock.getsockname()[1]
 
 
-def fresh_inbound_port() -> int:
-    """Свободный inbound-порт для ОДНОГО запуска sing-box.
-
-    Приоритет: переменная окружения SING_BOX_PORT (если пользователь явно задал
-    фиксированный порт). Иначе — каждый раз выбирается НОВЫЙ эфемерный порт.
-
-    Почему не один порт на весь процесс: если предыдущий sing-box не успел
-    освободить порт (завис после таймаута, остался дочерний процесс), следующий
-    батч с тем же портом упадёт с "bind: address already in use" и целиком
-    потеряет свой батч. Свежий порт на каждый запуск делает батчи независимыми.
-    """
-    try:
-        env_val = os.getenv("SING_BOX_PORT")
-        if env_val:
-            port = int(env_val)
-            if port > 0:
-                return port
-    except Exception:
-        pass
-    return find_free_port()
-
-
-_URLTEST_RESULT_RE = re.compile(r"outbound/urltest\[[^\]]+\]: outbound\s+.+?\s+(available|unavailable)")
-
-
-def _terminate_process_tree(process) -> None:
-    """Достоверно завершает сам sing-box и его дочерние процессы.
-
-    Popen.terminate()/kill() на Windows (TerminateProcess) убивает только сам
-    процесс и НЕ трогает детей — из-за этого после остановленного по таймауту
-    sing-box может остаться жить ещё один экземпляр, который держит inbound-порт.
-    Следующий батч тогда падает с "bind: address already in use" -> return_code=1
-    -> все 100 конфигов батча помечаются как недоступные.
-
-    ВАЖНО: taskkill /F /T не всегда срабатывает (нет прав / sing-box детачится),
-    поэтому после него обязательно резервный process.kill() (убивает сам процесс
-    через дескриптор Popen). Проверяем через poll() и при необходимости повторяем.
-    """
-    if os.name == "nt":
-        try:
-            # taskkill /T /F убивает дерево процессов, включая детей.
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-            )
-        except Exception:  # noqa: BLE001
-            pass
-    # Резервный путь: гарантированно убиваем сам Popen-процесс. На Windows под
-    # песочницей taskkill может быть отклонён — TerminateProcess из handle точно.
-    for _ in range(2):
-        if process.poll() is None:
-            try:
-                process.kill()
-            except Exception:  # noqa: BLE001 — уже мёртв
-                pass
-            try:
-                process.wait(timeout=3)
-            except Exception:  # noqa: BLE001
-                pass
-    # Ещё раз дождаться освобождения ПЕРЕД возвратом (чтобы порт точно освободился).
-    try:
-        process.wait(timeout=3)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def _clean_log_line(line: str) -> str:
-    """Готовит строку вывода sing-box к записи в лог.
-
-    Раньше здесь всё заменялось на ASCII, потому что консольный обработчик был
-    в cp1251 и ронял logging на emoji флагов стран. Теперь консоль UTF-8
-    (см. pipeline.logging_setup._ensure_utf8), поэтому флаги и названия
-    стран остаются читаемыми — убираем только ANSI-цвета и управляющие
-    символы, которые лог ломают.
-    """
-    text = _ANSI_ESCAPE_RE.sub("", line)
-    return "".join(ch for ch in text if ch == "\t" or ch >= " ")
-
-
-def run_singbox_admin(
-    config_path,
-    singbox_path=None,
-    *,
-    expected_debug_count=0,
-    timeout=60.0,
-    debug_mode=True,
-):
-    """Запускает sing-box и завершает его после нужного количества urltest-результатов или по таймауту.
-
-    Завершение отсчитывается по строкам `outbound/urltest ... (available|unavailable)`,
-    а не по любым `DEBUG[`-строкам, чтобы не останавливаться после первых нескольких узлов.
-    Все строки sing-box сохраняются в списке и возвращаются вызывающему для парсинга.
-    """
-    executable = singbox_path or SING_BOX_PATH
-    if not os.path.exists(executable):
-        raise FileNotFoundError(f"Не найден sing-box по пути: {executable}")
-
-    command_line = [executable, "run", "-c", config_path]
-    if debug_mode:
-        LOGGER.debug("Running sing-box command: %s", command_line)
-    kwargs = {
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.STDOUT,
-        "stdin": subprocess.DEVNULL,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "replace",
-        "bufsize": 1,
-    }
-    if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-    try:
-        process = subprocess.Popen(command_line, **kwargs)
-    except OSError as exc:
-        return ([], [f"failed to start sing-box: {exc}"])
-
-    output_lines = []
-    result_count = 0
-
-    def _reader():
-        nonlocal result_count
-        if process.stdout is None:
-            return
-        try:
-            for line in process.stdout:
-                if not line:
-                    continue
-                text = line.rstrip("\n")
-                output_lines.append(text)
-                if _URLTEST_RESULT_RE.search(text):
-                    result_count += 1
-        except Exception:
-            pass
-
-    reader = threading.Thread(target=_reader, daemon=True)
-    reader.start()
-
-    started_at = time.monotonic()
-    deadline = started_at + timeout
-    # Причина выхода из цикла ожидания — отличаем штатное завершение
-    # (собрали достаточно результатов) от аварийного выхода процесса.
-    stopped_by_us = False      # мы сами убили sing-box после получения результатов
-    timed_out = False          # истекло время ожидания
-    while time.monotonic() < deadline:
-        if expected_debug_count > 0 and result_count >= expected_debug_count:
-            stopped_by_us = True
-            break
-        if process.poll() is not None:
-            # Процесс завершился сам (аварийно или раньше времени) ДО сбора
-            # всех результатов — это реальная проблема, не штатная остановка.
-            stopped_by_us = False
-            timed_out = False
-            break
-        time.sleep(0.1)
-    else:
-        timed_out = True
-
-    if process.poll() is None:
-        # sing-box ещё жив: штатный путь — убиваем его, чтобы забрать результаты.
-        _terminate_process_tree(process)
-        stopped_by_us = True
-
-    reader.join(timeout=1)
-    elapsed = time.monotonic() - started_at
-    return_code = process.returncode
-
-    # Штатное завершение: мы сами остановили sing-box после того, как он отдал
-    # все N urltest-результатов. На Windows принудительный kill процесса даёт
-    # return_code=1, но это НЕ ошибка — просто нормальный teardown.
-    graceful = bool(
-        expected_debug_count > 0
-        and result_count >= expected_debug_count
-        and stopped_by_us
-        and timed_out is False
-    )
-
-    # --- Как читать результат этого запуска -------------------------------
-    # sing-box для urltest возвращает ненулевой код почти всегда: он сам
-    # останавливается, когда все outbound'ы отчитались, а на Windows принудительное
-    # завершение дерева процессов всегда даёт код 1. Поэтому сам по себе
-    # return_code ничего не значит — важно, ЕСТЬ ЛИ РЕЗУЛЬТАТЫ.
-    has_results = result_count > 0
-    fatal_lines = [line for line in output_lines if "FATAL" in line or "ERROR[" in line]
-
-    if expected_debug_count > 0 and not has_results:
-        LOGGER.error(
-            "sing-box run returned no urltest results. return_code=%s output_lines=%d timeout=%.2fs expected=%d",
-            return_code,
-            len(output_lines),
-            elapsed,
-            expected_debug_count,
-        )
-
-    # Авария — это когда sing-box упал, НЕ отдав результатов: не смог привязать
-    # порт, не распарсил конфиг, не хватило прав. Таймаут с уже полученными
-    # результатами — штатная ситуация: часть серверов просто не отвечает.
-    crashed = (return_code is not None and return_code != 0) and not graceful and not has_results
-    if crashed:
-        LOGGER.error(
-            "sing-box завершился с кодом %s, результатов нет (captured %d lines):",
-            return_code,
-            len(output_lines),
-        )
-        # Причина сбоя читается в строках FATAL/ERROR самого sing-box.
-        # Весь его вывод сюда не выводим: он состоит в основном из штатных
-        # INFO/DEBUG-строк про сеть и DNS, из-за чего error.log засорялся
-        # сообщениями об обычных вещах.
-        reasons = fatal_lines or output_lines[-3:]
-        for line in reasons[:5]:
-            LOGGER.error("  sing-box: %s", _clean_log_line(line))
-        if len(fatal_lines) > 5:
-            LOGGER.error(
-                "  sing-box: ... ещё %d строк с ошибками (смотрите DEBUG)", len(fatal_lines) - 5,
-            )
-
-    # Полный вывод sing-box — это DEBUG. Он нужен при разборе инцидентов
-    # (LOG_LEVEL=DEBUG), но не должен попадать в обычные логи: там для каждого
-    # мёртвого сервера своя строка, и на большом батче это сотни записей.
-    if has_results:
-        for line in output_lines:
-            LOGGER.debug("sing-box output: %s", _clean_log_line(line))
-    elif fatal_lines:
-        for line in fatal_lines:
-            LOGGER.debug("sing-box output: %s", _clean_log_line(line))
-
-    LOGGER.info(
-        "sing-box run finished: %d/%d urltest results in %.2fs (return_code=%s)%s%s",
-        result_count,
-        expected_debug_count,
-        elapsed,
-        return_code,
-        " [graceful]" if graceful else "",
-        " [таймаут, часть серверов не ответила]" if timed_out and has_results else "",
-    )
-    return (output_lines, [line for line in output_lines if line])
-
-
-def generate_debug_configs_with_singbox(
-    *,
-    threads=1,
-    urltest="",
-    ping_limit=0,
-    template=URLTEST_TEMPLATE,
-    output_dir="source/tests",
-    singbox_path=None,
-    merge_lines=None,
-):
-    global providers
-    """Собирает один merged-config из нескольких строк и запускает sing-box один раз."""
-    if threads <= 0:
-        raise ValueError("threads must be greater than zero")
-    if not urltest:
-        raise ValueError("urltest must not be empty")
-    if ping_limit < 0:
-        raise ValueError("ping_limit must not be negative")
-
-    template_path = ROOT / template
-    output_dir_path = ROOT / output_dir
-    output_dir_path.mkdir(parents=True, exist_ok=True)
-
-    old_cwd = os.getcwd()
-    previous_providers = providers
-    try:
-        os.chdir(ROOT)
-        init_parsers()
-        providers = {"exclude_protocol": "", "subscribes": []}
-
-        LOGGER.info("Loading sing-box template from %s", template_path)
-        template_data = load_template(template_path)
-
-        if merge_lines is None:
-            return {
-                "config_path": "",
-                "command": [],
-                "output": [],
-                "node_count": 0,
-                "unparsable_lines": [],
-            }
-
-        lines = [line.strip() for line in merge_lines if line.strip()]
-        LOGGER.info("Received %d merge lines", len(lines))
-
-        parsed_nodes = []
-        parsed_node_lines = []
-        # Строки, из которых не собрался ни один узел: их нельзя проверить,
-        # вызывающий переводит их в чс (см. ServerStore.blacklist_unparsable).
-        unparsable_lines = []
-        skipped_lines = 0
-        for line_index, line in enumerate(lines, start=1):
-            nodes = get_nodes(line)
-            if not nodes:
-                skipped_lines += 1
-                unparsable_lines.append(line)
-                continue
-            node_index = 0
-            line_used = False
-            for node in nodes:
-                if not isinstance(node, dict):
-                    skipped_lines += 1
-                    continue
-                line_used = True
-                original_tag = node.get("tag")
-                if original_tag:
-                    node_index += 1
-                    numbered_tag = f"{original_tag}#{line_index}"
-                    if node_index > 1:
-                        numbered_tag += f".{node_index}"
-                    node["tag"] = numbered_tag
-                parsed_nodes.append(node)
-                parsed_node_lines.append(line)
-            if not line_used:
-                unparsable_lines.append(line)
-
-        if skipped_lines:
-            LOGGER.info(
-                "Parsed %d/%d lines into nodes (%d lines skipped: unknown/unsupported protocol or empty)",
-                len(parsed_nodes),
-                len(lines),
-                skipped_lines,
-            )
-
-        if not parsed_nodes:
-            return {
-                "config_path": "",
-                "command": [],
-                "output": [],
-                "node_count": 0,
-                "parsed_nodes": [],
-                "parsed_node_lines": [],
-                "unparsable_lines": unparsable_lines,
-            }
-
-        config = build_singbox_config_from_nodes(template_data, parsed_nodes)
-        # Свежий свободный порт на каждый запуск: если предыдущий sing-box
-        # завис и держит старый порт, следующий батч всё равно стартует.
-        inbound_port = fresh_inbound_port()
-        for inbound in config.get("inbounds", []):
-            if inbound.get("type") == "mixed" and inbound.get("listen") == "127.0.0.1":
-                inbound["listen_port"] = inbound_port
-                break
-        filename = "merged_config.json"
-        target_path = output_dir_path / filename
-        with target_path.open("w", encoding="utf-8") as fh:
-            json.dump(config, fh, ensure_ascii=False, indent=2)
-
-        LOGGER.info("Wrote merged config to %s", target_path)
-        LOGGER.info("Starting sing-box with %d nodes", len(parsed_nodes))
-        raw_lines, output_lines = run_singbox_admin(
-            str(target_path),
-            singbox_path=singbox_path,
-            expected_debug_count=len(parsed_nodes),
-            timeout=15.0,
-            debug_mode=bool(os.getenv("SINGBOX_DEBUG", "") or os.getenv("DEBUG", "")),
-        )
-        LOGGER.info("sing-box run completed, captured %d output lines", len(output_lines))
-        return {
-            "config_path": str(target_path),
-            "command": ["sing-box", "run", "-c", str(target_path)],
-            "output": output_lines,
-            "raw_output": raw_lines,
-            "node_count": len(parsed_nodes),
-            "parsed_nodes": parsed_nodes,
-            "parsed_node_lines": parsed_node_lines,
-            "unparsable_lines": unparsable_lines,
-        }
-    finally:
-        os.chdir(old_cwd)
-        providers = previous_providers

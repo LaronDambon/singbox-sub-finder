@@ -105,6 +105,57 @@ def _get_read_token(args) -> str:
 
 
 # --------------------------------------------------------------------------- сбор URI
+def _server_filter_from(template_dict):
+    """Достаёт server_filter из шаблона (None, если его нет).
+
+    Ключ лежит в самом шаблоне рядом с outbounds, поэтому условия отбора
+    хранятся вместе с конфигом, а не в отдельном файле настроек.
+    """
+    if not isinstance(template_dict, dict):
+        return None
+    return template_dict.get("server_filter")
+
+
+def _apply_server_filter(uris: list[str], template_dict) -> list[str]:
+    """Отбирает URI по server_filter из шаблона.
+
+    Фильтр применяется к ЗАПИСЯМ базы (страна, профиль целей, задержка),
+    поэтому строки сначала сопоставляются с базой по ключу. Строки, которых
+    в базе нет, при заданном фильтре отбрасываются: иначе условие
+    «исключить Россию» молча пропускало бы всё, о чём база не знает.
+    """
+    spec = _server_filter_from(template_dict)
+    if not spec:
+        return uris
+    from script.node_filters import build_filter
+
+    flt = build_filter(spec)
+    if flt.is_empty:
+        return uris
+    from config.env import SERVERS_DB_FILE
+    from script.downloader import normalize_proxy_key
+    from script.server_store import ServerStore
+
+    store = ServerStore(SERVERS_DB_FILE)
+    records = store.server_records_by_key(uris)
+    kept = []
+    for uri in uris:
+        rec = records.get(normalize_proxy_key(uri))
+        if rec is not None and flt.matches(rec):
+            kept.append(uri)
+    print(
+        f"Фильтр шаблона ({flt.describe()}): {len(uris)} -> {len(kept)} серверов",
+        file=sys.stderr,
+    )
+    if not kept:
+        raise RuntimeError(
+            "Фильтр server_filter отсёк все серверы. "
+            f"Условие: {flt.describe()}. Скорее всего неверно указана страна "
+            "или тег в capabilities."
+        )
+    return kept
+
+
 def _load_source_uris(args) -> list[str]:
     """Возвращает список server-URI для сборки в зависимости от --source."""
     src = (args.source or "whitelist").lower()
@@ -123,8 +174,10 @@ def _load_source_uris(args) -> list[str]:
     store = ServerStore(SERVERS_DB_FILE)
     # export_whitelist_lines добавляет capability-тэги ([name] / [Global]) к строкам
     # на этапе экспорта для генерации итогового конфига.
-    from config.env import REACHABILITY_GLOBAL_TAG
-    lines = store.export_whitelist_lines(global_tag=REACHABILITY_GLOBAL_TAG)
+    from config.env import BEST_TOP, REACHABILITY_GLOBAL_TAG
+    lines = store.export_whitelist_lines(
+        global_tag=REACHABILITY_GLOBAL_TAG, best_top=BEST_TOP,
+    )
     if not lines:
         raise RuntimeError(
             "В whitelist базы нет серверов (ни один не пинговался в последней проверке). Нечего собирать."
@@ -299,6 +352,12 @@ def _build_config(uris, template_dict) -> dict:
     real = [o for o in outbounds if isinstance(o, dict) and o.get("type") not in ("selector", "urltest", "direct", "block", "dns")]
     if not real:
         raise RuntimeError("После сборки не осталось реальных outbound-узлов (пустой конфиг).")
+    # Проверка «реальные outbound есть» недостаточна: конфиг с живыми
+    # прокси внутри, но с пустой группой в route.final молча не выпускает
+    # наружу ничего. Раньше такой конфиг спокойно уезжал в репозиторий.
+    from script.core import validate_config_groups
+
+    validate_config_groups(config, strict=True)
     return config
 
 
@@ -522,6 +581,7 @@ def deploy(
         template_dict = _apply_server_ip(_resolve_template(a), ip_source)
         if uris is None:
             uris = _load_source_uris(a)
+        uris = _apply_server_filter(uris, template_dict)
         config = _build_config(uris, template_dict)
         payload = json.dumps(config, ensure_ascii=False, indent=2)
 

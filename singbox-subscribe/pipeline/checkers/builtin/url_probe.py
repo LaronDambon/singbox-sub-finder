@@ -34,30 +34,11 @@ from config.env import (
     URLTEST_URL,
 )
 from pipeline.checkers.base import CheckContext, CheckOutcome, CheckResult, Checker
-from pipeline.collector import Verdict, summarize
+from pipeline.collector import Verdict
 from pipeline.dispatcher import BatchDispatcher, make_dispatcher
 from pipeline.logging_setup import get_logger
 
 LOGGER = get_logger("checkers.url_probe")
-
-
-def parse_ping_results(lines) -> dict:
-    """Разбирает готовый вывод sing-box в {tag: ping_ms|None}.
-
-    None означает, что тег отмечен как unavailable: сервер не ответил.
-    Оставлено для совместимости и для разбора инцидентов — сам pipeline
-    разбирает вывод построчно через ``pipeline.collector``.
-    """
-    collector = summarize(list(lines))
-    return {
-        tag: (result.ping_ms if result.verdict is Verdict.ALIVE else None)
-        for tag, result in collector.results.items()
-    }
-
-
-def has_urltest_records(lines) -> bool:
-    """Есть ли в выводе хоть один настоящий результат проверки."""
-    return summarize(list(lines)).result_lines > 0
 
 
 class UrlProbeChecker(Checker):

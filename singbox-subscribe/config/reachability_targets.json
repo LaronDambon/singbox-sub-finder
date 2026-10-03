@@ -1,5 +1,5 @@
 {
-  "comment": "Целевые сайты для профилирования достижимости прокси (reachability check).",
+  "comment": "Целевые сайты для профилирования достижимости прокси (reachability check). Порог max_ping_ms применяется к TTFB — времени до заголовков ответа. Telegram и GitHub отвечают заметно медленнее остальных шести целей: медиана TTFB у них около 2188 мс против примерно 1200 мс у остальных. При пороге 2000 мс они не добирали 9%, и Global (он требует ВСЕХ целей разом) становился недостижим в принципе: telegram проходили 3 сервера из 20, github — 5. После подъёма до 3000 мс — 12 и 15, и Global появился у 9 из 20.",
   "format_version": 1,
   "targets": [
     {
@@ -50,7 +50,7 @@
       "name": "telegram",
       "tag": "telegram",
       "url": "https://api.telegram.org",
-      "max_ping_ms": 2000,
+      "max_ping_ms": 3000,
       "timeout_ms": 6000,
       "expected_statuses": [200, 401, 403, 429],
       "headers": {
@@ -61,7 +61,7 @@
       "name": "github",
       "tag": "github",
       "url": "https://www.github.com",
-      "max_ping_ms": 2000,
+      "max_ping_ms": 3000,
       "timeout_ms": 6000,
       "expected_statuses": [200, 301, 302, 403, 429],
       "headers": {

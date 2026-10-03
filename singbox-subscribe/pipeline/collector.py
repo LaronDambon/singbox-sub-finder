@@ -48,11 +48,18 @@ class Verdict(str, Enum):
 #: Основная строка результата urltest: «...outbound <тег> available (127ms)».
 #:
 #: Тег sing-box печатает НЕОДНИМ словом: он может содержать пробел и эмодзи,
-#: например «🇨🇦 [openproxylist.com] ss-CA#15 unavailable». Поэтому тег ловится
-#: лениво до первого «available/unavailable», а не через \S+.
+#: поэтому тег ловится лениво до первого «available/unavailable».
+#:
+#: Формат задержки менялся вместе с версией sing-box, и это стоило всех пингов
+#: в базе: старые версии печатали «available (414ms)», а 1.14 печатает
+#: «available: 414ms» — через двоеточие, без скобок. Регулярка ждала скобки,
+#: не находила ничего и молча писала ping_ms = NULL. Из-за этого фильтр по
+#: задержке отбирал ноль серверов, хотя задержки на самом деле есть.
+#: Поэтому принимаются оба вида разделителя.
 RESULT_RE = re.compile(
     r"outbound/urltest\[[^\]]+\]:\s*outbound\s+(?P<tag>.+?)\s+"
-    r"(?P<state>available|unavailable)\b(?:\s*\((?P<ping>\d+)\s*ms\))?",
+    r"(?P<state>available|unavailable)\b"
+    r"(?:\s*[:(]\s*(?P<ping>\d+)\s*ms\s*\)?)?",
     re.IGNORECASE,
 )
 

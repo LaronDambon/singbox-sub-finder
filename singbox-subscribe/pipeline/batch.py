@@ -28,6 +28,7 @@ sing-box всё равно один, а свободные параллельн�
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -139,24 +140,50 @@ class BatchClock:
     вернуть молчавших серверов в очередь, чем держать процесс на минутах.
 
     Время складывается из постоянной части — на старт процесса, разбор
-    конфига и DNS — и доли, пропорциональной размеру батча.
+    конфига и DNS — и времени, которое sing-box реально тратит на батч.
+
+    Раньше доля считалась пропорцией размера батча к размеру батча:
+
+        timeout = старт + таймаут * (размер / размер_батча)
+
+    и при размере батча ровно равном размеру батча это давало КОНСТАНТУ
+    (30 секунд) независимо от того, сколько серверов внутри. При батче 100
+    этому нужно 50-134 секунды, поэтому батч физически не мог завершиться,
+    а 40-60% серверов каждый раз возвращались в очередь и проверялись
+    повторно — уже вместе с теми, кто ответил.
+
+    Теперь срок считается по измеренному поведению sing-box 1.14:
+
+        T = 5 с * ceil(N / 10)
+
+    Измерено на конфигах от 5 до 200 outbound-ов: ровно 10 одновременных
+    проб, шаг 5 секунд, параметром не настраивается. Плюс запас
+    base_timeout на «отстающих», которые держат слот дольше своей волны.
     """
+
+    #: Одновременных проб внутри одного процесса sing-box.
+    PROBE_SLOTS = 10
+    #: Секунд на одну волну проб (измерено: шаг устойчиво 5 с).
+    PROBE_STEP = 5.0
+    #: Запас сверх закона. На реальных серверах батч выходит за 5с*N/10
+    #: в 1.08-1.34 раза из-за «отстающих», держащих слот после своей волны;
+    #: чем крупнее батч, тем лучше они гасятся, но и хвост длиннее.
+    HEADROOM = 1.5
 
     def __init__(self, size: int, *, base_timeout: float, batch_size: int,
                  min_timeout: float = 10.0) -> None:
         self.base = base_timeout
-        # Пол не даёт убить батч раньше, чем sing-box вообще что-то сказал.
-        ratio = (size / batch_size) if batch_size else 1.0
-        self.timeout = min_timeout + base_timeout * max(0.0, ratio)
+        waves = math.ceil(max(1, size) / self.PROBE_SLOTS)
+        self.timeout = (
+            min_timeout
+            + base_timeout
+            + self.PROBE_STEP * self.HEADROOM * waves
+        )
         self.started = time.monotonic()
 
     @property
     def remaining(self) -> float:
         return max(0.0, self.timeout - (time.monotonic() - self.started))
-
-    @property
-    def expired(self) -> bool:
-        return self.remaining <= 0.0
 
     @property
     def elapsed(self) -> float:

@@ -38,7 +38,7 @@ import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 from pipeline.logging_setup import get_logger
 
@@ -60,10 +60,11 @@ class CheckOutcome:
     capabilities: str | None = None
     detail: str | None = None
     data: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def decides(self) -> bool:
-        return self.ok is not None
+    #: Префиксы тэгов, которые этот чекер ЗАМЕНЯЕТ, а не дополняет.
+    #: Категория — это «одно из многих»: у сервера может быть ровно одна
+    #: speed-метка, а не все категории, найденные за все прошлые прогоны.
+    #: Пустой набор — обычное дополнение (тэги копятся).
+    capabilities_replace: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -83,14 +84,6 @@ class CheckResult:
     @property
     def lines(self) -> list[str]:
         return list(self.outcomes)
-
-    @property
-    def ok_lines(self) -> list[str]:
-        return [line for line, out in self.outcomes.items() if out.ok is True]
-
-    @property
-    def failed_lines(self) -> list[str]:
-        return [line for line, out in self.outcomes.items() if out.ok is False]
 
     def merge(self, other: "CheckResult") -> "CheckResult":
         """Сливает результат другого чекера в этот (для обогащения)."""
@@ -139,10 +132,6 @@ class CheckContext:
         self.settings = dict(settings or {})
         self.db = db
         self.logger = logger or get_logger("checker")
-
-    def option(self, name: str, default: Any = None) -> Any:
-        """Значение настройки чекера из PIPELINE_CHECKERS-настроек или .env."""
-        return self.settings.get(name, default)
 
     @staticmethod
     async def run_sync(func, *args, **kwargs):
@@ -277,13 +266,3 @@ def discover_checker_files(*directories: Path | str) -> list[Path]:
 def available_lines(ctx: CheckContext, outcomes: dict[str, CheckOutcome]) -> list[str]:
     """Утилита для чекеров-дополнений: строки, признанные живыми."""
     return [line for line in ctx.lines if (outcomes.get(line) or CheckOutcome()).ok is not False]
-
-
-def ensure_iterable(value: Any) -> Iterable[Any]:
-    if value is None:
-        return ()
-    if isinstance(value, (str, bytes)):
-        return (value,)
-    if isinstance(value, Iterable):
-        return value
-    return (value,)

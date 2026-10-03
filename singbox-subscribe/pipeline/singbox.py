@@ -78,14 +78,14 @@ def build_batch_config(lines: list[str], *, tag_prefix: str,
     """
     from script import core as core_mod
 
-    # script.core разбирает ссылки через глобальное состояние: providers
-    # обязателен (иначе get_parser() падает на None.get), а пути к шаблону
-    # и парсерам разрешаются относительно ROOT. Ставим и возвращаем как было.
-    # Блок синхронный, поэтому параллельные батчи не мешают друг другу.
-    old_cwd = os.getcwd()
+    # script.core разбирает ссылки через глобальное состояние providers —
+    # ставим пустой и возвращаем как было. chdir(ROOT) больше НЕ делается:
+    # пути к шаблону и парсерам передаются абсолютными, а разбор строк с
+    # локальной схемой диск не трогает. chdir — это состояние процесса,
+    # и два потока (event loop и executor чекеров), делающие его каждый
+    # на свою строку, могли оставить процесс в чужом каталоге.
     previous_providers = core_mod.providers
     try:
-        os.chdir(core_mod.ROOT)
         core_mod.providers = {"exclude_protocol": "", "subscribes": []}
         core_mod.init_parsers()
         template = core_mod.load_template(template_path)
@@ -129,7 +129,6 @@ def build_batch_config(lines: list[str], *, tag_prefix: str,
         config = core_mod.build_singbox_config_from_nodes(template, nodes)
         return BatchConfig(config=config, tag_to_line=tag_to_line, unparsable=unparsable)
     finally:
-        os.chdir(old_cwd)
         core_mod.providers = previous_providers
 
 
@@ -155,6 +154,43 @@ def classify_failure(fatal_lines: list[str]) -> tuple[BatchOutcome, str]:
         match = _FATAL_LINE_RE.search(first)
         return BatchOutcome.CONFIG_ERROR, (match.group("msg") if match else first)[:200]
     return BatchOutcome.NO_RESULTS, "sing-box не вернул ни одного результата"
+
+
+def _kill_sync(proc) -> None:
+    """Гасит sing-box БЕЗ единого await — единственное, что работает при отмене.
+
+    Когда задачу батча отменяют, event loop может быть в состоянии отмены, и
+    любой await внутри очистки рискует снова бросить CancelledError, так и не
+    дойдя до конца. Поэтому здесь только синхронные вызовы ОС, каждый под
+    подавлением: очистка обязана завершиться целиком.
+
+    Именно этот путь закрывает «Event loop is closed»: процесс убит до того,
+    как цикл событий закроется, поэтому каналы subprocess не остаются
+    висящими на объектах, которые уничтожает интерпретатор.
+    """
+    if proc.returncode is not None:
+        return
+    if os.name == "nt":
+        # terminate() на Windows не трогает дочерние процессы, а они держат
+        # порт и мешают следующему батчу.
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+    # Process.kill() у asyncio.Process синхронный и сам по себе не бросает
+    # CancelledError, но ValueError возможен, если каналы уже закрыты.
+    with contextlib.suppress(ProcessLookupError, OSError, ValueError):
+        proc.kill()
+
+
+def _cancel_tasks(*tasks) -> None:
+    """Просит задачи-помощники завершиться, не дожидаясь их."""
+    for task in tasks:
+        if task is not None and not task.done():
+            task.cancel()
 
 
 async def _terminate(proc) -> None:
@@ -275,20 +311,52 @@ async def run_batch(
     watcher = asyncio.create_task(watch_exit())
     timed_out = False
 
+    # Дальше живут ДВА await-участка: сам запуск батча (ожидание finished) и его
+    # штатная уборка. Отмена задачи может прийти в любой из них, поэтому оба
+    # закрыты одним обработчиком: он глушит sing-box СИНХРОННО и пробрасывает
+    # CancelledError дальше ровно один раз.
     try:
-        await asyncio.wait_for(finished.wait(), timeout=clock.timeout)
-    except asyncio.TimeoutError:
-        timed_out = True
+        try:
+            await asyncio.wait_for(finished.wait(), timeout=clock.timeout)
+        except asyncio.TimeoutError:
+            timed_out = True
 
-    # Убиваем процесс, но НЕ обрываем чтение: всё, что sing-box успел
-    # напечатать до смерти, должно попасть в результат.
-    await _terminate(proc)
-    with contextlib.suppress(Exception):
-        await asyncio.wait_for(finished.wait(), timeout=3)
-    for task in (reader, watcher):
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await task
+        # Убиваем процесс, но НЕ обрываем чтение: всё, что sing-box успел
+        # напечатать до смерти, должно попасть в результат.
+        await _terminate(proc)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(finished.wait(), timeout=3)
+    except asyncio.CancelledError:
+        # Сюда попадает отмена батча: grace-таймаут Supervisor.stop_all, Ctrl+C
+        # или внешний task.cancel(). Штатный путь сюда не доходит.
+        #
+        # Именно этот блок и был источником мусора в конце вывода: отмена
+        # пролетала мимо _terminate, sing-box оставался висеть вместе с
+        # открытыми каналами, и при закрытии цикла событий интерпретатор
+        # печатал «Event loop is closed» и «I/O operation on closed pipe».
+        #
+        # Здесь НИ ОДНОГО await: во время отмены loop может быть в состоянии
+        # отмены, и любой await внутри уборки рискует снова бросить
+        # CancelledError, не дойдя до конца. Только синхронные вызовы ОС.
+        _cancel_tasks(reader, watcher)
+        _kill_sync(proc)
+        _unlink(config_path)
+        raise
+
+    # Штатный путь: дочитываем помощников. gather с return_exceptions=True
+    # возвращает их отмену как результат, поэтому обычный CancelledError
+    # (отменённые нами задачи) наружу не выпускает — в отличие от голого
+    # contextlib.suppress, который глотал бы и настоящую отмену этого батча.
+    _cancel_tasks(reader, watcher)
+    try:
+        await asyncio.gather(reader, watcher, return_exceptions=True)
+    except asyncio.CancelledError:
+        # Отмена пришла ровно на уборке: процесс уже убит, но конфиг и
+        # помощников всё равно нужно прибрать — иначе вернёмся в тот же мусор.
+        _cancel_tasks(reader, watcher)
+        _kill_sync(proc)
+        _unlink(config_path)
+        raise
     _unlink(config_path)
 
     return _finish_report(report, collector, built.tag_to_line, timed_out, clock)

@@ -13,6 +13,12 @@
 Сервер, прошедший проверку до ВСЕХ целевых сайтов, помечается тэгом [Global] —
 такие серверы попадают в общий outbound 'proxy' через фильтры config.
 
+Задержка здесь — это TTFB: время до ЗАГОЛОВКОВ ответа (stream=True), а не
+время выкачивания страницы. Тело обрывается через REACHABILITY_BODY_BYTES.
+Порог — REACHABILITY_MAX_PING_MS (или max_ping_ms цели), и сравнивается
+именно с TTFB: полное время загрузки страницы с порогом пинга не сравнимо
+(openai отвечает 404 за 3.4 с на живом прокси — это нормальный TTFB).
+
 CLI:
   python -m script.reachability_check '<proxy_line>'
   python -m script.reachability_check --targets openrouter,gemini '<proxy_line>'
@@ -38,6 +44,10 @@ from config.env import (
     COUNTRYTEST_TEMPLATE,
     REACHABILITY_TARGETS_FILE,
     REACHABILITY_TIMEOUT,
+    REACHABILITY_MAX_PING_MS,
+    REACHABILITY_BODY_BYTES,
+    REACHABILITY_BODY_SECONDS,
+    REACHABILITY_PER_PROXY_CONCURRENCY,
 )
 
 from script.logger_utils import get_project_logger
@@ -48,6 +58,23 @@ LOGGER = get_project_logger("reachability_check")
 # Таймаут одного целевого запроса: (connect, read), сек.
 PROBE_CONNECT_TIMEOUT = 4.0
 PROBE_READ_TIMEOUT = float(REACHABILITY_TIMEOUT) if REACHABILITY_TIMEOUT else 6.0
+# Порог TTFB по умолчанию, если цель не задала max_ping_ms (config/env.py).
+DEFAULT_MAX_PING_MS = int(REACHABILITY_MAX_PING_MS) if REACHABILITY_MAX_PING_MS else 500
+# Тело ответа нужно только чтобы убедиться, что соединение живое: читаем
+# первые ~64 КБ и обрываем (тот же приём, что _drain в script/speed_check.py).
+PROBE_BODY_MAX_BYTES = int(REACHABILITY_BODY_BYTES) if REACHABILITY_BODY_BYTES else 65536
+PROBE_BODY_MAX_SECONDS = (
+    float(REACHABILITY_BODY_SECONDS) if REACHABILITY_BODY_SECONDS else 2.0
+)
+# Сколько целей одновременно опрашиваем через один и тот же прокси. Каждая проба
+# открывает НОВОЕ соединение с узлом (TCP+TLS внутри sing-box), поэтому при
+# одновременных 8 пробах они стоят в очереди друг за другом и в измеренный TTFB
+# попадает время ожидания в этой очереди: замер в 3-6 раз больше настоящей
+# задержки до сайта, и ни один живой сервер не проходит порог. По умолчанию —
+# одна цель за раз на прокси, параллелизм остаётся между прокси.
+PER_PROXY_CONCURRENCY = max(
+    1, int(REACHABILITY_PER_PROXY_CONCURRENCY) if REACHABILITY_PER_PROXY_CONCURRENCY else 1
+)
 # Ожидание готовности inbound-портов при старте sing-box, сек.
 STARTUP_WAIT_SECONDS = 10.0
 # Максимум inbound'ов (и прокси) в одном процессе sing-box.
@@ -85,7 +112,7 @@ def load_targets(path: str | Path | None = None) -> list[dict]:
             "name": name,
             "tag": str(t.get("tag") or name).strip(),
             "url": url,
-            "max_ping_ms": int(t.get("max_ping_ms") or 500),
+            "max_ping_ms": int(t.get("max_ping_ms") or DEFAULT_MAX_PING_MS),
             "timeout_ms": int(t.get("timeout_ms") or 6000),
             "expected_statuses": list(t.get("expected_statuses") or [200, 204, 301, 302]),
             "headers": dict(t.get("headers") or {"User-Agent": BROWSER_UA}),
@@ -108,10 +135,8 @@ def _normalize_key(raw_line: str) -> str:
 def _parse_outbound(proxy_line: str, index: int, used_tags: set[str]):
     from script import core
 
-    old_cwd = os.getcwd()
     previous_providers = core.providers
     try:
-        os.chdir(ROOT)
         core.init_parsers()
         core.providers = {"exclude_protocol": "", "subscribes": []}
 
@@ -134,7 +159,6 @@ def _parse_outbound(proxy_line: str, index: int, used_tags: set[str]):
     except Exception as exc:  # noqa: BLE001
         return None, f"ошибка разбора: {exc}"
     finally:
-        os.chdir(old_cwd)
         core.providers = previous_providers
 
 
@@ -241,66 +265,58 @@ def _ports_ready(ports: list[int], deadline_seconds: float) -> bool:
     return not remaining
 
 # --- Reachability-проба конкретного порта по всем целям ----------------------
-def _probe_port(port: int, targets: list[dict]) -> dict:
-    """Проверяет доступность целевых сайтов через локальный порт-прокси.
+def _drain_body(resp, *, max_bytes: int, max_seconds: float) -> int:
+    """Дочитывает первые max_bytes тела и обрывает его. Возвращает число байт.
 
-    Возвращает {target_name: {"ok": bool, "status": int|None, "latency_ms": int|None, "error": str|None}}
-    Сервер считается достижившим цель, если запрос завершился (нет connect/read-сбоя)
-    И пинг <= max_ping_ms.
+    Тот же приём, что _drain в script/speed_check.py: тело читается порциями
+    и закрывается на первом же превышении, поэтому страница не уезжает целиком
+    (gemini.google.com один занимал 856 КБ на каждый прокси). Ошибки чтения
+    здесь не важны — TTFB уже измерен по заголовкам.
     """
-    result: dict[str, dict] = {}
-    proxies = {"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"}
-    session = requests.Session()
-    session.trust_env = False  # игнорировать системные HTTP(S)_PROXY
-
-    for t in targets:
-        name = t["name"]
-        connect_to, read_to = PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT
-        tm = t.get("timeout_ms")
-        if tm:
-            read_to = max(0.5, tm / 1000.0)
-        start = time.monotonic()
-        entry = {"ok": False, "status": None, "latency_ms": None, "error": None}
-        try:
-            resp = session.get(
-                t["url"],
-                proxies=proxies,
-                timeout=(connect_to, read_to),
-                headers=t.get("headers") or {"User-Agent": BROWSER_UA},
-                allow_redirects=True,
-            )
-            elapsed = round((time.monotonic() - start) * 1000.0, 1)
-            entry["status"] = resp.status_code
-            entry["latency_ms"] = elapsed
-            # "дозвонился" = завершил прокси-запрос с любым HTTP-статусом
-            # (в т.ч. 403/429 — это отказ ПОСЛЕ прохода через прокси, прокси жив).
-            # Считаем ok, если пинг уложился в порог.
-            entry["ok"] = elapsed <= t.get("max_ping_ms", 500)
-        except Exception as exc:  # noqa: BLE001
-            entry["error"] = f"{type(exc).__name__}: {exc}"
-        result[name] = entry
-    return result
+    total = 0
+    started = time.monotonic()
+    try:
+        for chunk in resp.iter_content(16384):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total >= max_bytes or (time.monotonic() - started) >= max_seconds:
+                break
+    except Exception:  # noqa: BLE001 — тело нам не нужно, важны только заголовки
+        pass
+    return total
 
 
+def _probe_target(port: int, target: dict, *, max_ping_ms: int | None = None) -> dict:
+    """Одна проба «прокси -> целевой сайт». Меряет TTFB, а не время загрузки.
 
-def _probe_single(port: int, target: dict) -> tuple[str, dict]:
-    """Одна проба: один прокси — одна цель.
-
-    Раньше все цели обходились последовательно внутри одного прокси, и батч
-    из двух серверов с восемью целями растягивался на 80+ секунд: каждая цель
-    ждала своего connect+read таймаута по очереди. Теперь цели независимы и
-    уходят в общий пул потоков.
+    stream=True отдаёт управление, как только пришли заголовки ответа, — это и
+    есть задержка до целевого сайта. Дальше тело добирается порциями и
+    сразу обрывается. Сравнивается с порогом именно TTFB: время выкачивания
+    страницы к пингу отношения не имеет.
     """
-    name = target["name"]
     connect_to, read_to = PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT
     tm = target.get("timeout_ms")
     if tm:
         read_to = max(0.5, tm / 1000.0)
+    # Явный max_ping_ms (настройка конвейера) важнее порога цели; если его
+    # нет — берём max_ping_ms цели, иначе REACHABILITY_MAX_PING_MS.
+    threshold = int(max_ping_ms or target.get("max_ping_ms") or DEFAULT_MAX_PING_MS)
+
     start = time.monotonic()
-    entry = {"ok": False, "status": None, "latency_ms": None, "error": None}
+    entry = {
+        "ok": False,
+        "status": None,
+        "latency_ms": None,   # синоним ttfb_ms, оставлен для совместимости
+        "ttfb_ms": None,
+        "body_bytes": 0,
+        "max_ping_ms": threshold,
+        "error": None,
+    }
     proxies = {"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"}
     session = requests.Session()
     session.trust_env = False  # игнорировать системные HTTP(S)_PROXY
+    resp = None
     try:
         resp = session.get(
             target["url"],
@@ -308,21 +324,68 @@ def _probe_single(port: int, target: dict) -> tuple[str, dict]:
             timeout=(connect_to, read_to),
             headers=target.get("headers") or {"User-Agent": BROWSER_UA},
             allow_redirects=True,
+            stream=True,
         )
-        elapsed = round((time.monotonic() - start) * 1000.0, 1)
+        # Заголовки получены — это и есть TTFB (включая редиректы).
+        ttfb_ms = round((time.monotonic() - start) * 1000.0, 1)
         entry["status"] = resp.status_code
-        entry["latency_ms"] = elapsed
-        entry["ok"] = elapsed <= target.get("max_ping_ms", 500)
+        entry["ttfb_ms"] = ttfb_ms
+        entry["latency_ms"] = ttfb_ms
+        entry["body_bytes"] = _drain_body(
+            resp,
+            max_bytes=PROBE_BODY_MAX_BYTES,
+            max_seconds=min(PROBE_BODY_MAX_SECONDS, read_to),
+        )
+        # "дозвонился" = получил любой HTTP-статус (в т.ч. 403/429/404 — это
+        # отказ ПОСЛЕ прохода через прокси, сам прокси жив) И уложился в порог.
+        entry["ok"] = ttfb_ms <= threshold
     except Exception as exc:  # noqa: BLE001
         entry["error"] = f"{type(exc).__name__}: {exc}"
     finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
         session.close()
-    return name, entry
+    return entry
+
+
+def _probe_port(port: int, targets: list[dict], *,
+                max_ping_ms: int | None = None) -> dict:
+    """Проверяет доступность целевых сайтов через локальный порт-прокси.
+
+    Возвращает {target_name: {"ok", "status", "ttfb_ms"/"latency_ms",
+    "body_bytes", "error"}}. Сервер считается достижившим цель, если пришли
+    заголовки ответа (нет connect/read-сбоя) И TTFB <= порога.
+    """
+    return {t["name"]: _probe_target(port, t, max_ping_ms=max_ping_ms) for t in targets}
+
+
+def _probe_single(port: int, target: dict, *,
+                  max_ping_ms: int | None = None,
+                  gate: threading.Semaphore | None = None) -> tuple[str, dict]:
+    """Одна проба: один прокси — одна цель.
+
+    Раньше все цели обходились последовательно внутри одного прокси, и батч
+    из двух серверов с восемью целями растягивался на 80+ секунд: каждая цель
+    ждала своего connect+read таймаута по очереди. Теперь цели независимы и
+    уходят в общий пул потоков.
+
+    gate — семафор на конкретный прокси: не даёт нескольким целям одновременно
+    открывать соединения через один узел, иначе в замер TTFB попадает очередь
+    внутри sing-box (см. PER_PROXY_CONCURRENCY).
+    """
+    if gate is None:
+        return target["name"], _probe_target(port, target, max_ping_ms=max_ping_ms)
+    with gate:
+        return target["name"], _probe_target(port, target, max_ping_ms=max_ping_ms)
 
 
 # --- Батч-исполнение ---------------------------------------------------------
 def _run_batch(items: list[tuple[str, int]], results: dict[str, dict],
-               targets: list[dict], concurrency: int, depth: int = 0) -> None:
+               targets: list[dict], concurrency: int, depth: int = 0,
+               max_ping_ms: int | None = None) -> None:
     """items: [(line, index)] — проверяет батч одним процессом sing-box.
 
     При инфраструктурном сбое старта делит батч пополам (рекурсия).
@@ -372,8 +435,8 @@ def _run_batch(items: list[tuple[str, int]], results: dict[str, dict],
                 "Reach батч из %d прокси не стартовал, делю пополам (%d + %d)",
                 len(items), mid, len(items) - mid,
             )
-            _run_batch(items[:mid], results, targets, concurrency, depth + 1)
-            _run_batch(items[mid:], results, targets, concurrency, depth + 1)
+            _run_batch(items[:mid], results, targets, concurrency, depth + 1, max_ping_ms)
+            _run_batch(items[mid:], results, targets, concurrency, depth + 1, max_ping_ms)
         else:
             for line, _ in items:
                 if line not in results:
@@ -386,14 +449,26 @@ def _run_batch(items: list[tuple[str, int]], results: dict[str, dict],
 
         # Параллелим сразу по двум осям: прокси И цели. Иначе восемь целей
         # шли последовательно и батч из двух серверов занимал больше минуты.
+        # Но через ОДИН прокси цели ждут друг друга (gate): иначе все восемь
+        # соединений встают в очередь внутри sing-box и TTFB выходит в разы
+        # больше настоящей задержки до сайта.
+        gates = {e["port"]: threading.Semaphore(PER_PROXY_CONCURRENCY) for e in active}
         jobs = [(line, port, target) for line, port in pairs for target in targets]
-        workers = max(1, min(concurrency * len(targets), len(jobs)))
+        # Потоков нужно ровно столько, сколько одновременных соединений держит
+        # sing-box: по одному на прокси (или PER_PROXY_CONCURRENCY на прокси).
+        # Больше не нужно: остальное всё равно упрётся в gate своего прокси.
+        workers = max(1, min(
+            len(jobs), max(concurrency, len(pairs) * PER_PROXY_CONCURRENCY)
+        ))
         lock = threading.Lock()
         for line, _ in pairs:
             results.setdefault(line, {"error": None, "targets": {}})
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
-                pool.submit(_probe_single, port, target): (line, target["name"])
+                pool.submit(
+                    _probe_single, port, target,
+                    max_ping_ms=max_ping_ms, gate=gates.get(port),
+                ): (line, target["name"])
                 for line, port, target in jobs
             }
             for fut in as_completed(futures):
@@ -417,13 +492,18 @@ def batch_reachability_check(proxy_lines: list[str], *,
                              concurrency: int | None = None,
                              batch_size: int = MAX_BATCH_INBOUNDS,
                              targets: list[dict] | None = None,
-                             target_names: list[str] | None = None) -> dict[str, dict]:
+                             target_names: list[str] | None = None,
+                             max_ping_ms: int | None = None) -> dict[str, dict]:
     """Проверяет доступность до целевых сайтов для списка прокси.
 
     targets — список целей; если None (или пусто), берётся список из
     config/reachability_targets.json. target_names — фильтр по именам.
+    max_ping_ms — порог TTFB в мс: None = у каждой цели свой max_ping_ms,
+    а где его нет — REACHABILITY_MAX_PING_MS из config/env.py; число = жёсткое
+    переопределение порога для всех целей.
 
-    Возвращает {proxy_line: {"error": str|None, "targets": {name: {ok,status,latency_ms,error}}}}.
+    Возвращает {proxy_line: {"error": str|None, "targets": {name: {ok, status,
+    ttfb_ms/latency_ms, body_bytes, error}}}}.
     """
     from config.env import REACHABILITY_CONCURRENCY
 
@@ -465,11 +545,12 @@ def batch_reachability_check(proxy_lines: list[str], *,
             bi + 1, total_batches, len(chunk), len(all_targets), concurrency,
         )
         batch_started = time.monotonic()
-        _run_batch(chunk, results, all_targets, concurrency)
+        _run_batch(chunk, results, all_targets, concurrency, 0, max_ping_ms)
         LOGGER.info(
             "Reach batch %d/%d завершён за %.2fs", bi + 1, total_batches,
             time.monotonic() - batch_started,
         )
+    _log_probe_stats(results, all_targets, max_ping_ms)
 
     with _cache_lock:
         for line in pending:
@@ -481,11 +562,47 @@ def batch_reachability_check(proxy_lines: list[str], *,
     return results
 
 
+def _log_probe_stats(results: dict[str, dict], targets: list[dict],
+                     max_ping_ms: int | None = None) -> None:
+    """Итог по пробам: сколько целей пройдено по TTFB и сколько байт скачано.
+
+    Тело обрывается через PROBE_BODY_MAX_BYTES, поэтому трафик на сервер
+    урезан в разы по сравнению с полной выкачкой страниц.
+    """
+    ok_by_target = {t["name"]: 0 for t in targets}
+    body_bytes = 0
+    for res in results.values():
+        for name, entry in (res.get("targets") or {}).items():
+            if name not in ok_by_target:
+                continue
+            if entry.get("ok"):
+                ok_by_target[name] += 1
+            body_bytes += int(entry.get("body_bytes") or 0)
+    default_ping = max_ping_ms if max_ping_ms is not None else DEFAULT_MAX_PING_MS
+    detail = ", ".join(
+        f"{name}={ok_by_target[name]}/{len(results)} (порог "
+        f"{next((t.get('max_ping_ms') for t in targets if t['name'] == name), default_ping)}мс)"
+        for name in ok_by_target
+    )
+    LOGGER.info(
+        "Reach итог: %d/%d серверов с тэгами; тела прочитано %.1f КБ "
+        "(порог по умолчанию %dмс) | %s",
+        sum(1 for r_ in results.values()
+            if r_.get("targets") and any(e.get("ok") for e in r_["targets"].values())),
+        len(results),
+        body_bytes / 1024.0,
+        default_ping,
+        detail,
+    )
+
+
 def check_reachability(proxy_line: str, *, targets: list[dict] | None = None,
-                       target_names: list[str] | None = None) -> dict:
+                       target_names: list[str] | None = None,
+                       max_ping_ms: int | None = None) -> dict:
     """Совместимость: профиль одного прокси (обёртка над батчем из 1)."""
     res_map = batch_reachability_check(
         [proxy_line], targets=targets, target_names=target_names,
+        max_ping_ms=max_ping_ms,
     )
     return res_map.get(proxy_line.strip()) or {"error": "нет результата", "targets": {}}
 
@@ -530,7 +647,15 @@ if __name__ == "__main__":
         print("===== " + (line[:80]) + " =====")
         print(json.dumps(res, ensure_ascii=False, indent=2))
         if res.get("targets") and not res.get("error"):
-            reached = profile_to_tags(load_targets(), res["targets"])
+            all_targets = load_targets()
+            reached = profile_to_tags(all_targets, res["targets"])
             print("Тэги: " + ", ".join(f"[{t}]" for t in reached) or "(нет)")
-            if profile_is_global(load_targets(), res["targets"]):
+            for name, entry in res["targets"].items():
+                print(
+                    f"  {name}: ttfb={entry.get('ttfb_ms')}мс "
+                    f"(порог {entry.get('max_ping_ms')}мс, статус {entry.get('status')}, "
+                    f"тело {entry.get('body_bytes')}Б)"
+                    + (f" ошибка: {entry['error']}" if entry.get("error") else "")
+                )
+            if profile_is_global(all_targets, res["targets"]):
                 print("=> [Global] (достиг всех целей)")

@@ -27,7 +27,6 @@ import asyncio
 from typing import Any, Callable
 
 _lock: asyncio.Lock | None = None
-_runs = 0
 
 
 def get_lock() -> asyncio.Lock:
@@ -48,11 +47,4 @@ async def run_exclusive(func: Callable[..., Any], /, *args, **kwargs) -> Any:
 
     target = partial(func, **kwargs) if kwargs else func
     async with get_lock():
-        global _runs
-        _runs += 1
         return await loop.run_in_executor(None, target, *args)
-
-
-def runs_count() -> int:
-    """Сколько раз что-то запускалось под замком (для тестов и диагностики)."""
-    return _runs

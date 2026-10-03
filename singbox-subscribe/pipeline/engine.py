@@ -46,7 +46,7 @@ from config.env import (
     PURGE_STABLE_BELOW,
     SERVERS_DB_FILE,
 )
-from pipeline.checkers import build_checkers, describe as describe_checkers
+from pipeline.checkers import build_checkers
 from pipeline.context import PipelineContext, Settings, default_settings
 from pipeline.database import (
     QUEUE_FAILED,
@@ -286,18 +286,12 @@ class Pipeline:
             )
         if export and not export.get("skipped"):
             LOGGER.info(
-                "Экспорт: whitelist %d, blacklist %d, merge %d, исключено %d",
-                export.get("whitelist", 0), export.get("blacklist", 0),
-                export.get("merge", 0), export.get("purged", 0),
+                "Экспорт: whitelist %d, исключено %d",
+                export.get("whitelist", 0), export.get("purged", 0),
             )
         LOGGER.info("Итог: %s за %.1fs", "успешно" if report.get("ok") else "с ошибками",
                     report.get("elapsed", 0.0))
         LOGGER.info("=" * 66)
-
-    @staticmethod
-    def available_checkers() -> list[dict]:
-        """Все найденные чекеры (для CLI)."""
-        return describe_checkers()
 
 
 def run_pipeline(

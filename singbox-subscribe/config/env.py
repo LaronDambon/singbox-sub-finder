@@ -84,8 +84,6 @@ WHITELIST_FILE = ROOT / "source" / "whitelist.txt"
 BLACKLIST_FILE = ROOT / "source" / "blacklist.txt"
 # Центральная база всех серверов и их stable (единственный источник правды).
 SERVERS_DB_FILE = ROOT / "source" / "servers.db"
-LOG_DIR = ROOT / "logs"
-LOG_FILE = ROOT / "logs" / "merge.log"
 URLTEST_TEMPLATE = ROOT / "config" / "urltest_template.json"
 COUNTRYTEST_TEMPLATE = ROOT / "config" / "countrytest_template.json"
 REACHABILITY_TARGETS_FILE = ROOT / "config" / "reachability_targets.json"
@@ -131,11 +129,65 @@ REACHABILITY_ENABLED = _bool("REACHABILITY_ENABLED", True)
 REACHABILITY_CONCURRENCY = _int("REACHABILITY_CONCURRENCY", 8)
 REACHABILITY_TIMEOUT = _float("REACHABILITY_TIMEOUT", 6.0)
 # Максимальный пинг до цели (ms) для попадания в capabilities.
+# Это порог TTFB — времени до ЗАГОЛОВКОВ ответа, а не времени скачивания
+# тела (см. script/reachability_check.py). Применяется к целям, у которых
+# max_ping_ms не задан в config/reachability_targets.json.
 REACHABILITY_MAX_PING_MS = _int("REACHABILITY_MAX_PING_MS", 500)
+# Сколько байт тела дочитывать после заголовков. TTFB уже измерен, дальше тело
+# не нужно: без ограничения requests тянул страницу целиком (gemini = 856 КБ
+# на каждый прокси), а «пингом» считался конец загрузки.
+REACHABILITY_BODY_BYTES = _int("REACHABILITY_BODY_BYTES", 64 * 1024)
+# И сколько секунд максимум читать это тело, чтобы медленный хост не висел.
+REACHABILITY_BODY_SECONDS = _float("REACHABILITY_BODY_SECONDS", 2.0)
+# Сколько целей одновременно опрашиваем через ОДИН прокси. Каждая проба — это
+# новое соединение с узлом (TCP+TLS), и если одновременно их 8, они встают в
+# очередь друг за другом ВНУТРИ sing-box: измеренный TTFB растёт в 3-6 раз
+# (5-7 с вместо 0.7-2.5 с) и ни один сервер не проходит порог. Поэтому цели
+# одного прокси идут последовательно, а параллелизм остаётся между прокси.
+REACHABILITY_PER_PROXY_CONCURRENCY = _int("REACHABILITY_PER_PROXY_CONCURRENCY", 1)
 # С какого stable начинать профилировать (ok-серверы ниже не трогаем).
 REACHABILITY_MIN_STABLE = _int("REACHABILITY_MIN_STABLE", 0)
 # Тэг цели, которой помечается сервер, прошедший ВСЕ проверки категории.
 REACHABILITY_GLOBAL_TAG = os.getenv("REACHABILITY_GLOBAL_TAG", "Global")
+
+# --- Метки «лучших» серверов -------------------------------------------------
+# Сколько лучших серверов на каждый профиль достижимости получают дополнительный
+# тег вида [gemini-best] на экспорте. 0 — метки не добавляются.
+# Ранжирование идёт по измеренной скорости, поэтому метки осмысленны только
+# после замера; до него серверы сравниваются по задержке.
+BEST_TOP = _int("BEST_TOP", 0)
+
+# --- Замер скорости прокси ---------------------------------------------------
+# Отдельный чекер-дополнение. Меряет МБ/с на размеро-контролируемой выкачке
+# и заодно проверяет, открывается ли целевой сайт через прокси.
+# Смысл: ping может быть отличным, а скорость никуда. И наоборот — до Gemini
+# пинг есть, а страницу сервер не отдаёт.
+SPEED_ENABLED = _bool("SPEED_ENABLED", True)
+# Сайт для проверки доступа. Gemini режет дата-центровые и VPN-адреса,
+# поэтому это отдельная проверка, а не следствие доступности.
+SPEED_SITE_URL = os.getenv("SPEED_SITE_URL", "https://gemini.google.com/")
+# Источник данных для замера: отдаёт ровно запрошенное число байт.
+SPEED_PROBE_URL = os.getenv("SPEED_PROBE_URL", "https://speed.cloudflare.com/__down")
+SPEED_PROBE_BYTES = _int("SPEED_PROBE_BYTES", 4 * 1024 * 1024)
+# Потолок ЧТЕНИЯ, а не размера: медленный сервер отдаёт своё и уходит.
+SPEED_READ_SECONDS = _float("SPEED_READ_SECONDS", 4.0)
+# Границы категорий: ниже min — slow, от good и выше — fast.
+SPEED_MIN_MBPS = _float("SPEED_MIN_MBPS", 1.0)
+SPEED_GOOD_MBPS = _float("SPEED_GOOD_MBPS", 5.0)
+SPEED_CONCURRENCY = _int("SPEED_CONCURRENCY", 8)
+# Тэги в capabilities (на экспорте станут [speed-fast] и т.п.).
+SPEED_TIER_TAGS = {
+    "fast": os.getenv("SPEED_TAG_FAST", "speed-fast"),
+    "ok": os.getenv("SPEED_TAG_OK", "speed-ok"),
+    "slow": os.getenv("SPEED_TAG_SLOW", "speed-slow"),
+    "blocked": os.getenv("SPEED_TAG_BLOCKED", "speed-blocked"),
+    # Сайт не пускает по СТРАНЕ: сервер жив и быстрый, но в Gemini не войти.
+    "geo": os.getenv("SPEED_TAG_GEO", "speed-geo"),
+}
+# Префикс категории: новая метка ЗАМЕНЯет старую speed-*, а не дописывается
+# к ней. Иначе за несколько прогонов на сервере накапливаются все категории
+# сразу — "[speed-slow][speed-ok]".
+SPEED_TAG_PREFIX = os.getenv("SPEED_TAG_PREFIX", "speed-")
 
 # ------------------------------------------------------------------ Flask --
 FLASK_HOST = os.getenv("FLASK_HOST", "0.0.0.0")
@@ -194,7 +246,7 @@ LOG_CAPTURE_STDOUT = _bool("LOG_CAPTURE_STDOUT", False)
 # Проверяющие алгоритмы через запятую: url_probe,country,reachability.
 # «none» или пусто -> только url_probe.
 PIPELINE_CHECKERS = os.getenv(
-    "PIPELINE_CHECKERS", "url_probe,country,reachability"
+    "PIPELINE_CHECKERS", "url_probe,country,reachability,speed"
 )
 # Этап поиска новых серверов из ссылок (асинхронный, расширяет БД).
 PIPELINE_DISCOVERY = _bool("PIPELINE_DISCOVERY", True)
@@ -226,6 +278,35 @@ PIPELINE_MAX_RETRIES = _int("PIPELINE_MAX_RETRIES", 3)
 # Очередь проверки живёт в БД (check_queue) и переживает перезапуск.
 # PIPELINE_QUEUE_PERSIST=1 -> ставить pending-строки обратно в очередь при старте.
 PIPELINE_QUEUE_PERSIST = _bool("PIPELINE_QUEUE_PERSIST", True)
+
+# --- Службы (режим python -m pipeline serve) -------------------------------
+# Каждая служба крутится своим циклом и общается с остальными через очередь
+# в базе, а не через ожидание. Интервалы в секундах.
+#
+# ВКЛЮЧАЛКИ служб. Раньше каждая читала os.getenv("SERVICE_...") != "0"
+# напрямую мимо этого файла. Чем это было плохо:
+#   * переменные не попадали в .env.example и никак не проверялись;
+#   * "false", "off" и "нет" считались ВКЛЮЧЁННЫМИ — только "0" выключал;
+#   * список включённых служб жил в пяти разных местах.
+# Теперь разбор один и тот же, что у всех остальных настроек (_bool).
+SERVICE_DISCOVERY = _bool("SERVICE_DISCOVERY", True)
+SERVICE_COLLECTOR = _bool("SERVICE_COLLECTOR", True)
+SERVICE_CHECKER = _bool("SERVICE_CHECKER", True)
+SERVICE_RESULTS = _bool("SERVICE_RESULTS", True)
+SERVICE_PUBLISHER = _bool("SERVICE_PUBLISHER", True)
+
+SERVICE_DISCOVERY_INTERVAL = _float("SERVICE_DISCOVERY_INTERVAL", 3600.0)
+# Сборщик батчей ходит в базу чаще: очередь должна пополняться, пока
+# подписки обновляются раз в час.
+SERVICE_COLLECTOR_INTERVAL = _float("SERVICE_COLLECTOR_INTERVAL", 60.0)
+# Служба записи забирает вердикты: пауза меньше, чтобы свежие серверы
+# появлялись в базе сразу после подтверждения.
+SERVICE_RESULTS_INTERVAL = _float("SERVICE_RESULTS_INTERVAL", 2.0)
+# Выгрузка свежих рабочих серверов раз в полчаса.
+SERVICE_PUBLISHER_INTERVAL = _float("SERVICE_PUBLISHER_INTERVAL", 1800.0)
+# Деплой по расписанию выключен: выгрузка обновляет списки, публикация —
+# отдельное решение.
+SERVICE_PUBLISHER_DEPLOY = _bool("SERVICE_PUBLISHER_DEPLOY", False)
 # Папка с ПОЛЬЗОВАТЕЛЬСКИМИ проверяющими алгоритмами (подхватываются автоматически).
 PIPELINE_CUSTOM_CHECKERS_DIR = Path(
     os.getenv("PIPELINE_CUSTOM_CHECKERS_DIR", str(ROOT / "pipeline" / "checkers" / "custom"))

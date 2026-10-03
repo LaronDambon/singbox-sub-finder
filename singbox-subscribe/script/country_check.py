@@ -154,10 +154,8 @@ def _parse_outbound(proxy_line: str, index: int, used_tags: set[str]):
     """
     from script import core
 
-    old_cwd = os.getcwd()
     previous_providers = core.providers
     try:
-        os.chdir(ROOT)
         core.init_parsers()
         core.providers = {"exclude_protocol": "", "subscribes": []}
 
@@ -180,7 +178,6 @@ def _parse_outbound(proxy_line: str, index: int, used_tags: set[str]):
     except Exception as exc:  # noqa: BLE001
         return None, f"ошибка разбора: {exc}"
     finally:
-        os.chdir(old_cwd)
         core.providers = previous_providers
 
 

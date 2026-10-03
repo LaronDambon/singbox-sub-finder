@@ -28,13 +28,10 @@ import importlib.util
 import inspect
 import sys as _sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import Iterable
 
 from pipeline.logging_setup import get_logger
 from pipeline.checkers.base import Checker, discover_checker_files
-
-if TYPE_CHECKING:  # pragma: no cover
-    from pipeline.context import PipelineContext
 
 LOGGER = get_logger("checkers.registry")
 
@@ -43,8 +40,6 @@ DEFAULT_CUSTOM_DIR = Path(__file__).resolve().parent / "custom"
 
 #: Классы-наследники Checker, которые не регистрируются как отдельные алгоритмы.
 _SKIP_NAMES = {"Checker", "FunctionChecker"}
-
-_instances: dict[str, Checker] = {}
 
 
 def _import_module_from_path(path: Path):
@@ -133,8 +128,6 @@ def build(selection: str | None = None, *, custom_dir: str | Path | None = None)
     checkers = build(custom_dir="~/my_checkers")        # + своя папка
     ```
     """
-    global _instances
-
     wanted = _parse_selection(selection)
     available = discover(custom_dir)
 
@@ -161,7 +154,6 @@ def build(selection: str | None = None, *, custom_dir: str | Path | None = None)
             LOGGER.info("Ни один чекер не выбран — используется url_probe по умолчанию")
             chosen = [fallback]
 
-    _instances = {c.name: c for c in chosen}
     return sort_checkers(chosen)
 
 
@@ -178,19 +170,3 @@ def describe(checkers: Iterable[Checker] | None = None) -> list[dict]:
         }
         for c in sort_checkers(items)
     ]
-
-
-async def setup_all(checkers: Iterable[Checker], ctx: "PipelineContext") -> None:
-    for checker in checkers:
-        try:
-            await checker.setup(ctx)
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.error("Подготовка чекера %s не удалась: %s", checker.name, exc)
-
-
-async def teardown_all(checkers: Iterable[Checker]) -> None:
-    for checker in checkers:
-        try:
-            await checker.teardown()
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Завершение чекера %s не удалось: %s", checker.name, exc)

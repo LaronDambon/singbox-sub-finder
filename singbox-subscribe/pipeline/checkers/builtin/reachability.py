@@ -15,6 +15,7 @@ from config.env import (
     REACHABILITY_ENABLED,
     REACHABILITY_GLOBAL_TAG,
     REACHABILITY_MIN_STABLE,
+    REACHABILITY_MAX_PING_MS,
 )
 from pipeline.checkers.base import CheckContext, CheckOutcome, CheckResult, Checker
 from pipeline.checkers.builtin._runner import run_exclusive
@@ -34,6 +35,9 @@ class ReachabilityChecker(Checker):
         self.enabled = bool(REACHABILITY_ENABLED)
         self.min_stable = int(REACHABILITY_MIN_STABLE)
         self.global_tag = REACHABILITY_GLOBAL_TAG
+        # Порог задержки до цели (TTFB, мс). None = у каждой цели свой
+        # max_ping_ms, а где его нет — значение из config/env.py.
+        self.max_ping_ms: int | None = None
         self._targets: list[dict] = []
         self._alive: set[str] = set()
 
@@ -43,6 +47,17 @@ class ReachabilityChecker(Checker):
             ctx.settings.get("reachability_min_stable", REACHABILITY_MIN_STABLE)
         )
         self.global_tag = ctx.settings.get("global_tag", REACHABILITY_GLOBAL_TAG)
+        raw_ping = ctx.settings.get(
+            "reachability_max_ping_ms", ctx.settings.get("max_ping_ms")
+        )
+        if raw_ping is None:
+            self.max_ping_ms = None
+        else:
+            try:
+                self.max_ping_ms = max(1, int(raw_ping))
+            except (TypeError, ValueError):
+                LOGGER.warning("Некорректный порог пинга %r, беру %s", raw_ping, REACHABILITY_MAX_PING_MS)
+                self.max_ping_ms = int(REACHABILITY_MAX_PING_MS) if REACHABILITY_MAX_PING_MS else None
         if not self.enabled:
             return
         from script.reachability_check import load_targets
@@ -54,8 +69,10 @@ class ReachabilityChecker(Checker):
             self._targets = []
         if self._targets:
             LOGGER.info(
-                "Reachability: %d целей, профиль для stable >= %d",
+                "Reachability: %d целей, профиль для stable >= %d, порог TTFB: %s",
                 len(self._targets), self.min_stable,
+                f"{self.max_ping_ms} мс (всем целям)" if self.max_ping_ms
+                else f"{REACHABILITY_MAX_PING_MS} мс по умолчанию, у целей свои",
             )
 
     async def check(self, ctx: CheckContext) -> CheckResult:
@@ -77,6 +94,7 @@ class ReachabilityChecker(Checker):
         # пишет общий временный конфиг — параллельный запуск небезопасен.
         results = await run_exclusive(
             batch_reachability_check, sorted(lines), targets=self._targets,
+            max_ping_ms=self.max_ping_ms,
         )
 
         outcomes: dict[str, CheckOutcome] = {}

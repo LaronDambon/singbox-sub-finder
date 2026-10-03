@@ -62,9 +62,17 @@ class CheckStage:
 
     name = "check"
 
-    def __init__(self, ctx: "PipelineContext", checkers) -> None:
+    def __init__(self, ctx: "PipelineContext", checkers, sink=None) -> None:
         self.ctx = ctx
         self.db: "Database" = ctx.db
+        # Куда уходят посчитанные вердикты. По умолчанию — сразу в базу
+        # (обычный прогон); в режиме служб — в очередь result_queue, и
+        # записью занимается отдельная служба.
+        if sink is None:
+            from pipeline.services.sinks import DirectSink
+
+            sink = DirectSink(self.db)
+        self.sink = sink
         self.checkers = list(checkers)
         self.availability = [c for c in self.checkers if c.decides_availability]
         self.enrichers = [c for c in self.checkers if not c.decides_availability]
@@ -134,7 +142,11 @@ class CheckStage:
         started = time.monotonic()
         try:
             if self.use_dispatcher:
-                LOGGER.info("Проверка живости: диспетчер батчей + живой разбор вывода sing-box")
+                LOGGER.info(
+            "Проверка живости: диспетчер батчей + живой разбор вывода sing-box, "
+            "вердикты -> %s",
+            getattr(self.sink, "name", "база"),
+        )
                 await self._dispatch_loop()
             elif self.checkers:
                 await asyncio.gather(*(self._worker(i) for i in range(self.workers_count)))
@@ -176,6 +188,7 @@ class CheckStage:
             startup=self.startup,
             urltest=self.urltest,
             max_retries=self.max_retries,
+            sink=self.sink,
         )
         stats = DispatchStats()
 
@@ -262,13 +275,29 @@ class CheckStage:
                 batch_no, checker.name, result.summary, len(targets),
             )
             for line, outcome in result.outcomes.items():
-                if outcome is None or not (outcome.country or outcome.capabilities):
+                if outcome is None:
                     continue
-                rows.append({
+                data = outcome.data or {}
+                # Само измерение скорости едет в базу цифрой: по одному тегу
+                # вроде speed-slow нельзя отличить 0.4 МБ/с от 0.9, а для
+                # отбора лучших нужна настоящая величина.
+                speed_mbps = data.get("speed_mbps")
+                speed_down = data.get("speed_down")
+                speed_up = data.get("speed_up")
+                has_speed = any(v is not None for v in (speed_mbps, speed_down, speed_up))
+                if not (outcome.country or outcome.capabilities or has_speed):
+                    continue
+                row = {
                     "key": _key_of(line),
                     "country": outcome.country or "",
                     "capabilities": outcome.capabilities or "",
-                })
+                    "capabilities_replace": list(outcome.capabilities_replace or ()),
+                }
+                if has_speed:
+                    row["speed_mbps"] = speed_mbps
+                    row["speed_down"] = speed_down
+                    row["speed_up"] = speed_up
+                rows.append(row)
 
         if rows:
             self._enriched += await self.db.record_enrichment(rows)

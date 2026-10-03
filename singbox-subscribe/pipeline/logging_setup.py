@@ -105,6 +105,10 @@ class ExactLevelFilter(logging.Filter):
         return record.levelno == self.level
 
 
+#: Как часто вычищать словарь подавленных сообщений, сообщений.
+_THROTTLE_SWEEP_EVERY = 2000
+
+
 class ThrottleFilter(logging.Filter):
     """Гасит поток одинаковых сообщений.
 
@@ -119,6 +123,7 @@ class ThrottleFilter(logging.Filter):
         self.window = max(0.0, float(window))
         self._state: dict[tuple, tuple[int, int, float]] = {}
         self._lock = threading.Lock()
+        self._calls = 0
 
     def filter(self, record: logging.LogRecord) -> bool:
         key = (record.levelno, record.name, record.getMessage()[:200])
@@ -126,6 +131,9 @@ class ThrottleFilter(logging.Filter):
         with self._lock:
             count, suppressed, first = self._state.get(key, (0, 0, now))
             count += 1
+            self._calls += 1
+            if self._calls >= _THROTTLE_SWEEP_EVERY:
+                self._sweep(now)
             if now - first > self.window:
                 # Окно прошло — счётчики сбрасываются, сообщение снова видно.
                 self._state[key] = (count, 0, now)
@@ -137,11 +145,32 @@ class ThrottleFilter(logging.Filter):
             self._state[key] = (count, suppressed, first)
             return False
 
+    def _sweep(self, now: float) -> None:
+        """Выбрасывает ключи, окно по которым давно прошло.
+
+        Словарь жил вечно: ключ добавлялся на каждое новое сообщение и
+        никогда не удалялся. В режиме служб, который считает дни, это
+        утечка памяти, растущая с каждым уникальным сообщением.
+        Вызывается под self._lock.
+        """
+        self._calls = 0
+        if not self._state:
+            return
+        stale = [
+            k for k, (_c, _s, first) in self._state.items()
+            if now - first > self.window
+        ]
+        for key in stale:
+            self._state.pop(key, None)
+
     def summary(self) -> list[str]:
         """Строки-сводки по заглушённым сообщениям (для финального отчёта)."""
         with self._lock:
             return [
-                f"{level} {name}: {msg!r} — подавлено {suppressed} повторов"
+                # Уровень хранится числом (record.levelno), в текст приводим
+                # явно: иначе в сводку попадало бы "20 singbox.singbox: ...".
+                f"{logging.getLevelName(level)} {name}: {msg!r}"
+                f" — подавлено {sup} повторов"
                 for (level, name, msg), (_c, sup, _f) in self._state.items()
                 if sup
             ]
@@ -444,10 +473,6 @@ def get_logger(name: str | None = None) -> logging.Logger:
     return logging.getLogger(f"{ROOT_LOGGER_NAME}.{name}")
 
 
-def is_configured() -> bool:
-    return _configured
-
-
 def log_throttle_summary(logger: logging.Logger | None = None) -> None:
     """Печатает сводку по подавленным повторам — в конце длительного этапа."""
     target = logger or get_logger("throttle")
@@ -455,7 +480,16 @@ def log_throttle_summary(logger: logging.Logger | None = None) -> None:
     throttle = getattr(root, "throttle", None)
     if not isinstance(throttle, ThrottleFilter):
         return
-    for line in throttle.summary():
+    # Сводка — чистая диагностика в самом конце прогона. Раньше ошибка
+    # в ней роняла уже завершённую проверку: планировщик видел падение,
+    # хотя все этапы отработали. Считаем это своим багом, но прогон
+    # из-за него валить нельзя.
+    try:
+        lines = throttle.summary()
+    except Exception:  # noqa: BLE001
+        target.warning("Сводку по подавленным повторам собрать не удалось", exc_info=True)
+        return
+    for line in lines:
         target.info("Подавлено повторов: %s", line)
 
 

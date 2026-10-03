@@ -303,25 +303,6 @@ def normalize_proxy_key(raw: str) -> str:
     return value.lower()
 
 
-def write_merge_from_pool(store, output_path: Path) -> int:
-    """Пишет merge.txt из пула проверки центральной базы.
-
-    Пул = ВСЕ живые серверы: excluded=0 и stable >= PURGE_STABLE_BELOW
-    (нижний порог, по умолчанию 0). Умершие (stable = -1) не импортируются.
-    Лучшие серверы (высокий stable) идут первыми.
-    """
-    pool = store.check_pool()
-    # Дополнительно вырезаем серверы с insecure-fingerprint (fp=unsafe и т.п.),
-    # которые могли попасть в базу из старых кешей/до этого фикса.
-    merged = [
-        row["line"] for row in pool
-        if row["line"] and not has_unsafe_fingerprint(row["line"])
-    ]
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text("\n".join(merged), encoding="utf-8")
-    return len(merged)
-
-
 def _download_source(idx: int, url: str, download_dir: Path) -> dict:
     """Скачивает один источник (или пропускает по кэшу). Потокобезопасно.
 
@@ -444,9 +425,10 @@ def build_merge_from_urls(
     *,
     logger: logging.Logger | None = None,
 ) -> dict[str, object]:
-    """Скачивает подписки, регистрирует серверы в центральной базе (servers.db)
-    и собирает merge.txt из пула проверки базы. Whitelist экспортируется из
-    базы по результату последней проверки (whitelist.txt = available=1)."""
+    """Скачивает подписки и регистрирует серверы в центральной базе (servers.db).
+    Пул проверки остаётся в базе (merge.txt не выгружается); whitelist
+    экспортируется из базы по результату последней проверки
+    (whitelist.txt = available=1)."""
     urls_file_path = Path(urls_file).resolve()
     output_path_path = Path(output_path).resolve()
     log_file_path = Path(log_file).resolve() if log_file else None
@@ -455,7 +437,7 @@ def build_merge_from_urls(
         # Единый логгер проекта; файловые обработчики уже настроены в setup_project_logging.
         logger = get_project_logger("merge_configs")
 
-    logger.info("Старт сборки merge.txt")
+    logger.info("Старт загрузки подписок в базу")
     logger.info("URLs file: %s", urls_file_path)
     logger.info("Output file: %s", output_path_path)
     if log_file_path:
@@ -511,7 +493,7 @@ def build_merge_from_urls(
             source_lines.append(clean)
 
     # Отделяем строки, которые ни один парсер не превращает в узел: проверить
-    # их нельзя, поэтому сразу отправляем в чс, а не в merge.txt. Иначе такой
+    # их нельзя, поэтому сразу отправляем в чс, а не в пул проверки. Иначе такой
     # мусор (битые ss/vless/vmess-ссылки) занимает батчи проверки и засоряет
     # лог в каждом цикле.
     #
@@ -548,8 +530,14 @@ def build_merge_from_urls(
             "Чс: %d неразбираемых серверов исключены из проверки (blacklist)", blacklisted,
         )
 
-    logger.info("Сборка %s из пула проверки базы", output_path_path)
-    merged_count = write_merge_from_pool(store, output_path_path)
+    # merge.txt больше не выгружается: пул проверки живёт в базе (check_pool()),
+    # промежуточного файла между скачиванием и проверкой больше нет. Размер
+    # пула считаем для отчёта, на диск ничего не пишем.
+    pool_rows = store.check_pool()
+    merged_count = sum(
+        1 for row in pool_rows
+        if row["line"] and not has_unsafe_fingerprint(row["line"])
+    )
 
     # Экспорт whitelist.txt — файловая проекция базы: серверы, ПИНГОВАВШИЕСЯ
     # в последней проверке (available=1), для внешних потребителей.
@@ -564,8 +552,8 @@ def build_merge_from_urls(
     )
     db_stats = store.stats()
     logger.info(
-        "Итог: пул проверки %d конфигов (база: %d всего, %d исключено) в %s",
-        merged_count, db_stats["total"], db_stats["excluded"], output_path_path,
+        "Итог: пул проверки %d конфигов в базе (база: %d всего, %d исключено)",
+        merged_count, db_stats["total"], db_stats["excluded"],
     )
     logger.info("Завершено успешно")
     return {

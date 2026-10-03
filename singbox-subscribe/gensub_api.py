@@ -416,6 +416,9 @@ def build_config_from_uris(uris, template):
         }
 
     config = core_mod.build_singbox_config_from_nodes(template_data, nodes)
+    # Не строго: веб-выдача лишь показывает предупреждение, а деплой
+    # (deploy_config) проверяет строго и отказывается пушить сломанный конфиг.
+    core_mod.validate_config_groups(config, strict=False)
     return config
 
 

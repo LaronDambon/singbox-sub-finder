@@ -5,10 +5,14 @@
 
   * исключает из ротации умерших (``purge_dead``);
   * экспортирует ``whitelist.txt`` (пинговавшиеся в последней проверке)
-    и ``blacklist.txt`` (умершие) — для внешних потребителей;
-  * пишет ``merge.txt`` — тот самый пул проверки, который раньше был
-    промежуточным файлом между скачиванием и проверкой;
+    — для внешних потребителей;
   * при DEPLOY_ENABLED=1 — собирает конфиг и отправляет в GitHub.
+
+``blacklist.txt`` и ``merge.txt`` больше НЕ выгружаются: и то, и другое —
+файловая проекция базы, которую никто из кода не читает. Чёрный список
+остаётся в базе (колонка ``excluded`` + ``blacklist_unparsable()`` — на неё
+опираются повторы, «щит» и purge), а пул проверки берётся из базы
+(``check_pool()``/``check_queue``), а не из промежуточного файла.
 """
 
 from __future__ import annotations
@@ -51,34 +55,32 @@ class ExportStage:
     def __init__(self, ctx: "PipelineContext") -> None:
         self.ctx = ctx
 
-    async def run(self, db: "Database") -> dict:
-        result: dict = {"purged": 0, "whitelist": 0, "blacklist": 0, "merge": 0, "deploy": None}
+    async def run(self, db: "Database", *, deploy: bool | None = None) -> dict:
+        """Обновляет списки и, по решению, публикует конфиг.
+
+        deploy=None -> берётся глобальная настройка DEPLOY_ENABLED.
+        Служба публикации передаёт его явно: выгрузка по расписанию и
+        выгрузка по кнопке — разные вещи, и режим служб по умолчанию
+        деплой выключает.
+        """
+        result: dict = {"purged": 0, "whitelist": 0, "deploy": None}
+        want_deploy = DEPLOY_ENABLED if deploy is None else bool(deploy)
 
         # --- умершие выпадают из ротации ------------------------------------
         result["purged"] = await db.purge_dead(PURGE_STABLE_BELOW)
         LOGGER.info("Из проверки исключено серверов: %d", result["purged"])
 
-        # --- merge.txt: файл пула проверки ----------------------------------
-        if self.ctx.setting("write_merge", True):
-            result["merge"] = await db.write_pool_file(Path(self.ctx.setting("merge_file")))
-            LOGGER.info("Пул проверки записан: %d серверов", result["merge"])
-
-        # --- whitelist / blacklist -------------------------------------------
+        # --- whitelist: единственная файловая выгрузка ------------------------
+        # blacklist.txt и merge.txt не пишутся: их состояние живёт в базе.
         if self.ctx.setting("export_lists", True):
             result["whitelist"] = await db.export_whitelist(
                 Path(self.ctx.setting("whitelist_file")),
                 global_tag=self.ctx.setting("global_tag", "Global"),
             )
-            result["blacklist"] = await db.export_blacklist(
-                Path(self.ctx.setting("blacklist_file")),
-            )
-            LOGGER.info(
-                "Экспорт из базы: whitelist %d, blacklist %d",
-                result["whitelist"], result["blacklist"],
-            )
+            LOGGER.info("Экспорт из базы: whitelist %d", result["whitelist"])
 
         # --- деплой конфига в GitHub ----------------------------------------
-        if DEPLOY_ENABLED:
+        if want_deploy:
             result["deploy"] = await self.ctx.run_sync(self._deploy)
         return result
 

@@ -89,8 +89,10 @@ class BatchDispatcher:
         max_split_depth: int = 3,
         max_attempts: int = 2,
         max_retries: int = 3,
+        sink=None,
     ) -> None:
         self.db = db
+        self.sink = sink
         self.batch_size = max(1, batch_size)
         self.slots = max(1, slots)
         self.timeout = timeout
@@ -225,7 +227,8 @@ class BatchDispatcher:
         return [report]
 
     # ----------------------------------------------------------------- запись
-    async def persist(self, reports, stats: "DispatchStats", items=()) -> None:
+    async def persist(self, reports, stats: "DispatchStats", items=(),
+                      sink=None) -> None:
         """Переносит собранные батчами вердикты в базу.
 
         Снимает забранные записи с работы: вердикт получен (в том числе
@@ -236,7 +239,17 @@ class BatchDispatcher:
             return
         from pipeline.stages.writer import format_line
 
-        stable_map = await self.db.load_stable_map()
+        # stable нужен лишь для серверов этого батча: из них формируется
+        # текст строки (суффикс -stable-N). Раньше тут читалась ВСЯ таблица
+        # на каждый батч — на инструментированном прогоне это была половина
+        # всего времени, потраченного на базу.
+        batch_keys: list[str] = []
+        for report in reports:
+            for tag in report.verdicts:
+                raw = report.tag_to_line.get(tag)
+                if raw:
+                    batch_keys.append(_key_of(raw))
+        stable_map = await self.db.load_stable_for(batch_keys)
         # Сколько раз сервер уже возвращали в очередь без вердикта.
         by_line: dict[str, int] = {}
         for item in items:
@@ -316,19 +329,15 @@ class BatchDispatcher:
         stats.retry += len(retry)
         stats.unparsable += len(unparsable)
 
-        if rows:
-            await self.db.record_results(rows)
-        if retry:
-            # Молчавшие серверы не «мёртвые» — возвращаем их в очередь.
-            await self.db.enqueue(retry, source="retry")
-        if unparsable:
-            await self.db.blacklist_unparsable(unparsable)
-        if items:
-            # Строки, ушедшие на повтор, закрывать как сделанные нельзя —
-            # они уже стоят в очереди заново, иначе повтор пропадёт. Ключи
-            # должны быть нормализованы так же, как в самой очереди.
-            skip = {_key_of(line) for line in retry}
-            await self.db.complete_batch(list(items), skip_keys=skip)
+        # Вердикты уходят приёмнику: в обычном прогоне он пишет в базу
+        # сразу, в режиме служб — кладём порцию в очередь result_queue, и
+        # записью занимается отдельная служба.
+        sink = sink or self.sink
+        if sink is None:
+            from pipeline.services.sinks import DirectSink
+
+            sink = DirectSink(self.db)
+        await sink.submit(rows=rows, retry=retry, unparsable=unparsable, items=list(items))
 
         if rows or retry:
             LOGGER.info(
@@ -347,6 +356,7 @@ def make_dispatcher(
     urltest: str = "",
     max_attempts: int = 2,
     max_retries: int = 3,
+    sink=None,
 ) -> BatchDispatcher:
     """Собирает диспетчер с настройками по умолчанию из конфигурации."""
     from config.env import (
@@ -373,6 +383,7 @@ def make_dispatcher(
         template_path=Path(URLTEST_TEMPLATE),
         config_dir=Path(SING_BOX_OUTPUT_DIR),
         urltest=urltest or URLTEST_URL,
+        sink=sink,
     )
 
 

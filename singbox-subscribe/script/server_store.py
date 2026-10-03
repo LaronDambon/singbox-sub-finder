@@ -36,6 +36,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import re
 import sqlite3
@@ -49,6 +50,7 @@ from config.env import (
     SERVERS_DB_FILE,
     SHIELD_CYCLES,
 )
+from utils.tool import set_country_in_name
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -68,6 +70,12 @@ CREATE TABLE IF NOT EXISTS servers (
     fails          INTEGER NOT NULL DEFAULT 0,
     capabilities   TEXT NOT NULL DEFAULT '',
     excluded       INTEGER NOT NULL DEFAULT 0,
+    -- Замер скорости в МБ/с. Раньше измерение выбрасывалось и оставался
+    -- только тег вроде speed-slow, по которому нельзя отличить 0.4 МБ/с
+    -- от 0.9. Для отбора «лучших» нужна сама цифра.
+    speed_mbps     REAL,
+    speed_down     REAL,
+    speed_up       REAL,
     first_seen     TEXT NOT NULL,
     last_seen      TEXT NOT NULL,
     last_checked   TEXT
@@ -79,12 +87,18 @@ CREATE INDEX IF NOT EXISTS idx_servers_excluded ON servers(excluded);
 UPSERT_RESULT_SQL = """
 INSERT INTO servers (
     key, line, stable, ever_pinged, ping_ms, protocol, country, capabilities,
+    speed_mbps, speed_down, speed_up,
     available, checks, fails, first_seen, last_seen, last_checked
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
 ON CONFLICT(key) DO UPDATE SET
     stable         = excluded.stable,
     ever_pinged    = MAX(servers.ever_pinged, excluded.ever_pinged),
     ping_ms        = COALESCE(excluded.ping_ms, servers.ping_ms),
+    -- COALESCE, а не прямое присваивание: сервер без замера не должен
+    -- затирать результат прошлого измерения пустым значением.
+    speed_mbps     = COALESCE(excluded.speed_mbps, servers.speed_mbps),
+    speed_down     = COALESCE(excluded.speed_down, servers.speed_down),
+    speed_up       = COALESCE(excluded.speed_up, servers.speed_up),
     protocol       = CASE WHEN excluded.protocol != '' THEN excluded.protocol ELSE servers.protocol END,
     country        = CASE WHEN excluded.country != '' THEN excluded.country ELSE servers.country END,
     capabilities   = CASE WHEN excluded.capabilities != '' THEN excluded.capabilities ELSE servers.capabilities END,
@@ -99,6 +113,15 @@ ON CONFLICT(key) DO UPDATE SET
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def _as_float(value):
+    """Число из строки/словаря или None. Кривые значения молча игнорируются."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
 
 
 def parse_stable_from_line(line: str) -> int:
@@ -138,6 +161,27 @@ def compute_next_state(
     return max(prev - 1, alive_min - 1)
 
 
+def _merge_tags(current: str, incoming: str, replace: Sequence[str] = ()) -> str:
+    """Склеивает списки тэгов через запятую, сохраняя порядок и убирая дубли.
+
+    Тэги из РАЗНЫХ чекеров дополняют друг друга: сервер может иметь и
+    [gemini], и [speed-fast]. Но внутри одной категории тэг — это ОДИН
+    из многих, и новый заменяет старый: без этого прогон, решивший сервер
+    быстрым, оставлял рядом метку прошлого прогона "[speed-slow][speed-ok]".
+
+    replace — префиксы категорий, которые новый тэг затирает ("speed-").
+    """
+    old_tags = [t.strip() for t in current.split(",") if t.strip()]
+    new_tags = [t.strip() for t in incoming.split(",") if t.strip()]
+    if replace:
+        old_tags = [t for t in old_tags if not t.startswith(tuple(replace))]
+    merged: list[str] = []
+    for tag in old_tags + new_tags:
+        if tag not in merged:
+            merged.append(tag)
+    return ",".join(merged)
+
+
 class ServerStore:
     """Обёртка над SQLite-базой серверов.
 
@@ -149,6 +193,9 @@ class ServerStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
+            # WAL задаётся здесь, при создании магазина, и дальше просто
+            # сохраняется в файле базы — см. комментарий в _connect().
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
             self._ensure_ever_pinged_column(conn)
             # Нормализация накопленных значений: stable не бывает ниже
@@ -161,12 +208,27 @@ class ServerStore:
 
     # ------------------------------------------------------------------ util
     def _connect(self) -> sqlite3.Connection:
+        """Открывает соединение.
+
+        journal_mode=WAL выставляется ОДИН раз при создании магазина.
+        Это DDL: он пишет заголовок базы и берёт блокировку схемы. Выполнять
+        его на каждом открытии смысла нет, режим сохраняется в файле базы
+        сам. Измерено: PRAGMA занимал 0.43 мс из 0.75 мс открытия, при
+        4+ соединениях на батч это заметная накладная нагрузка.
+        """
         conn = sqlite3.connect(self.db_path, timeout=15.0)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
+
+    def _connect_managed(self) -> "contextlib.closing[sqlite3.Connection]":
+        """Соединение, которое коммитит И закрывается.
+
+        "with conn:" в sqlite3 только коммитит транзакцию и НЕ закрывает
+        соединение — оно живёт до сборки мусора.
+        """
+        return contextlib.closing(self._connect())
 
     @staticmethod
     def _dead_stable() -> int:
@@ -182,10 +244,17 @@ class ServerStore:
     def _ensure_ever_pinged_column(conn: sqlite3.Connection) -> None:
         """Миграция схемы: добавляет колонку ever_pinged в старую базу."""
         cols = {row[1] for row in conn.execute("PRAGMA table_info(servers)")}
-        if "ever_pinged" not in cols:
-            conn.execute(
-                "ALTER TABLE servers ADD COLUMN ever_pinged INTEGER NOT NULL DEFAULT 0"
-            )
+        # CREATE TABLE IF NOT EXISTS не добавляет колонки в уже созданную
+        # таблицу, поэтому новые поля приходится докувать на месте. Без этого
+        # старая база падала бы на INSERT с «no such column».
+        for name, decl in (
+            ("ever_pinged", "INTEGER NOT NULL DEFAULT 0"),
+            ("speed_mbps", "REAL"),
+            ("speed_down", "REAL"),
+            ("speed_up", "REAL"),
+        ):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE servers ADD COLUMN {name} {decl}")
 
     @staticmethod
     def _key_of(line: str) -> str:
@@ -199,6 +268,60 @@ class ServerStore:
         with self._connect() as conn:
             rows = conn.execute("SELECT key, stable FROM servers").fetchall()
         return {row["key"]: (row["stable"] or 0) for row in rows}
+
+    def server_records_by_key(self, lines: Iterable[str]) -> dict[str, dict]:
+        """Ключ -> запись сервера для переданных строк подписки.
+
+        Нужно расширенной фильтрации: страна, профиль целей, задержка и
+        stable лежат в колонках базы, а не в самой строке. Читаются только
+        запрошенные ключи, а не вся таблица.
+        """
+        keys = list(dict.fromkeys(self._key_of(ln) for ln in lines if ln))
+        if not keys:
+            return {}
+        out: dict[str, dict] = {}
+        with self._connect() as conn:
+            for i in range(0, len(keys), 500):
+                chunk = keys[i:i + 500]
+                placeholders = ",".join("?" * len(chunk))
+                for r in conn.execute(
+                    "SELECT key, line, stable, ping_ms, capabilities, country, protocol "
+                    f"FROM servers WHERE key IN ({placeholders})",
+                    chunk,
+                ):
+                    out[r["key"]] = {
+                        "key": r["key"],
+                        "line": r["line"],
+                        "stable": r["stable"],
+                        "ping_ms": r["ping_ms"],
+                        "capabilities": r["capabilities"] or "",
+                        "country": r["country"] or "",
+                        "protocol": r["protocol"] or "",
+                    }
+        return out
+
+    def load_stable_for(self, keys: Sequence[str]) -> dict[str, int]:
+        """Карта ключ -> stable ТОЛЬКО для перечисленных ключей.
+
+        Диспетчеру при записи одного батча нужны значения stable handful'а
+        серверов, но он читал всю таблицу. Инструментированный прогон
+        показывал, что на этом уходила половина всего времени работы с БД:
+        полный скан на каждый батч вместо точечного чтения по primary key.
+        """
+        keys = list(dict.fromkeys(k for k in keys if k))
+        if not keys:
+            return {}
+        out: dict[str, int] = {}
+        with self._connect() as conn:
+            for i in range(0, len(keys), 500):
+                chunk = keys[i:i + 500]
+                placeholders = ",".join("?" * len(chunk))
+                for r in conn.execute(
+                    f"SELECT key, stable FROM servers WHERE key IN ({placeholders})",
+                    chunk,
+                ):
+                    out[r["key"]] = r["stable"] or 0
+        return out
 
     def load_country_map(self) -> dict[str, str]:
         """Карта ключ -> эмодзи страны для серверов с известной страной.
@@ -372,25 +495,30 @@ class ServerStore:
                     chunk,
                 ):
                     prev[r["key"]] = r["stable"] or 0
+            # Один executemany вместо conn.execute на каждую строку:
+            # 40 строк батча были 40 обращениями к базе вместо одного.
+            # Сам UPSERT_RESULT_SQL уже рассчитан на пакетную вставку.
+            params = []
             for row in rows:
                 ok = bool(row.get("available"))
                 new_stable = compute_next_state(prev.get(row["key"], 0), ok=ok)
-                conn.execute(
-                    UPSERT_RESULT_SQL,
-                    (
-                        row["key"],
-                        row.get("line") or "",
-                        new_stable,
-                        1 if ok else 0,
-                        row.get("ping_ms"),
-                        row.get("protocol") or "",
-                        row.get("country") or "",
-                        row.get("capabilities") or "",
-                        1 if ok else 0,
-                        0 if ok else 1,
-                        now, now, now,
-                    ),
-                )
+                params.append((
+                    row["key"],
+                    row.get("line") or "",
+                    new_stable,
+                    1 if ok else 0,
+                    row.get("ping_ms"),
+                    row.get("protocol") or "",
+                    row.get("country") or "",
+                    row.get("capabilities") or "",
+                    _as_float(row.get("speed_mbps")),
+                    _as_float(row.get("speed_down")),
+                    _as_float(row.get("speed_up")),
+                    1 if ok else 0,
+                    0 if ok else 1,
+                    now, now, now,
+                ))
+            conn.executemany(UPSERT_RESULT_SQL, params)
 
     def record_enrichment(self, rows: Sequence[dict]) -> int:
         """Обновляет ТОЛЬКО обогащение: страна и профиль достижимости.
@@ -402,6 +530,11 @@ class ServerStore:
         два изменения подряд.
 
         Пустые значения не затирают уже известные.
+
+        capabilities — это ОБЪЕДИНЕНИЕ, а не замена: чекеров-дополнений
+        несколько (профиль достижимости, категория скорости), и они пишут
+        в одну и ту же колонку по очереди. Если бы второй затирал первого,
+        тэг [gemini] исчезал бы там, где появился [speed-fast].
         Возвращает количество обновлённых серверов.
         """
         if not rows:
@@ -412,17 +545,36 @@ class ServerStore:
             for row in rows:
                 country = row.get("country") or ""
                 capabilities = row.get("capabilities") or ""
-                if not country and not capabilities:
+                speed = (
+                    _as_float(row.get("speed_mbps")),
+                    _as_float(row.get("speed_down")),
+                    _as_float(row.get("speed_up")),
+                )
+                if not country and not capabilities and not any(s is not None for s in speed):
                     continue
+                if capabilities:
+                    current = conn.execute(
+                        "SELECT capabilities FROM servers WHERE key = ?",
+                        (row["key"],),
+                    ).fetchone()
+                    capabilities = _merge_tags(
+                        (current["capabilities"] if current else "") or "",
+                        capabilities,
+                        replace=row.get("capabilities_replace") or (),
+                    )
                 cursor = conn.execute(
                     """
                     UPDATE servers SET
                         country = CASE WHEN ? <> '' THEN ? ELSE country END,
                         capabilities = CASE WHEN ? <> '' THEN ? ELSE capabilities END,
+                        speed_mbps = COALESCE(?, speed_mbps),
+                        speed_down = COALESCE(?, speed_down),
+                        speed_up = COALESCE(?, speed_up),
                         last_seen = ?
                     WHERE key = ?
                     """,
-                    (country, country, capabilities, capabilities, now, row["key"]),
+                    (country, country, capabilities, capabilities,
+                     speed[0], speed[1], speed[2], now, row["key"]),
                 )
                 updated += cursor.rowcount or 0
         return updated
@@ -476,9 +628,16 @@ class ServerStore:
         if limit:
             query += " LIMIT ?"
             params.append(limit)
+        query = query.replace(
+            "SELECT line, stable, ping_ms, capabilities FROM servers",
+            "SELECT line, stable, ping_ms, capabilities, country FROM servers",
+        )
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
-        return [row["line"] for row in rows]
+        return [
+            set_country_in_name(row["line"], row["country"] or "")
+            for row in rows
+        ]
 
     def _capability_tags(self, caps: str, global_tag: str) -> str:
         """Превращает профиль (список тэгов через запятую) в суффикс тэгов.
@@ -501,7 +660,9 @@ class ServerStore:
                             min_stable: int | None = None,
                             max_stable: int | None = None,
                             global_tag: str = "Global",
-                            only_available: bool = False) -> list[str]:
+                            only_available: bool = False,
+                            server_filter=None,
+                            best_top: int = 0) -> list[str]:
         """Строки серверов по фильтру с добавленными capability-тэгами.
 
         ВАЖНО: capability-профиль ХРАНИТСЯ в БД, тэги [name] добавляются
@@ -509,7 +670,8 @@ class ServerStore:
         Сервер, у которого профиль полностью состоит из global_tag (достиг
         всех целей), получает ровно один тэг [Global].
         """
-        query = "SELECT line, stable, ping_ms, capabilities FROM servers WHERE line != ''"
+        query = ("SELECT line, key, stable, ping_ms, capabilities, country, "
+                "speed_mbps, speed_down, speed_up FROM servers WHERE line != ''")
         params: list[object] = []
         if only_available:
             query += " AND available = 1 AND excluded = 0"
@@ -522,10 +684,48 @@ class ServerStore:
         query += " ORDER BY stable DESC, ping_ms IS NULL, ping_ms ASC, key ASC"
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
+        if server_filter is not None:
+            rows = [
+                r for r in rows
+                if server_filter.matches({
+                    "line": r["line"],
+                    "stable": r["stable"],
+                    "ping_ms": r["ping_ms"],
+                    "capabilities": r["capabilities"] or "",
+                    "country": r["country"] or "",
+                    "protocol": "",
+                })
+            ]
+        # Метки «best»: в группе одного профиля лучшие получают
+        # дополнительный тег. Считается ПОСЛЕ фильтра, иначе фильтр по
+        # профилю вырезал бы часть группы и «лучшим» оказался бы не тот.
+        best_by_key: dict[str, str] = {}
+        if best_top:
+            from script.best_tags import BestRules, add_best_tags
+
+            # Теги скорости не ранжируются: там «лучший» — это и есть весь
+            # смысл тега, а из двух одинаковых выберется случайный.
+            skip = tuple(sorted({
+                s.strip()
+                for r in rows
+                for s in (r["capabilities"] or "").split(",")
+                if s.strip().startswith("speed-")
+            }))
+            marked = add_best_tags(
+                [dict(r) for r in rows], rules=BestRules(top=best_top),
+                skip_profiles=skip,
+            )
+            for rec in marked:
+                base_caps = rec.get("capabilities") or ""
+                best_by_key[rec["key"]] = rec.get("capabilities") or base_caps
+
         out = []
         for row in rows:
-            base = row["line"]
-            caps = row["capabilities"] or ""
+            # Флаг страны — источник истины в колонке country: страна
+            # определяется ПОСЛЕ записи строки в базу, так что в самой строке
+            # её может не быть, и фильтр по странам такую строку не находит.
+            base = set_country_in_name(row["line"], row["country"] or "")
+            caps = best_by_key.get(row["key"]) or row["capabilities"] or ""
             # Если в профиле уже есть Global-метка храним её как global_tag;
             # иначе — обычный профиль целей.
             if caps:
@@ -577,14 +777,24 @@ class ServerStore:
         out.write_text("\n".join(lines), encoding="utf-8")
         return len(lines)
 
-    def export_whitelist_lines(self, *, global_tag: str = "Global") -> list[str]:
+    def export_whitelist_lines(self, *, global_tag: str = "Global",
+                               server_filter=None, best_top: int = 0) -> list[str]:
         """Whitelist-строки: серверы, ПИНГОВАВШИЕСЯ в последней проверке.
 
         Критерий нового принципа: available=1 (последняя проверка успешна) —
         без порога stable. Не пинганулся -> не добавляется, но остаётся в пуле
         проверки. Тэги [name] / [Global] добавляются здесь же.
+
+        server_filter — опциональный ServerFilter (script.node_filters):
+        отбор по capabilities, стране, региону, задержке, stable и протоколу.
+        Применяется ДО того, как строка станет outbound, потому что страна и
+        профиль лежат в колонках базы, а в самой строке подписки их может
+        не быть вовсе.
         """
-        return self.export_tagged_lines(only_available=True, global_tag=global_tag)
+        return self.export_tagged_lines(
+            only_available=True, global_tag=global_tag,
+            server_filter=server_filter, best_top=best_top,
+        )
 
     def export_whitelist_to_file(self, path: str | Path, *, global_tag: str = "Global") -> int:
         """Whitelist = available=1 (последняя проверка успешна), в файл."""

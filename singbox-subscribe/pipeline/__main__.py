@@ -1,6 +1,7 @@
 """CLI ядра: python -m pipeline <команда>.
 
     run       полный прогон (поиск -> очередь -> проверка -> экспорт)
+    serve     режим служб: все этапы крутятся постоянно и общаются через очереди
     check     только проверка (очередь наполняется из базы)
     discover  только поиск новых серверов из подписок
     export    только экспорт списков из базы
@@ -23,6 +24,20 @@ from pipeline.logging_setup import get_logger, setup_logging
 
 def _dump(value) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, default=str))
+
+
+def _cmd_serve(args) -> int:
+    from pipeline.serve import serve
+
+    async def main():
+        await serve(
+            db_path=args.db,
+            checkers=args.checkers,
+            duration=args.duration,
+        )
+        return 0
+
+    return asyncio.run(main())
 
 
 def _cmd_run(args) -> int:
@@ -176,6 +191,11 @@ def build_parser() -> argparse.ArgumentParser:
                            help="не искать новые серверы из подписок"),
             p.add_argument("--no-export", action="store_true",
                            help="не обновлять whitelist/blacklist/merge"),
+        ))
+    add("serve", _cmd_serve, "режим служб: всё крутится постоянно", with_json=False,
+        extra=lambda p: p.add_argument(
+            "--duration", type=float, default=None,
+            help="отработать N секунд и выйти (для проверки и тестов)",
         ))
     add("check", _cmd_check, "только проверка (очередь берётся из базы)")
     add("discover", _cmd_discover, "только поиск новых серверов из подписок")
