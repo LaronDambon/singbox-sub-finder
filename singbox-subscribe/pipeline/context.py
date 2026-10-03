@@ -115,10 +115,12 @@ class PipelineContext:
         """
         if name in self.settings:
             return self.settings[name]
-        from config.settings import get_settings
+        # Через setting(), а НЕ через getattr(get_settings(), name):
+        # значения больше не лежат плоскими атрибутами, а getattr по имени
+        # из .env возвращал None молча — чекер уходил в int(None).
+        from config.settings import setting
 
-        found = getattr(get_settings(), name, None)
-        return default if found is None else found
+        return setting(name, default)
 
     # ------------------------------------------------------------ помощники
     @staticmethod

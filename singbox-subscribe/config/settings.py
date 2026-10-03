@@ -158,187 +158,304 @@ def _as_bool(raw, default: bool) -> bool:
 
 
 @dataclass(frozen=True)
+class PathsSettings:
+    """Настройки: пути проекта."""
+
+    urls_file: Path
+    merge_file: Path
+    whitelist_file: Path
+    blacklist_file: Path
+    servers_db_file: Path
+    urltest_template: Path
+    countrytest_template: Path
+    reachability_targets_file: Path
+    config_template_dir: Path
+    sing_box_output_dir: Path
+    sing_box_path: Path
+    custom_checkers_dir: Path
+
+
+@dataclass(frozen=True)
+class CoreSettings:
+    """Настройки: core."""
+
+    purge_stable_below: int
+    new_server_stable: int
+    shield_cycles: int
+    best_top: int
+    sing_box_port: int
+
+
+@dataclass(frozen=True)
+class UrltestSettings:
+    """Настройки: urltest."""
+
+    url: str
+    timeout: float
+    batch_size: int
+
+
+@dataclass(frozen=True)
+class SubSettings:
+    """Настройки: sub."""
+
+    concurrency: int
+
+
+@dataclass(frozen=True)
+class CountrySettings:
+    """Настройки: country."""
+
+    enabled: bool
+    concurrency: int
+    timeout: float
+
+
+@dataclass(frozen=True)
+class ReachSettings:
+    """Настройки: reach."""
+
+    enabled: bool
+    concurrency: int
+    timeout: float
+    max_ping_ms: int
+    body_bytes: int
+    body_seconds: float
+    per_proxy_concurrency: int
+    min_stable: int
+    global_tag: str
+
+
+@dataclass(frozen=True)
+class SpeedSettings:
+    """Настройки: speed."""
+
+    enabled: bool
+    site_url: str
+    sources: str
+    probe_bytes: int
+    upload_bytes: int
+    min_sources: int
+    read_seconds: float
+    min_mbps: float
+    good_mbps: float
+    concurrency: int
+    tag_prefix: str
+    tier_tags: dict
+
+
+@dataclass(frozen=True)
+class WebSettings:
+    """Настройки: web."""
+
+    host: str
+    port: int
+
+
+@dataclass(frozen=True)
+class DeploySettings:
+    """Настройки: deploy."""
+
+    enabled: bool
+    repo: str
+    template: str
+    templates: str
+    path: str
+    create_repo: bool
+    ip_source: str
+    ip_placeholder: str
+
+
+@dataclass(frozen=True)
+class LogSettings:
+    """Настройки: log."""
+
+    dir_path: Path
+    level: int
+    console_level: int
+    file_name: str
+    max_bytes: int
+    backup_count: int
+    retention_days: int
+    per_level_files: bool
+    format: str
+    throttle_limit: int
+    throttle_window: float
+    capture_stdout: bool
+
+
+@dataclass(frozen=True)
+class PipelineSettings:
+    """Настройки: pipeline."""
+
+    checkers: str
+    discovery: bool
+    discovery_concurrency: int
+    check_workers: int
+    batch_size: int
+    check_timeout: float
+    batch_startup: float
+    enrich_timeout: float
+    max_attempts: int
+    max_retries: int
+    queue_persist: bool
+    export_lists: bool
+    write_merge: bool
+
+
+@dataclass(frozen=True)
+class ServicesSettings:
+    """Настройки: services."""
+
+    discovery: bool
+    collector: bool
+    checker: bool
+    results: bool
+    publisher: bool
+    discovery_interval: float
+    collector_interval: float
+    results_interval: float
+    publisher_interval: float
+    publisher_deploy: bool
+
+
+#: Секция -> (префикс имён в .env, поля). По этой таблице плоский словарь
+#: сворачивается в секции, а имя настройки ищется обратно по имени поля.
+_LAYOUT: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] = (
+    ("paths", "", (
+        ("URLS_FILE", "urls_file"), ("MERGE_FILE", "merge_file"),
+        ("WHITELIST_FILE", "whitelist_file"), ("BLACKLIST_FILE", "blacklist_file"),
+        ("SERVERS_DB_FILE", "servers_db_file"),
+        ("URLTEST_TEMPLATE", "urltest_template"),
+        ("COUNTRYTEST_TEMPLATE", "countrytest_template"),
+        ("REACHABILITY_TARGETS_FILE", "reachability_targets_file"),
+        ("CONFIG_TEMPLATE_DIR", "config_template_dir"),
+        ("SING_BOX_OUTPUT_DIR", "sing_box_output_dir"),
+        ("SING_BOX_PATH", "sing_box_path"),
+        ("PIPELINE_CUSTOM_CHECKERS_DIR", "custom_checkers_dir"),
+    )),
+    ("core", "", (
+        ("PURGE_STABLE_BELOW", "purge_stable_below"),
+        ("NEW_SERVER_STABLE", "new_server_stable"),
+        ("SHIELD_CYCLES", "shield_cycles"),
+        ("BEST_TOP", "best_top"), ("SING_BOX_PORT", "sing_box_port"),
+    )),
+    ("urltest", "URLTEST_", (
+        ("URLTEST_URL", "url"), ("URLTEST_TIMEOUT", "timeout"),
+        ("URLTEST_BATCH_SIZE", "batch_size"),
+    )),
+    ("sub", "SUB_DOWNLOAD_", (("SUB_DOWNLOAD_CONCURRENCY", "concurrency"),)),
+    ("country", "COUNTRY_CHECK_", (
+        ("COUNTRY_CHECK_ENABLED", "enabled"),
+        ("COUNTRY_CHECK_CONCURRENCY", "concurrency"),
+        ("COUNTRY_CHECK_TIMEOUT", "timeout"),
+    )),
+    ("reach", "REACHABILITY_", (
+        ("REACHABILITY_ENABLED", "enabled"),
+        ("REACHABILITY_CONCURRENCY", "concurrency"),
+        ("REACHABILITY_TIMEOUT", "timeout"),
+        ("REACHABILITY_MAX_PING_MS", "max_ping_ms"),
+        ("REACHABILITY_BODY_BYTES", "body_bytes"),
+        ("REACHABILITY_BODY_SECONDS", "body_seconds"),
+        ("REACHABILITY_PER_PROXY_CONCURRENCY", "per_proxy_concurrency"),
+        ("REACHABILITY_MIN_STABLE", "min_stable"),
+        ("REACHABILITY_GLOBAL_TAG", "global_tag"),
+    )),
+    ("speed", "SPEED_", (
+        ("SPEED_ENABLED", "enabled"), ("SPEED_SITE_URL", "site_url"),
+        ("SPEED_SOURCES", "sources"), ("SPEED_PROBE_BYTES", "probe_bytes"),
+        ("SPEED_UPLOAD_BYTES", "upload_bytes"),
+        ("SPEED_MIN_SOURCES", "min_sources"),
+        ("SPEED_READ_SECONDS", "read_seconds"),
+        ("SPEED_MIN_MBPS", "min_mbps"), ("SPEED_GOOD_MBPS", "good_mbps"),
+        ("SPEED_CONCURRENCY", "concurrency"),
+        ("SPEED_TAG_PREFIX", "tag_prefix"), ("SPEED_TIER_TAGS", "tier_tags"),
+    )),
+    ("web", "FLASK_", (("FLASK_HOST", "host"), ("FLASK_PORT", "port"))),
+    ("deploy", "DEPLOY_", (
+        ("DEPLOY_ENABLED", "enabled"), ("DEPLOY_TEMPLATE", "template"),
+        ("GH_DEPLOY_REPO", "repo"),
+        ("DEPLOY_TEMPLATES", "templates"), ("DEPLOY_PATH", "path"),
+        ("DEPLOY_CREATE_REPO", "create_repo"),
+        ("DEPLOY_IP_SOURCE", "ip_source"),
+        ("DEPLOY_IP_PLACEHOLDER", "ip_placeholder"),
+    )),
+    ("log", "LOG_", (
+        ("LOG_DIR_PATH", "dir_path"), ("LOG_LEVEL", "level"),
+        ("LOG_CONSOLE_LEVEL", "console_level"), ("LOG_FILE_NAME", "file_name"),
+        ("LOG_MAX_BYTES", "max_bytes"), ("LOG_BACKUP_COUNT", "backup_count"),
+        ("LOG_RETENTION_DAYS", "retention_days"),
+        ("LOG_PER_LEVEL_FILES", "per_level_files"), ("LOG_FORMAT", "format"),
+        ("LOG_THROTTLE_LIMIT", "throttle_limit"),
+        ("LOG_THROTTLE_WINDOW", "throttle_window"),
+        ("LOG_CAPTURE_STDOUT", "capture_stdout"),
+    )),
+    ("pipeline", "PIPELINE_", (
+        ("PIPELINE_CHECKERS", "checkers"), ("PIPELINE_DISCOVERY", "discovery"),
+        ("PIPELINE_DISCOVERY_CONCURRENCY", "discovery_concurrency"),
+        ("PIPELINE_CHECK_WORKERS", "check_workers"),
+        ("PIPELINE_BATCH_SIZE", "batch_size"),
+        ("PIPELINE_CHECK_TIMEOUT", "check_timeout"),
+        ("PIPELINE_BATCH_STARTUP", "batch_startup"),
+        ("PIPELINE_ENRICH_TIMEOUT", "enrich_timeout"),
+        ("PIPELINE_MAX_ATTEMPTS", "max_attempts"),
+        ("PIPELINE_MAX_RETRIES", "max_retries"),
+        ("PIPELINE_QUEUE_PERSIST", "queue_persist"),
+        ("PIPELINE_EXPORT_LISTS", "export_lists"),
+        ("PIPELINE_WRITE_MERGE", "write_merge"),
+    )),
+    ("services", "SERVICE_", (
+        ("SERVICE_DISCOVERY", "discovery"), ("SERVICE_COLLECTOR", "collector"),
+        ("SERVICE_CHECKER", "checker"), ("SERVICE_RESULTS", "results"),
+        ("SERVICE_PUBLISHER", "publisher"),
+        ("SERVICE_DISCOVERY_INTERVAL", "discovery_interval"),
+        ("SERVICE_COLLECTOR_INTERVAL", "collector_interval"),
+        ("SERVICE_RESULTS_INTERVAL", "results_interval"),
+        ("SERVICE_PUBLISHER_INTERVAL", "publisher_interval"),
+        ("SERVICE_PUBLISHER_DEPLOY", "publisher_deploy"),
+    )),
+)
+
+
+#: Имя секции -> её класс. Строится один раз, чтобы _fold не искал по имени.
+_SECTION_CLASSES = {
+    "paths": PathsSettings, "core": CoreSettings, "urltest": UrltestSettings,
+    "sub": SubSettings, "country": CountrySettings, "reach": ReachSettings,
+    "speed": SpeedSettings, "web": WebSettings, "deploy": DeploySettings,
+    "log": LogSettings, "pipeline": PipelineSettings, "services": ServicesSettings,
+}
+
+#: Имя настройки в .env -> (секция, поле). Строится из _LAYOUT.
+_BY_ENV_NAME: dict[str, tuple[str, str]] = {
+    env_name: (section, field)
+    for section, _prefix, fields in _LAYOUT
+    for env_name, field in fields
+}
+
+@dataclass(frozen=True)
 class Settings:
-    """Все настройки проекта. Один экземпляр на процесс."""
+    """Все настройки проекта. Один экземпляр на процесс.
+
+    Значения разложены по тематическим секциям: settings.speed.enabled.
+    Так работает автодополнение IDE и находится любое использование, чего
+    не даёт чтение по строке. Имена в .env при этом прежние — SPEED_ENABLED
+    так и остаётся SPEED_ENABLED, менять их не нужно.
+    """
 
 
-    # ============================== значения из окружения ==============
-    # Пути считаются от корня пакета; при необходимости переопределяются env.
-    URLS_FILE: Path = None
-    MERGE_FILE: Path = None
-    WHITELIST_FILE: Path = None
-    BLACKLIST_FILE: Path = None
-    # Центральная база всех серверов и их stable (единственный источник правды).
-    SERVERS_DB_FILE: Path = None
-    URLTEST_TEMPLATE: Path = None
-    COUNTRYTEST_TEMPLATE: Path = None
-    REACHABILITY_TARGETS_FILE: Path = None
-    CONFIG_TEMPLATE_DIR: Path = None
-    SING_BOX_OUTPUT_DIR: Path = None
-    SING_BOX_PATH: Path = None
-    # Нижний порог stable: в цикл проверки импортируются серверы со stable >= порога.
-    # Дойдя до порога - 1 (по умолчанию -1), сервер считается умершим и больше не
-    PURGE_STABLE_BELOW: int = 0
-    # Значение stable нового сервера ДО первого удачного пинга: столько неудачных
-    # проверок у него есть, чтобы доказать жизнеспособность.
-    NEW_SERVER_STABLE: int = 5
-    # «Щит» от удаления: после удачного пинга stable выставляется не ниже этого
-    # значения — столько неудачных проверок подряд сервер ещё проживёт.
-    SHIELD_CYCLES: int = 96
-    # URL для проверки доступности (лёгкий 204-ответ; можно заменить на «тяжёлый»).
-    URLTEST_URL: str = "https://speed.cloudflare.com/__down?during=download&bytes=2048576"
-    # Таймаут одной проверки, сек.
-    URLTEST_TIMEOUT: float = 10.0
-    # Сколько серверов проверять за один запуск sing-box.
-    URLTEST_BATCH_SIZE: int = 100
-    # Порт локального mixed-inbound sing-box.
-    SING_BOX_PORT: int = 7891
-    # Сколько источников подписок качать параллельно при сборке merge.txt.
-    SUB_DOWNLOAD_CONCURRENCY: int = 6
-    COUNTRY_CHECK_ENABLED: bool = True
-    # Сколько прокси проверять параллельно (аналог countryConcurrency в Throne).
-    COUNTRY_CHECK_CONCURRENCY: int = 8
-    # Таймаут чтения одного geo-запроса (сек); всего пробуется до 3 эндпоинта.
-    COUNTRY_CHECK_TIMEOUT: float = 6.0
-    REACHABILITY_ENABLED: bool = True
-    REACHABILITY_CONCURRENCY: int = 8
-    REACHABILITY_TIMEOUT: float = 6.0
-    # Максимальный пинг до цели (ms) для попадания в capabilities.
-    # Это порог TTFB — времени до ЗАГОЛОВКОВ ответа, а не времени скачивания
-    REACHABILITY_MAX_PING_MS: int = 500
-    # Сколько байт тела дочитывать после заголовков. TTFB уже измерен, дальше тело
-    # не нужно: без ограничения requests тянул страницу целиком (gemini = 856 КБ
-    REACHABILITY_BODY_BYTES: int = 64 * 1024
-    # И сколько секунд максимум читать это тело, чтобы медленный хост не висел.
-    REACHABILITY_BODY_SECONDS: float = 2.0
-    # Сколько целей одновременно опрашиваем через ОДИН прокси. Каждая проба — это
-    # новое соединение с узлом (TCP+TLS), и если одновременно их 8, они встают в
-    REACHABILITY_PER_PROXY_CONCURRENCY: int = 1
-    # С какого stable начинать профилировать (ok-серверы ниже не трогаем).
-    REACHABILITY_MIN_STABLE: int = 0
-    # Тэг цели, которой помечается сервер, прошедший ВСЕ проверки категории.
-    REACHABILITY_GLOBAL_TAG: str = "Global"
-    # --- Метки «лучших» серверов -------------------------------------------------
-    # Сколько лучших серверов на каждый профиль достижимости получают дополнительный
-    BEST_TOP: int = 0
-    # --- Замер скорости прокси ---------------------------------------------------
-    # Отдельный чекер-дополнение. Меряет МБ/с на размеро-контролируемой выкачке
-    SPEED_ENABLED: bool = True
-    # Сайт для проверки доступа. Gemini режет дата-центровые и VPN-адреса,
-    # поэтому это отдельная проверка, а не следствие доступности.
-    SPEED_SITE_URL: str = "https://gemini.google.com/"
-    # --- Источники замера: несколько сайтов сразу -------------------------------
-    # Скорость меряется не по одному сайту, а по нескольким ОДНОВРЕМЕННО, и итог —
-    SPEED_SOURCES: str = ""
-    # Сколько байт тянуть с КАЖДОГО источника (они идут параллельно).
-    SPEED_PROBE_BYTES: int = 2 * 1024 * 1024
-    # Сколько байт отдавать на проверку вверх.
-    SPEED_UPLOAD_BYTES: int = 1024 * 1024
-    # Сколько источников должны ответить, чтобы замер вообще засчитали: один
-    # ответивший сайт ничего не доказывает.
-    SPEED_MIN_SOURCES: int = 2
-    # Потолок ЧТЕНИЯ, а не размера: медленный сервер отдаёт своё и уходит.
-    SPEED_READ_SECONDS: float = 4.0
-    # Границы категорий: ниже min — slow, от good и выше — fast.
-    SPEED_MIN_MBPS: float = 1.0
-    SPEED_GOOD_MBPS: float = 5.0
-    SPEED_CONCURRENCY: int = 8
-    # Префикс категории: новая метка ЗАМЕНЯет старую speed-*, а не дописывается
-    # к ней. Иначе за несколько прогонов на сервере накапливаются все категории
-    SPEED_TAG_PREFIX: str = "speed-"
-    FLASK_HOST: str = "0.0.0.0"
-    FLASK_PORT: int = 8000
-    DEPLOY_ENABLED: bool = False
-    # Репозиторий owner/repo; токены — GH_DEPLOY_TOKEN (write) и GH_READ_TOKEN (read).
-    GH_DEPLOY_REPO: str = "LaronDambon/sing-box-config"
-    DEPLOY_TEMPLATE: str = "sbc-1.14.json"
-    # Мульти-деплой: шаблоны через запятую/пробел или 'all'.
-    DEPLOY_TEMPLATES: str = ""
-    DEPLOY_PATH: str = "config.json"
-    DEPLOY_CREATE_REPO: bool = False
-    DEPLOY_IP_SOURCE: str = ""
-    DEPLOY_IP_PLACEHOLDER: str = "{{SERVER_IP}}"
-    # Единая точка настройки — pipeline.logging_setup. Всё, что ниже, читается
-    # ОДИН раз при первом обращении к get_logger()/setup_logging().
-    LOG_DIR_PATH: Path = None
-    LOG_LEVEL: int = 0
-    # Уровень консоли отдельно от файлов: LOG_CONSOLE_LEVEL=INFO -> файлы подробнее.
-    LOG_CONSOLE_LEVEL: int = 0
-    # Главный файл: всё, что прошло порог LOG_LEVEL.
-    LOG_FILE_NAME: str = "app.log"
-    # Ротация по размеру: файл до LOG_MAX_BYTES, затем LOG_BACKUP_COUNT копий.
-    LOG_MAX_BYTES: int = 10 * 1024 * 1024
-    LOG_BACKUP_COUNT: int = 5
-    # Очистка по возрасту: файлы старше LOG_RETENTION_DAYS дней удаляются при старте.
-    # 0 = не удалять по возрасту (чистая ротация по размеру).
-    LOG_RETENTION_DAYS: int = 14
-    # Отдельный файл на каждый уровень (info.log/warning.log/error.log) с фильтром
-    # ТОЧНО на уровень: запись INFO попадает только в info.log, а не копией в три
-    LOG_PER_LEVEL_FILES: bool = True
-    # Подробный формат с модулем в файле: text|json
-    LOG_FORMAT: str = "text"
-    # Защита от «пулемёта»: не более LOG_THROTTLE_LIMIT одинаковых сообщений
-    # за LOG_THROTTLE_WINDOW секунд (далее — одна сводная строка).
-    LOG_THROTTLE_LIMIT: int = 20
-    LOG_THROTTLE_WINDOW: float = 60.0
-    # Перенаправлять print()/сторонние библиотеки в логгер (1/0).
-    LOG_CAPTURE_STDOUT: bool = False
-    # Порядок и состав этапов задаются здесь; каждый этап реализуется отдельным
-    # модулем (см. pipeline/checkers и pipeline/stages).
-    PIPELINE_CHECKERS: str = "url_probe,country,reachability,speed"
-    # Этап поиска новых серверов из ссылок (асинхронный, расширяет БД).
-    PIPELINE_DISCOVERY: bool = True
-    # Сколько источников качать одновременно на этапе поиска.
-    PIPELINE_DISCOVERY_CONCURRENCY: int = 6
-    # Сколько батчей проверки крутится одновременно (каждый = свой sing-box).
-    PIPELINE_CHECK_WORKERS: int = 2
-    # Размер батча проверки = сколько серверов уходит в один запуск sing-box.
-    # Наследует URLTEST_BATCH_SIZE (см. from_env).
-    PIPELINE_BATCH_SIZE: int = None
-    # Таймаут одного БАТЧА проверки, сек. Батч из 100 серверов получает
-    # PIPELINE_CHECK_TIMEOUT + PIPELINE_BATCH_STARTUP, осколок — долю от своего
-    PIPELINE_CHECK_TIMEOUT: float = 20.0
-    # Постоянная часть таймаута: запуск sing-box, разбор конфига, резолв DNS.
-    PIPELINE_BATCH_STARTUP: float = 10.0
-    # Таймаут ЧЕКЕРОВ-ДОПОЛНЕНИЙ (страна, достижимость целевых сайтов), сек.
-    # Это отдельные часы: профиль достижимости гоняет каждый сервер через
-    PIPELINE_ENRICH_TIMEOUT: float = 180.0
-    # Сколько попыток повторить батч при сбое ЗАПУСКА sing-box (занятый порт).
-    PIPELINE_MAX_ATTEMPTS: int = 3
-    # Сколько раз сервер возвращается в очередь, если sing-box ни разу не сказал
-    # про него ничего: таймаут батча, сбой конфига, обрыв. Такие серверы не
-    PIPELINE_MAX_RETRIES: int = 3
-    # Очередь проверки живёт в БД (check_queue) и переживает перезапуск.
-    # PIPELINE_QUEUE_PERSIST=1 -> ставить pending-строки обратно в очередь при старте.
-    PIPELINE_QUEUE_PERSIST: bool = True
-    # --- Службы (режим python -m pipeline serve) -------------------------------
-    # Каждая служба крутится своим циклом и общается с остальными через очередь
-    SERVICE_DISCOVERY: bool = True
-    SERVICE_COLLECTOR: bool = True
-    SERVICE_CHECKER: bool = True
-    SERVICE_RESULTS: bool = True
-    SERVICE_PUBLISHER: bool = True
-    SERVICE_DISCOVERY_INTERVAL: float = 3600.0
-    # Сборщик батчей ходит в базу чаще: очередь должна пополняться, пока
-    # подписки обновляются раз в час.
-    SERVICE_COLLECTOR_INTERVAL: float = 60.0
-    # Служба записи забирает вердикты: пауза меньше, чтобы свежие серверы
-    # появлялись в базе сразу после подтверждения.
-    SERVICE_RESULTS_INTERVAL: float = 2.0
-    # Выгрузка свежих рабочих серверов раз в полчаса.
-    SERVICE_PUBLISHER_INTERVAL: float = 1800.0
-    # Деплой по расписанию выключен: выгрузка обновляет списки, публикация —
-    # отдельное решение.
-    SERVICE_PUBLISHER_DEPLOY: bool = False
-    # Папка с ПОЛЬЗОВАТЕЛЬСКИМИ проверяющими алгоритмами (подхватываются автоматически).
-    PIPELINE_CUSTOM_CHECKERS_DIR: Path = None
-    # Экспортировать whitelist.txt/blacklist.txt после цикла.
-    PIPELINE_EXPORT_LISTS: bool = True
-    # Записывать merge.txt (пул проверки) после наполнения очереди.
-    PIPELINE_WRITE_MERGE: bool = True
-
-    # Тэги категорий скорости: fast/ok/slow/blocked/geo.
-    SPEED_TIER_TAGS: dict = field(default_factory=dict)
+    # Секции. Каждая — отдельный дата-класс выше; здесь только ссылки.
+    paths: PathsSettings
+    core: CoreSettings
+    urltest: UrltestSettings
+    sub: SubSettings
+    country: CountrySettings
+    reach: ReachSettings
+    speed: SpeedSettings
+    web: WebSettings
+    deploy: DeploySettings
+    log: LogSettings
+    pipeline: PipelineSettings
+    services: ServicesSettings
 
     # ============================== сборка значений ====================
     @classmethod
@@ -489,7 +606,22 @@ class Settings:
         }
 
         cls._fill_paths(val, source, over)
-        return cls(**val)
+        return cls(**cls._fold(val))
+
+    @staticmethod
+    def _fold(val: dict[str, Any]) -> dict[str, Any]:
+        """Сворачивает плоский словарь в секции.
+
+        Имя настройки в .env и имя поля в секции связаны таблицей _LAYOUT,
+        а не угадываются по префиксу. Исключения из правила перечислены там
+        же, а не спрятаны в коде.
+        """
+        out: dict[str, Any] = {}
+        for section, _prefix, fields in _LAYOUT:
+            out[section] = _SECTION_CLASSES[section](
+                **{field: val[env_name] for env_name, field in fields},
+            )
+        return out
 
     @staticmethod
     def _fill_paths(val, source, over) -> None:
@@ -526,8 +658,20 @@ class Settings:
         )
 
     def as_dict(self) -> dict[str, Any]:
-        """Все значения словарём — для логов и отладки."""
-        return {f.name: getattr(self, f.name) for f in dataclass_fields(self)}
+        """Все значения словарём — для логов и отладки.
+
+        Раскрывает секции, чтобы в лог попало всё, а не пустые объекты.
+        """
+        out: dict[str, Any] = {}
+        for section, _prefix, fields in _LAYOUT:
+            nested = getattr(self, section)
+            for env_name, field in fields:
+                # Ключ — имя из .env, а НЕ имя поля: полей с одинаковым
+                # именем несколько (timeout есть в country/reach/urltest,
+                # enabled — в speed/reach/country/deploy), и по именам полей
+                # словарь молча терял бы 10 настроек. Имя из .env уникально.
+                out[env_name] = getattr(nested, field)
+        return out
 
 _SING_BOX_BIN = "sing-box.exe" if os.name == "nt" else "sing-box"
 
@@ -572,12 +716,33 @@ def get_settings() -> Settings:
 
 
 def setting(name: str, default: Any = None) -> Any:
-    """Настройка по имени, как в .env: setting("PIPELINE_BATCH_SIZE").
+    """Настройка по имени из .env: setting("PIPELINE_BATCH_SIZE").
 
-    Основной способ достать настройку в коде, который не получает объект
-    сверху. Имя настройки называется ровно один раз — здесь строкой, в
-    .env строкой же. Отдельные константы больше не нужны и не должны
-    появляться: это и есть та вторая связь, которая ломалась молча.
+    ВРЕМЕННЫЙ СПОСОБ. Основной сейчас — атрибутный:
+        get_settings().speed.enabled
+    Он ловит опечатку сам (AttributeError), а этот способ — только
+    проверкой ниже. Функция нужна, пока идёт перевод мест чтения;
+    когда строковых вызовов не останется, она удаляется.
+
+    На неизвестное имя — исключение, а не None. Молчаливый None означал бы,
+    что опечатка в имени уезжает в сравнение и всплывает позже, в другом
+    месте и с другим симптомом. Именно так потерялся SPEED_TIER_TAGS:
+    поля не было в таблице синонимов, и ошибка обнаружилась на живом
+    запуске, а не в тестах.
     """
-    value = getattr(get_settings(), name, None)
-    return default if value is None else value
+    where = _BY_ENV_NAME.get(name)
+    if where is None:
+        raise KeyError(
+            "нет настройки %r. Похожие: %s. Правильный путь обычно "
+            "виден в config/settings.py в таблице _LAYOUT"
+            % (name, ", ".join(_closest(name)) or "совпадений нет")
+        )
+    section, field = where
+    return getattr(getattr(get_settings(), section), field)
+
+
+def _closest(name: str, limit: int = 3) -> list[str]:
+    """Ближайшие по написанию имена настроек — для подсказки в ошибке."""
+    import difflib
+
+    return difflib.get_close_matches(name, _BY_ENV_NAME, n=limit, cutoff=0.6)

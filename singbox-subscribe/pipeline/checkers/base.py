@@ -147,12 +147,12 @@ class CheckContext:
         """
         if name in self.settings:
             return self.settings[name]
-        from config.settings import get_settings
+        # Через setting(), а не getattr(get_settings(), name): значения
+        # лежат в секциях, и getattr по имени из .env возвращал None
+        # МОЛЧА — чекер уходил в int(None) вместо падения на опечатке.
+        from config.settings import setting
 
-        value = getattr(get_settings(), name, None)
-        if value is None:
-            return default
-        return value
+        return setting(name, default)
 
     @staticmethod
     async def run_sync(func, *args, **kwargs):

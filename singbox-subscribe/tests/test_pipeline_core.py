@@ -505,6 +505,7 @@ async def test_settings_loading() -> None:
     print("\n--- загрузка настроек ---")
     from config.settings import (
         Settings, get_settings, init_settings, parse_level, read_env_file,
+        setting, _BY_ENV_NAME,
     )
 
     tmp = TMP / "env_for_settings"
@@ -529,24 +530,24 @@ async def test_settings_loading() -> None:
           read_env_file(tmp / "нет-такого.env") == {})
 
     s = Settings.from_env(overrides={}, env_file=env_file)
-    check("значение из .env прочитано", s.URLTEST_BATCH_SIZE == 42, s.URLTEST_BATCH_SIZE)
-    check("кавычки сняты", s.REACHABILITY_GLOBAL_TAG == "Из .env", s.REACHABILITY_GLOBAL_TAG)
+    check("значение из .env прочитано", s.urltest.batch_size == 42, s.urltest.batch_size)
+    check("кавычки сняты", s.reach.global_tag == "Из .env", s.reach.global_tag)
     # Умолчание здесь — из поля Settings (2), а не из репозиторного
     # .env: тест читает СВОЙ файл, поэтому значения репозитория не видны.
     check("битое число -> умолчание, а не падение",
-          s.PIPELINE_CHECK_WORKERS == 2, s.PIPELINE_CHECK_WORKERS)
-    check("строка «no» понята как False", s.SPEED_ENABLED is False, s.SPEED_ENABLED)
+          s.pipeline.check_workers == 2, s.pipeline.check_workers)
+    check("строка «no» понята как False", s.speed.enabled is False, s.speed.enabled)
     check("PIPELINE_BATCH_SIZE наследует URLTEST_BATCH_SIZE",
-          s.PIPELINE_BATCH_SIZE == 42, s.PIPELINE_BATCH_SIZE)
+          s.pipeline.batch_size == 42, s.pipeline.batch_size)
 
     # Перекрытие кодом сильнее .env И сильнее мусора.
     check("override сильнее .env",
           Settings.from_env(overrides={"URLTEST_BATCH_SIZE": 7},
-                            env_file=env_file).URLTEST_BATCH_SIZE == 7)
+                            env_file=env_file).urltest.batch_size == 7)
     # И приводится к типу: мусор в override не должен уехать строкой.
     check("override тоже приводится к типу",
           Settings.from_env(overrides={"URLTEST_BATCH_SIZE": "ерунда"},
-                            env_file=env_file).URLTEST_BATCH_SIZE == 42)
+                            env_file=env_file).urltest.batch_size == 42)
 
     check("уровень понимает имя и число",
           parse_level("DEBUG") == 10 and parse_level("25") == 25)
@@ -558,29 +559,37 @@ async def test_settings_loading() -> None:
     try:
         check("LOG_CONSOLE_LEVEL наследует LOG_LEVEL",
               Settings.from_env(overrides={"LOG_LEVEL": "WARNING"},
-                                env_file=env_file).LOG_CONSOLE_LEVEL == 30)
+                                env_file=env_file).log.console_level == 30)
     finally:
         if saved_console is not None:
             os.environ["LOG_CONSOLE_LEVEL"] = saved_console
 
     # Пути считаются от корня, а не из .env.
-    check("путь от корня проекта", s.SERVERS_DB_FILE.name == "servers.db", s.SERVERS_DB_FILE)
+    check("путь от корня проекта",
+          s.paths.servers_db_file.name == "servers.db", s.paths.servers_db_file)
     check("переопределяемый путь берётся из окружения",
           str(Settings.from_env(
               overrides={"CONFIG_TEMPLATE_DIR": r"C:\шблоны"},
-              env_file=env_file).CONFIG_TEMPLATE_DIR) == r"C:\шблоны")
+              env_file=env_file).paths.config_template_dir) == r"C:\шблоны")
 
     check("все пути заполнены",
-          all(getattr(s, n) is not None for n in (
-              "URLS_FILE", "SERVERS_DB_FILE", "URLTEST_TEMPLATE",
-              "SING_BOX_PATH", "LOG_DIR_PATH", "PIPELINE_CUSTOM_CHECKERS_DIR")))
+          all(getattr(s.paths, n) is not None for n in (
+              "urls_file", "servers_db_file", "urltest_template",
+              "sing_box_path", "custom_checkers_dir"))
+          and s.log.dir_path is not None)
     check("теги скорости собраны",
-          s.SPEED_TIER_TAGS["fast"] == "speed-fast"
-          and s.SPEED_TIER_TAGS["geo"] == "speed-geo", s.SPEED_TIER_TAGS)
+          s.speed.tier_tags["fast"] == "speed-fast"
+          and s.speed.tier_tags["geo"] == "speed-geo", s.speed.tier_tags)
 
+    # as_dict ключуется именем из .env: полей с одинаковым именем (timeout,
+    # concurrency, enabled) по нескольку, и по именам полей словарь молча
+    # терял бы часть настроек.
     d = s.as_dict()
-    check("as_dict отдаёт все поля", len(d) == len(type(s).as_dict.__doc__ or "") or len(d) > 80,
-          len(d))
+    check("as_dict отдаёт все 90 настроек", len(d) == 90, len(d))
+    check("as_dict ключуется именами из .env", "SPEED_ENABLED" in d, sorted(d)[:3])
+    check("as_dict без потерь на повторяющихся именах",
+          d["URLTEST_TIMEOUT"] == 10.0 and d["COUNTRY_CHECK_TIMEOUT"] == 6.0
+          and d["REACHABILITY_TIMEOUT"] == 6.0, "таймауты слиплись")
 
     # Один объект на процесс + понятная ошибка вместо AttributeError.
     got = init_settings()
@@ -593,10 +602,35 @@ async def test_settings_loading() -> None:
     check("повторный init_settings() не пересобирает",
           init_settings() is got)
     check("перекрытие переживает повторный вызов",
-          init_settings(PIPELINE_BATCH_SIZE=77).PIPELINE_BATCH_SIZE == 77,
+          init_settings(PIPELINE_BATCH_SIZE=77).pipeline.batch_size == 77,
           "перекрытие потерялось: повторный вызов его обнулил")
-    init_settings(PIPELINE_BATCH_SIZE=s.URLTEST_BATCH_SIZE)
+    init_settings(PIPELINE_BATCH_SIZE=s.urltest.batch_size)
 
+    # Неизвестное имя должно ПАдать. Раньше setting() возвращал None, и
+    # опечатка уезжала в сравнение и всплывала позже, в другом месте.
+    # Именно так потерялся SPEED_TIER_TAGS: поля не было в таблице
+    # синонимов, и ошибка обнаружилась на живом запуске, а не в тестах.
+    try:
+        setting("SPEED_ENABLE")
+        check("опечатка в имени падает", False, "исключения не было")
+    except KeyError as exc:
+        check("опечатка в имени падает", True)
+        check("в ошибке есть подсказка", "SPEED_ENABLED" in str(exc), str(exc)[:120])
+
+    # Атрибутный доступ ловит опечатку сам, без всякой проверки строк.
+    try:
+        s.speed.enabld
+        check("опечатка в атрибуте падает сама", False, "исключения не было")
+    except AttributeError:
+        check("опечатка в атрибуте падает сама", True)
+
+    # Каждая настройка .env доступна и по секции, и по имени — значения те же.
+    # Сравниваем с s — он собран из файла теста. got получен раньше, ДО
+    # перекрытия PIPELINE_BATCH_SIZE=77, и к этому моменту уже другой.
+    _g = get_settings()
+    check("секции и имена дают одно значение",
+          all(setting(n) == getattr(getattr(_g, sec), fld)
+              for n, (sec, fld) in _BY_ENV_NAME.items()), "расхождение секций")
 
 async def test_best_tags() -> None:
     """Отбор «лучших»: лучший по профилю получает дополнительный тег."""
