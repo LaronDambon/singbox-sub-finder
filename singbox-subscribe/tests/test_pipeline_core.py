@@ -1160,13 +1160,40 @@ def test_capability_tags_do_not_break_url_parsing() -> None:
     check("get_nodes вернул узел, а не упал", bool(nodes),
           "узлов: %d" % len(nodes or []))
 
-    # IPv6 в скобках содержит двоеточие и режется быть не должен
+    # Метки в ФРАГМЕНТЕ должны остаться: из фрагмента берётся тег узла,
+    # и без меток ни один узел не попадёт ни в одну группу шаблона.
+    # Формат боевой строки: <vless-uri>#<флажок> <протокол> <id>[метки]
+    vless_line = ("vless://4643976f-85fa-40cf-9e58-ea28b50f253b@1.2.3.4:443"
+                  "?encryption=none&type=tcp#"
+                  "US vless 000601-ping-208-stable-96"
+                  "[youtube][telegram][microsoft][yandex][speed-slow]")
+    frag = vless_line.split("#", 1)[1]
+    check("метки во фрагменте НЕ срезаны",
+          strip_capability_tags(vless_line).split("#", 1)[1] == frag,
+          strip_capability_tags(vless_line).split("#", 1)[1][-60:])
+
+    # vless: метки в хвосте фрагмента — на месте, ссылка не тронута
     v6 = "vless://4643976f-85fa-40cf-9e58-ea28b50f253b@[2001:db8::1]:443?type=tcp#A"
     check("IPv6-адрес не срезан",
           strip_capability_tags(v6) == v6, strip_capability_tags(v6))
     v6tag = v6 + "[openai]"
-    check("IPv6 с меткой — адрес цел, метка снята",
-          strip_capability_tags(v6tag) == v6, strip_capability_tags(v6tag))
+    check("IPv6 с меткой во фрагменте — всё цело",
+          strip_capability_tags(v6tag) == v6tag, strip_capability_tags(v6tag))
+
+    # vmess: фрагмента нет, метки приклеены к самой ссылке — срезаются
+    vm = "vmess://eyJhZGQiOiAiMS4yLjMuNCJ9=[openai][speed-slow]"
+    check("метки, приклеенные к ссылке, срезаны",
+          strip_capability_tags(vm) == "vmess://eyJhZGQiOiAiMS4yLjMuNCJ9=",
+          strip_capability_tags(vm))
+
+    # И главное: тег реального узла обязан сохранить метки.
+    # Именно по тегу шаблоны фильтруют группы (proxy, OpenAI-ping, ...).
+    # Когда метки срезались, все группы выходили пустыми и деплой падал.
+    nodes = get_nodes(vless_line)
+    tags = [n.get("tag") for n in (nodes or []) if isinstance(n, dict)]
+    check("метки сохранились в теге узла",
+          any("youtube" in (tg or "") for tg in tags), tags[:2])
+    check("узел собран", bool(tags), tags[:2])
 
 
 async def test_best_tags() -> None:
