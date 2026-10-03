@@ -779,3 +779,53 @@ def find_free_port():
         return sock.getsockname()[1]
 
 
+#: Верхний порт, который вообще можно занять.
+MAX_PORT = 65535
+#: Сколько неудачных проверок подряд допускаем, прежде чем признать неудачу.
+#: Нужно, чтобы цикл не крутился вечно, если свободных портов не хватит.
+PORT_SCAN_LIMIT = 20000
+
+
+def reserve_ports(count: int) -> list[int]:
+    """Подбирает count свободных TCP-портов на 127.0.0.1.
+
+    Обход идёт вверх от эфемерного порта, который выдала ОС. Но эфемерный
+    диапазон ограничен сверху теми же 65535, и на загруженной машине обход
+    доходит до края раньше, чем наберётся нужное количество: bind() на
+    порту выше границы бросает OverflowError, и подбор падал целиком.
+
+    На краю диапазона берём у ОС новый эфемерный порт и продолжаем с него,
+    вместо того чтобы падать.
+    """
+    ports: list[int] = []
+    used: set[int] = set()
+    candidate = find_free_port()
+    misses = 0
+    while len(ports) < count:
+        if misses > PORT_SCAN_LIMIT:
+            raise RuntimeError(
+                "свободных портов не нашлось: нужно %d, пропущено %d подряд"
+                % (count, misses),
+            )
+        if candidate > MAX_PORT:
+            candidate = find_free_port()
+            misses += 1
+            continue
+        if candidate in used:
+            misses += 1
+            candidate += 1
+            continue
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", candidate))
+            except OSError:
+                misses += 1
+                candidate += 1
+                continue
+        ports.append(candidate)
+        used.add(candidate)
+        misses = 0
+        candidate += 1
+    return ports
+
+

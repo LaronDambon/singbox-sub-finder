@@ -191,7 +191,6 @@ class UrltestSettings:
     """Настройки: urltest."""
 
     url: str
-    timeout: float
     batch_size: int
 
 
@@ -341,7 +340,7 @@ _LAYOUT: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] = (
         ("BEST_TOP", "best_top"), ("SING_BOX_PORT", "sing_box_port"),
     )),
     ("urltest", "URLTEST_", (
-        ("URLTEST_URL", "url"), ("URLTEST_TIMEOUT", "timeout"),
+        ("URLTEST_URL", "url"),
         ("URLTEST_BATCH_SIZE", "batch_size"),
     )),
     ("sub", "SUB_DOWNLOAD_", (("SUB_DOWNLOAD_CONCURRENCY", "concurrency"),)),
@@ -518,7 +517,6 @@ class Settings:
         val["NEW_SERVER_STABLE"] = get('NEW_SERVER_STABLE', 5, _as_int)
         val["SHIELD_CYCLES"] = get('SHIELD_CYCLES', 96, _as_int)
         val["URLTEST_URL"] = get('URLTEST_URL', "https://speed.cloudflare.com/__down?during=download&bytes=2048576")
-        val["URLTEST_TIMEOUT"] = get('URLTEST_TIMEOUT', 10.0, _as_float)
         val["URLTEST_BATCH_SIZE"] = get('URLTEST_BATCH_SIZE', 100, _as_int)
         val["SING_BOX_PORT"] = get('SING_BOX_PORT', 7891, _as_int)
         val["SUB_DOWNLOAD_CONCURRENCY"] = get('SUB_DOWNLOAD_CONCURRENCY', 6, _as_int)

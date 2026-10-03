@@ -62,8 +62,10 @@ class UrlProbeChecker(Checker):
 
         settings = ctx.settings
         self.batch_size = int(settings.get("batch_size", self.batch_size))
-        self.timeout = float(settings.get("timeout", self.timeout))
         self.max_attempts = int(settings.get("max_attempts", self.max_attempts))
+        # Ключа "timeout" в настройках прогона НЕТ, поэтому строка
+        # settings.get("timeout", ...) всегда возвращала self.timeout и
+        # ничего не меняла — чтение с виду живое, а по делу мёртвое.
         self.urltest = get_settings().urltest.url
         # Один батч на вызов check(): параллелизмом занимается диспетчер,
         # когда он сам набирает серверы из базы.

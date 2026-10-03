@@ -51,6 +51,7 @@ ROOT = Path(__file__).resolve().parents[1]
 from config.settings import get_settings
 
 from script.logger_utils import get_project_logger
+from script.core import reserve_ports
 
 LOGGER = get_project_logger("country_check")
 
@@ -229,28 +230,6 @@ def _build_batch_config(entries: list[dict], template_path: Path) -> dict:
     return config
 
 
-def _reserve_ports(count: int) -> list[int]:
-    """Подбирает count свободных TCP-портов на 127.0.0.1."""
-    ports: list[int] = []
-    # Берём базовый свободный порт и проверяем соседей связыванием.
-    base_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    base_sock.bind(("127.0.0.1", 0))
-    candidate = base_sock.getsockname()[1]
-    base_sock.close()
-    used: set[int] = set()
-    while len(ports) < count:
-        if candidate not in used:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                s.bind(("127.0.0.1", candidate))
-                ports.append(candidate)
-                used.add(candidate)
-            except OSError:
-                pass
-            finally:
-                s.close()
-        candidate += 1
-    return ports
 
 
 def _start_singbox(config: dict, config_path: Path):
@@ -356,7 +335,7 @@ def _run_batch(items: list[tuple[str, int]], results: dict[str, dict],
     if not active:
         return
 
-    ports = _reserve_ports(len(active))
+    ports = reserve_ports(len(active))
     for e, p in zip(active, ports):
         e["port"] = p
 

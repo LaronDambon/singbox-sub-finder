@@ -28,6 +28,7 @@ from typing import Callable, Iterable, Sequence
 
 from config.settings import get_settings
 from script.logger_utils import get_project_logger
+from script.core import reserve_ports
 
 LOGGER = get_project_logger("proxy_probe")
 
@@ -40,27 +41,6 @@ ProbeFn = Callable[[int, str], dict]
 
 
 # --- Порты -------------------------------------------------------------------
-def reserve_ports(count: int) -> list[int]:
-    """Подбирает count свободных портов на 127.0.0.1."""
-    ports: list[int] = []
-    base_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    base_sock.bind(("127.0.0.1", 0))
-    candidate = base_sock.getsockname()[1]
-    base_sock.close()
-    used: set[int] = set()
-    while len(ports) < count:
-        if candidate not in used:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                s.bind(("127.0.0.1", candidate))
-                ports.append(candidate)
-                used.add(candidate)
-            except OSError:
-                pass
-            finally:
-                s.close()
-        candidate += 1
-    return ports
 
 
 def ports_ready(ports: Sequence[int], deadline_seconds: float) -> bool:

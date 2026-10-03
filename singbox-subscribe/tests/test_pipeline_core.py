@@ -585,11 +585,14 @@ async def test_settings_loading() -> None:
     # concurrency, enabled) по нескольку, и по именам полей словарь молча
     # терял бы часть настроек.
     d = s.as_dict()
-    check("as_dict отдаёт все 90 настроек", len(d) == 90, len(d))
+    check("as_dict отдаёт все 89 настроек", len(d) == 89, len(d))
     check("as_dict ключуется именами из .env", "SPEED_ENABLED" in d, sorted(d)[:3])
+    # Три разных таймаута под разными именами не должны слипться: раньше
+    # одним из них был URLTEST_TIMEOUT, он удалён в 2.5.2 как нечитаемый.
     check("as_dict без потерь на повторяющихся именах",
-          d["URLTEST_TIMEOUT"] == 10.0 and d["COUNTRY_CHECK_TIMEOUT"] == 6.0
-          and d["REACHABILITY_TIMEOUT"] == 6.0, "таймауты слиплись")
+          d["COUNTRY_CHECK_TIMEOUT"] == 6.0 and d["REACHABILITY_TIMEOUT"] == 6.0
+          and d["PIPELINE_CHECK_TIMEOUT"] == 20.0
+          and d["PIPELINE_BATCH_STARTUP"] == 10.0, "таймауты слиплись")
 
     # Один объект на процесс + понятная ошибка вместо AttributeError.
     got = init_settings()
@@ -631,6 +634,79 @@ async def test_settings_loading() -> None:
             stale.append(_f.relative_to(_root).as_posix())
     check("строковых чтений настроек не осталось", not stale, stale)
 
+    # Плоские атрибуты вида settings.PIPELINE_BATCH_SIZE. Этот вид проскочил
+    # мимо первого перевода: он не содержит вызова setting(), поэтому поиск
+    # по нему его не видел. А на живом запуске main.py падал с AttributeError.
+    import re as _re2
+
+    _flat = []
+    for _f in _root.rglob("*.py"):
+        # tests/ пропускаем: здесь сам образец плоского имени стоит в
+        # комментарии, и проверка находила бы его, а не код.
+        if ".venv" in str(_f) or "tests" in _f.parts:
+            continue
+        _txt = _f.read_text(encoding="utf-8", errors="replace")
+        _hits = _re2.findall(r"\b(?:settings|self\.settings)\.[A-Z][A-Z0-9_]{2,}", _txt)
+        if _hits:
+            _flat.append("%s: %s" % (_f.relative_to(_root).as_posix(), sorted(set(_hits))))
+    check("плоских обращений к настройкам не осталось", not _flat, _flat)
+
+    # Настройка, которую никто не читает. URLTEST_TIMEOUT попал в .env и в
+    # .env.example, но в коде не встречался ни разу: после появления батчей
+    # срок стал считаться по закону 5с * ceil(N/10) плюс два отступа, а
+    # настройка осталась в списке. Надо было заметить это здесь, а не через
+    # год. Проверяем, что каждый путь из таблицы встречается в коде проекта.
+    _code = []
+    for _f in _root.rglob("*.py"):
+        if ".venv" in str(_f):
+            continue
+        _rel = _f.relative_to(_root).as_posix()
+        if _rel.startswith("tests/"):
+            continue
+        _code.append(_f.read_text(encoding="utf-8", errors="replace"))
+    _code_all = "\n".join(_code)
+
+    # Строки сборщика вида val["ИМЯ"] = get(...) — это ОПРЕДЕЛЕНИЕ, а не
+    # чтение: они есть у всех настроек по построению, и считать их чтением
+    # нельзя, иначе проверка ничего не находит. Выкидываем их.
+    _without_defs = _re2.sub(
+        r'val\[[\x22\x27][A-Z0-9_]+[\x22\x27]\]\s*=\s*get\(', "", _code_all)
+
+    def _read_somewhere(env_name: str, section: str, field: str) -> bool:
+        # 1) штатный доступ через секцию: get_settings().секция.поле
+        if ("." + section + "." + field) in _code_all:
+            return True
+        # 2) значение служит дефолтом для другой настройки:
+        #    val["ДРУГАЯ"] = get("ДРУГАЯ", val["ИМЯ"], ...)
+        if (", val[\"%s\"]" % env_name) in _without_defs:
+            return True
+        # 3) чтение в обход настроек: os.getenv("ИМЯ")
+        if ('getenv("%s"' % env_name) in _code_all:
+            return True
+        return False
+
+    _unused = [
+        "%s -> %s.%s" % (_n, _s, _f)
+        for _n, (_s, _f) in _BY_ENV_NAME.items()
+        if not _read_somewhere(_n, _s, _f)
+    ]
+    check("каждую настройку кто-то читает", not _unused, _unused)
+
+    # main.py — точка входа, ошибка в ней видна только на живом запуске.
+    # Поэтому собираем настройки этапов так же, как это делает он.
+    import argparse as _argparse
+    import main as _main_mod
+
+    _args = _main_mod.build_parser().parse_args([])
+    _stages = _main_mod.settings_from_args(_args, init_settings())
+    check("main.py собирает настройки этапов",
+          set(_stages) == {"discovery", "export_lists", "batch_size", "check_workers"},
+          sorted(_stages))
+    check("настройки этапов равны секции pipeline",
+          _stages["batch_size"] == get_settings().pipeline.batch_size
+          and _stages["check_workers"] == get_settings().pipeline.check_workers,
+          _stages)
+
     # Каждая настройка из .env доступна по своему пути через секцию, и путь
     # этот ровно один на настройку.
     _g = get_settings()
@@ -639,9 +715,53 @@ async def test_settings_loading() -> None:
               for sec, fld in _BY_ENV_NAME.values()),
           "какое-то поле оказалось None")
     check("число настроек совпадает с числом путей",
-          len(_BY_ENV_NAME) == 90, len(_BY_ENV_NAME))
-    check("в as_dict все 90", len(_g.as_dict()) == 90, len(_g.as_dict()))
+          len(_BY_ENV_NAME) == 89, len(_BY_ENV_NAME))
+    check("в as_dict все 89", len(_g.as_dict()) == 89, len(_g.as_dict()))
 
+
+
+async def test_reserve_ports() -> None:
+    import socket as _socket
+
+    import script.core as _core
+
+    # Обычный случай: порты уникальны и действительно bind-ятся.
+    _p = _core.reserve_ports(50)
+    check("50 портов, без повторов", len(set(_p)) == 50, len(set(_p)))
+    check("все порты в диапазоне", all(1 <= x <= 65535 for x in _p))
+    _bad = 0
+    for _port in _p[:25]:
+        _t = _socket.socket()
+        try:
+            _t.bind(("127.0.0.1", _port))
+        except OSError:
+            _bad += 1
+        finally:
+            _t.close()
+    check("выданные порты свободны", _bad == 0, _bad)
+
+    # Перескок через верх диапазона. Старый код доходил до bind(65536)
+    # и падал OverflowError. Подменяем ОС: первый эфемерный порт — 65533,
+    # то есть свободны всего два, а протим пять.
+    _orig = _core.find_free_port
+    _calls = {"n": 0}
+
+    def _fake():
+        _calls["n"] += 1
+        return 65533 if _calls["n"] == 1 else 40000 + _calls["n"]
+
+    _core.find_free_port = _fake
+    try:
+        _w = _core.reserve_ports(5)
+        check("перескок через 65535 не падает", True)
+        check("после перескока порты валидны",
+              all(1 <= x <= 65535 for x in _w), _w)
+        check("перескок случился", _calls["n"] >= 2, _calls["n"])
+        check("повторов после перескока нет", len(set(_w)) == len(_w), _w)
+    except OverflowError as exc:
+        check("перескок через 65535 не падает", False, repr(exc))
+    finally:
+        _core.find_free_port = _orig
 
 
 async def test_best_tags() -> None:
@@ -1636,6 +1756,7 @@ async def _amain() -> None:
     test_server_filters()
     test_validate_config_groups()
     await test_settings_loading()
+    await test_reserve_ports()
     await test_best_tags()
     await test_urltest_parsing()
     await test_collector_three_states()

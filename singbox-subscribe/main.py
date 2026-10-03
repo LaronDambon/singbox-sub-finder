@@ -76,12 +76,10 @@ def build_parser() -> argparse.ArgumentParser:
 #: а этапы pipeline — про короткие ключи настроек. Слияние — отдельная
 #: задача; здесь важно, что перекрытия уходят в объект настроек, а не
 #: теряются по дороге.
-_ENV_TO_PIPELINE_KEY = {
-    "PIPELINE_DISCOVERY": "discovery",
-    "PIPELINE_EXPORT_LISTS": "export_lists",
-    "PIPELINE_BATCH_SIZE": "batch_size",
-    "PIPELINE_CHECK_WORKERS": "check_workers",
-}
+#: Все четыре лежат в секции pipeline, поэтому имена из .env здесь больше не
+#: нужны: достаточно имени поля. Таблица соответствия имён живёт одна, в
+#: config/settings.py (_LAYOUT), и дублировать её в main.py незачем.
+_PIPELINE_KEYS = ("discovery", "export_lists", "batch_size", "check_workers")
 
 
 def env_overrides(args: argparse.Namespace) -> dict:
@@ -99,8 +97,8 @@ def env_overrides(args: argparse.Namespace) -> dict:
 def settings_from_args(args: argparse.Namespace, settings) -> dict:
     """Настройки этапов pipeline, собранные из общего объекта Settings."""
     return {
-        key: getattr(settings, env_name)
-        for env_name, key in _ENV_TO_PIPELINE_KEY.items()
+        key: getattr(settings.pipeline, key)
+        for key in _PIPELINE_KEYS
     }
 
 
@@ -140,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging()
     LOGGER.info(
         "Запуск main.py: батч %d, воркеров %d, чекеры из .env",
-        settings.PIPELINE_BATCH_SIZE, settings.PIPELINE_CHECK_WORKERS,
+        settings.pipeline.batch_size, settings.pipeline.check_workers,
     )
 
     async def amain() -> int:

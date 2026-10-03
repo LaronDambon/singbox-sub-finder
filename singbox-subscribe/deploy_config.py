@@ -782,7 +782,16 @@ def main(argv=None):
                         help="Путь файла внутри репозитория (default: config.json); в мульти-режиме используется только каталог из него")
     parser.add_argument("--token", default="", help="ДЕПЛОЙ-токен write (иначе GH_DEPLOY_TOKEN/GH_TOKEN)")
     parser.add_argument("--read-token", default="", help="READ-токен read-only для скачивания (иначе GH_READ_TOKEN)")
-    parser.add_argument("--create", action="store_true", help="Создать репозиторий, если его нет")
+    # По умолчанию — из настройки DEPLOY_CREATE_REPO. Раньше флаг всегда
+    # был False и настройку никто не читал: она стояла в .env, выглядела
+    # рабочей, а выгрузка репозиторий не создавала.
+    from config.settings import get_settings
+
+    parser.add_argument(
+        "--create", action="store_true",
+        default=get_settings().deploy.create_repo,
+        help="Создать репозиторий, если его нет (по умолчанию DEPLOY_CREATE_REPO)",
+    )
     parser.add_argument("--private", action="store_true", default=True, help="Создавать репо приватным (по умолчанию да)")
     parser.add_argument("--source", default="whitelist", help="whitelist|file:<путь>")
     parser.add_argument("--file", default=None, help="Путь к файлу URI при --source file")
