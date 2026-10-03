@@ -861,6 +861,87 @@ async def test_batch_helpers_actually_run() -> None:
           _bs.ports_ready(_bs.reserve_ports(2), 0.5) is False)
 
 
+async def test_reach_profile_replaces_its_own_tags() -> None:
+    """Профиль достижимости ЗАМЕНЯЕТ свой прошлый, а не сливается с ним.
+
+    Чекер скорости вытесняет свои теги префиксом "speed-". Чекер
+    достижимости префикса не задавал, поэтому его профиль объединялся с
+    прежним, и тег [Global], полученный когда-то, жил вечно.
+
+    Замер на боевой базе после прогона: из 38 серверов с тегом [Global]
+    полный набор из восьми целей имел ОДИН.
+
+    Первая версия теста проверяла только семантику БД и потому проходила
+    и на сломанном коде: флаг в record_results передавался руками, минуя
+    чекер. Поэтому здесь вызывается сам чекер.
+    """
+    import pipeline.checkers.builtin.reachability as _rc
+    from pipeline.checkers.base import CheckResult as _CR
+    from script.server_store import ServerStore as _SS
+
+    _NAMES = ("openrouter", "openai", "gemini", "youtube",
+              "telegram", "github", "microsoft", "yandex")
+    # у цели есть и name, и tag: profile_to_tags читает tag
+    _tg = [{"name": n, "tag": n, "url": "https://%s.example" % n,
+            "max_ping_ms": 2000} for n in _NAMES]
+    _LINE = "vless://4643976f-85fa-40cf-9e58-ea28b50f253b@1.2.3.4:443?type=tcp#A"
+
+    # --- часть 1: чекер реально проставляет префикс вытеснения
+    _c = _rc.ReachabilityChecker()
+    _c.enabled = True
+    _c._targets = _tg
+    _c.global_tag = "Global"
+    _c._target_tags = _rc.ReachabilityChecker.compute_target_tags(_tg, "Global")
+
+    # подменяем запуск sing-box: две из восьми целей достигнуты
+    async def _fake_run(_fn, _lines, **_kw):
+        return {_LINE: {"targets": {"openrouter": {"ok": True},
+                                    "gemini": {"ok": True}}}}
+
+    _rc.ReachabilityChecker.filter_lines = lambda self, ctx: [_LINE]
+    _orig_run = _rc.run_exclusive
+    _rc.run_exclusive = _fake_run
+    try:
+        _res = await _c.check(None)
+    finally:
+        _rc.run_exclusive = _orig_run
+        del _rc.ReachabilityChecker.filter_lines
+
+    _out = list(_res.outcomes.values())[0]
+    _repl = set(_out.capabilities_replace or ())
+    check("чекер вытесняет и цели, и Global",
+          _repl == set(_NAMES) | {"Global"}, sorted(_repl))
+    check("чекер НЕ вытесняет теги скорости",
+          not any(x.startswith("speed") for x in _repl), sorted(_repl))
+    check("профиль двух целей не помечен Global",
+          _out.capabilities == "openrouter,gemini", _out.capabilities)
+
+    # --- часть 2: с таким префиксом прошлый Global исчезает
+    _db = TMP / "replace_tags.db"
+    if _db.exists():
+        _db.unlink()
+    _st = _SS(_db)
+    _st.upsert_lines([_LINE])
+    _key = next(iter(_st.load_stable_map()))
+
+    _st.record_results([{"key": _key, "available": 1, "stable": 10,
+                         "capabilities": "Global"}])
+    check("после первого прогона есть Global",
+          _st.get_capabilities(_key) == "Global", _st.get_capabilities(_key))
+
+    _st.record_results([{
+        "key": _key, "available": 1, "stable": 10,
+        "capabilities": "openrouter,gemini,speed-slow",
+        "capabilities_replace": _out.capabilities_replace,
+    }])
+    _got = _st.get_capabilities(_key)
+    check("Global исчез, когда сервер перестал проходить все цели",
+          "Global" not in _got, _got)
+    check("новые цели записаны", "openrouter" in _got, _got)
+    check("теги скорости чужого чекера сохранены",
+          "speed-slow" in _got, _got)
+
+
 async def test_best_tags() -> None:
     """Отбор «лучших»: лучший по профилю получает дополнительный тег."""
     print("\n--- метки лучших серверов ---")
@@ -1856,6 +1937,7 @@ async def _amain() -> None:
     await test_reserve_ports()
     await test_checkers_share_batch_helpers()
     await test_batch_helpers_actually_run()
+    await test_reach_profile_replaces_its_own_tags()
     await test_best_tags()
     await test_urltest_parsing()
     await test_collector_three_states()

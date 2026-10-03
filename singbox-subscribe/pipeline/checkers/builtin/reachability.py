@@ -35,6 +35,9 @@ class ReachabilityChecker(Checker):
         self.max_ping_ms: int | None = None
         self._targets: list[dict] = []
         self._alive: set[str] = set()
+        # Имена целей + сам тег Global: всё, что принадлежит профилю
+        # достижимости и должно вытесняться при новом прогоне.
+        self._target_tags: tuple[str, ...] = ()
 
     async def setup(self, ctx) -> None:
         self.enabled = bool(get_settings().reach.enabled)
@@ -63,6 +66,7 @@ class ReachabilityChecker(Checker):
         except Exception as exc:  # noqa: BLE001 — нет файла целей = фича выключена
             LOGGER.warning("Список целей не загружен, reachability выключен: %s", exc)
             self._targets = []
+        self._target_tags = self.compute_target_tags(self._targets)
         if self._targets:
             LOGGER.info(
                 "Reachability: %d целей, профиль для stable >= %d, порог TTFB: %s",
@@ -70,6 +74,20 @@ class ReachabilityChecker(Checker):
                 f"{self.max_ping_ms} мс (всем целям)" if self.max_ping_ms
                 else f"{default_ping} мс по умолчанию, у целей свои",
             )
+
+    @staticmethod
+    def compute_target_tags(targets: list[dict], global_tag: str = "Global") -> tuple[str, ...]:
+        """Префиксы, которые профиль достижимости вытесняет при записи.
+
+        Чекер скорости вытесняет свои теги префиксом "speed-". Без своего
+        префикса профиль объединялся с прошлым, и тег [Global], полученный
+        когда-то, жил вечно. Имена целей и сам Global — то, что принадлежит
+        этому чекеру; теги скорости остаются нетронутыми.
+        """
+        names = {str(tg.get("name", "")).strip() for tg in targets}
+        names.add(str(global_tag))
+        names.discard("")
+        return tuple(sorted(names))
 
     async def check(self, ctx: CheckContext) -> CheckResult:
         if not self.enabled or not self._targets:
@@ -110,6 +128,14 @@ class ReachabilityChecker(Checker):
             outcomes[line] = CheckOutcome(
                 ok=None,
                 capabilities=capabilities,
+                # Профиль ЗАМЕНЯЕТ свой прошлый, а не сливается с ним.
+                # Без этого тег, полученный когда-то, жил вечно: сервер,
+                # однажды прошедший все цели, навсегда оставался [Global],
+                # даже когда сейчас достигает двух целей из восьми.
+                # Замер на базе: из 38 серверов с [Global] полный набор
+                # целей имел ОДИН. Теги скорости не трогаем — их пишет
+                # другой чекер, и у него свой префикс вытеснения.
+                capabilities_replace=self._target_tags,
                 detail=result.get("error"),
             )
         return CheckResult(outcomes=outcomes, summary=f"{tagged}/{len(lines)} с тэгами")
