@@ -24,12 +24,14 @@ from config.env import (
     SPEED_ENABLED,
     SPEED_GOOD_MBPS,
     SPEED_MIN_MBPS,
+    SPEED_MIN_SOURCES,
     SPEED_PROBE_BYTES,
-    SPEED_PROBE_URL,
     SPEED_READ_SECONDS,
     SPEED_SITE_URL,
+    SPEED_SOURCES,
     SPEED_TAG_PREFIX,
     SPEED_TIER_TAGS,
+    SPEED_UPLOAD_BYTES,
 )
 from pipeline.checkers.base import CheckContext, CheckOutcome, CheckResult, Checker
 from pipeline.checkers.builtin._runner import run_exclusive
@@ -53,10 +55,15 @@ class SpeedChecker(Checker):
         from script.speed_check import SpeedConfig
 
         s = ctx.settings
+        # Поля SpeedConfig обязаны совпадать с её сигнатурой: у замера
+        # скорости их набор менялся вместе с переходом на несколько
+        # источников, и чекер обязан идти следом.
         return SpeedConfig(
             site_url=str(s.get("site_url", SPEED_SITE_URL) or SPEED_SITE_URL),
-            probe_url=str(s.get("probe_url", SPEED_PROBE_URL) or SPEED_PROBE_URL),
+            sources=str(s.get("sources", SPEED_SOURCES) or ""),
             probe_bytes=int(s.get("probe_bytes", SPEED_PROBE_BYTES)),
+            upload_bytes=int(s.get("upload_bytes", SPEED_UPLOAD_BYTES)),
+            min_sources=int(s.get("min_sources", SPEED_MIN_SOURCES)),
             read_seconds=float(s.get("read_seconds", SPEED_READ_SECONDS)),
             min_mbps=float(s.get("min_mbps", SPEED_MIN_MBPS)),
             good_mbps=float(s.get("good_mbps", SPEED_GOOD_MBPS)),
@@ -68,10 +75,20 @@ class SpeedChecker(Checker):
         self.enabled = bool(ctx.settings.get("speed_enabled", SPEED_ENABLED))
         if self.enabled:
             self.cfg = self._make_cfg(ctx)
+            # Список источников показываем явно: от него зависит, во что
+            # вырвется замер, и молчаливый дефолт тут опасен.
+            from script.speed_sources import resolve_sources
+
+            try:
+                names = ", ".join(s.key for s in resolve_sources(self.cfg.sources))
+            except ValueError as exc:
+                LOGGER.error("Speed: неверный список источников: %s", exc)
+                raise
             LOGGER.info(
-                "Speed: сайт %s, загрузка %s, slow < %.1f МБ/с, fast >= %.1f МБ/с",
-                self.cfg.site_url, self.cfg.download_url,
-                self.cfg.min_mbps, self.cfg.good_mbps,
+                "Speed: сайт %s, источники: %s, по %d МБ/с с каждого, "
+                "нужно ответов >= %d, slow < %.1f МБ/с, fast >= %.1f МБ/с",
+                self.cfg.site_url, names, self.cfg.probe_bytes,
+                self.cfg.min_sources, self.cfg.min_mbps, self.cfg.good_mbps,
             )
 
     async def check(self, ctx: CheckContext) -> CheckResult:
