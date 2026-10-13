@@ -34,6 +34,9 @@ class ReachabilityChecker(Checker):
         # max_ping_ms, а где его нет — значение из настроек.
         self.max_ping_ms: int | None = None
         self._targets: list[dict] = []
+        # Группы слияния тегов (блок merge): сервер, прошедший порог группы,
+        # пишется в БД одним общим тегом вместо тегов этой группы.
+        self._merge: list[dict] = []
         self._alive: set[str] = set()
         # Имена целей + сам тег Global: всё, что принадлежит профилю
         # достижимости и должно вытесняться при новом прогоне.
@@ -59,32 +62,59 @@ class ReachabilityChecker(Checker):
                 self.max_ping_ms = int(default_ping) if default_ping else None
         if not self.enabled:
             return
-        from script.reachability_check import load_targets
+        from script.reachability_check import load_merge_rules, load_targets
 
         try:
             self._targets = await ctx.run_sync(load_targets)
         except Exception as exc:  # noqa: BLE001 — нет файла целей = фича выключена
             LOGGER.warning("Список целей не загружен, reachability выключен: %s", exc)
             self._targets = []
-        self._target_tags = self.compute_target_tags(self._targets)
+        # Группы merge — из того же файла плюс REACHABILITY_MERGE_TAGS.
+        # Грузятся ДО расчёта вытесняемых тегов: имя группы (Global) тоже
+        # принадлежит этому чекеру и должно исчезать у тех, кто её не набрал.
+        try:
+            self._merge = await ctx.run_sync(load_merge_rules)
+        except Exception as exc:  # noqa: BLE001 — без групп профиль просто полный
+            LOGGER.warning("Группы merge не загружены, теги целей не сворачиваются: %s", exc)
+            self._merge = []
+        self._target_tags = self.compute_target_tags(
+            self._targets, self.global_tag, self._merge,
+        )
         if self._targets:
+            groups = ", ".join(
+                f"[{r['tag']}] = {r['min_matches']} из {list(r['tags'])}"
+                for r in self._merge
+            ) or "нет"
             LOGGER.info(
                 "Reachability: %d целей, профиль для stable >= %d, порог TTFB: %s",
                 len(self._targets), self.min_stable,
                 f"{self.max_ping_ms} мс (всем целям)" if self.max_ping_ms
                 else f"{default_ping} мс по умолчанию, у целей свои",
             )
+            LOGGER.info("Reachability: группы merge: %s", groups)
 
     @staticmethod
-    def compute_target_tags(targets: list[dict], global_tag: str = "Global") -> tuple[str, ...]:
+    def compute_target_tags(targets: list[dict], global_tag: str = "Global",
+                            merge_rules: list[dict] | None = None) -> tuple[str, ...]:
         """Префиксы, которые профиль достижимости вытесняет при записи.
 
         Чекер скорости вытесняет свои теги префиксом "speed-". Без своего
         префикса профиль объединялся с прошлым, и тег [Global], полученный
-        когда-то, жил вечно. Имена целей и сам Global — то, что принадлежит
-        этому чекеру; теги скорости остаются нетронутыми.
+        когда-то, жил вечно. Имена целей, сам Global и общие теги групп —
+        то, что принадлежит этому чекеру; теги скорости остаются нетронутыми.
+
+        Теги групп обязательны в этом списке: сервер, который сейчас набрал
+        только две generate_204 из трёх, больше не должен носить [Global].
         """
         names = {str(tg.get("name", "")).strip() for tg in targets}
+        if merge_rules is None:
+            try:
+                from script.reachability_check import load_merge_rules
+
+                merge_rules = load_merge_rules()
+            except Exception:  # noqa: BLE001 — без групп остаются имена целей
+                merge_rules = []
+        names.update(str(r.get("tag", "")).strip() for r in merge_rules or [])
         names.add(str(global_tag))
         names.discard("")
         return tuple(sorted(names))
@@ -99,7 +129,6 @@ class ReachabilityChecker(Checker):
 
         from script.reachability_check import (
             batch_reachability_check,
-            profile_is_global,
             profile_to_tags,
         )
 
@@ -113,6 +142,7 @@ class ReachabilityChecker(Checker):
 
         outcomes: dict[str, CheckOutcome] = {}
         tagged = 0
+        merged = 0
         for line in lines:
             result = results.get(line) or {}
             targets_res = result.get("targets") or {}
@@ -123,12 +153,16 @@ class ReachabilityChecker(Checker):
             # профиль раньше просто не писался в базу, и метки, полученные
             # в каком-то прошлом прогоне, жили вечно.
             if targets_res:
-                if profile_is_global(self._targets, targets_res):
-                    capabilities = self.global_tag
-                else:
-                    capabilities = ",".join(profile_to_tags(self._targets, targets_res))
+                # profile_to_tags сворачивает группы merge: три generate_204
+                # дают один тег Global вместо трёх тегов этих целей. Отдельная
+                # ветка «прошёл все цели -> Global» убрана: она и была старым
+                # правилом, из-за которого метка зависела от всего профиля.
+                tags = profile_to_tags(self._targets, targets_res, self._merge)
+                capabilities = ",".join(tags)
                 if capabilities:
                     tagged += 1
+                    if any(r["tag"] in tags for r in self._merge):
+                        merged += 1
                     LOGGER.info("Reachability [%s]: %s", capabilities, line[:70])
             # Затирать надо только когда профиля НЕТ: ответили, но ни одной
             # цели не достигли. Флаг ставится после вычисления capabilities,
@@ -150,4 +184,7 @@ class ReachabilityChecker(Checker):
                 capabilities_clear=clear,
                 detail=result.get("error"),
             )
-        return CheckResult(outcomes=outcomes, summary=f"{tagged}/{len(lines)} с тэгами")
+        summary = f"{tagged}/{len(lines)} с тэгами"
+        if merged:
+            summary += f", {merged} в группах merge"
+        return CheckResult(outcomes=outcomes, summary=summary)

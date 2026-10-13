@@ -1,6 +1,15 @@
 {
-  "comment": "Целевые сайты для профилирования достижимости прокси (reachability check). Порог max_ping_ms применяется к TTFB — времени до заголовков ответа. Telegram и GitHub отвечают заметно медленнее остальных шести целей: медиана TTFB у них около 2188 мс против примерно 1200 мс у остальных. При пороге 2000 мс они не добирали 9%, и Global (он требует ВСЕХ целей разом) становился недостижим в принципе: telegram проходили 3 сервера из 20, github — 5. После подъёма до 3000 мс — 12 и 15, и Global появился у 9 из 20.",
+  "comment": "Целевые сайты для профилирования достижимости прокси (reachability check). Порог max_ping_ms применяется к TTFB — времени до заголовков ответа. Профиль сервера — это теги тех целей, которые он прошёл; особые метки вроде [Global] собираются блоком merge, а не требованием пройти ВСЕ цели сразу.",
   "format_version": 1,
+  "merge": [
+    {
+      "comment": "Global: сервер, прошедший ЛЮБЫЕ 3 из 3 целей ниже, помечается в БД ровно тегом Global и выводится из базы одним тэгом [Global] вместо трёх [gstatic][yandex-portal][cloudflare]. Прежнее правило «Global = прошёл ВСЕ цели профиля» отменено: оно делало метку заложником всего списка и на боевой базе её выполнял один сервер из 38.",
+      "tag": "Global",
+      "tags": ["gstatic", "yandex-portal", "cloudflare"],
+      "min_matches": 3,
+      "remove_tags": true
+    }
+  ],
   "targets": [
     {
       "name": "openrouter",
@@ -86,6 +95,42 @@
       "max_ping_ms": 2000,
       "timeout_ms": 6000,
       "expected_statuses": [200, 301, 302, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "gstatic",
+      "tag": "gstatic",
+      "comment": "Цель группы Global. generate_204 отдаёт 204 и НОЛЬ байт тела — самая дешёвая проверка из трёх.",
+      "url": "https://www.gstatic.com/generate_204",
+      "max_ping_ms": 2000,
+      "timeout_ms": 6000,
+      "expected_statuses": [200, 204, 301, 302, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "yandex-portal",
+      "tag": "yandex-portal",
+      "comment": "Тот же URL, что у цели yandex, под отдельным именем: имя цели — ключ пробы и тега, и вторая запись с именем yandex молча вытеснила бы первую.",
+      "url": "https://yandex.ru/portal/generate_204",
+      "max_ping_ms": 2000,
+      "timeout_ms": 6000,
+      "expected_statuses": [200, 301, 302, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "cloudflare",
+      "tag": "cloudflare",
+      "comment": "Цель группы Global. Проверено запросом: http:// отвечает 204 без редиректа, https:// на cp.cloudflare.com — 403. Схему не меняем.",
+      "url": "http://cp.cloudflare.com/generate_204",
+      "max_ping_ms": 2000,
+      "timeout_ms": 6000,
+      "expected_statuses": [200, 204, 301, 302, 403, 429],
       "headers": {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
       }

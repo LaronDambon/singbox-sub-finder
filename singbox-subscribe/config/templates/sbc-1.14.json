@@ -353,6 +353,28 @@
       "tolerance": 100
     },
     {
+      "tag": "Yandex-ping",
+      "type": "urltest",
+      "outbounds": ["{all}"],
+      "filter": [
+        {
+          "action": "include",
+          "keywords": ["yandex"]
+        }
+      ],
+      "url": "https://yandex.ru/portal/generate_204",
+      "interval": "10m",
+      "tolerance": 50
+    },
+    {
+      "tag": "Yandex",
+      "type": "urltest",
+      "outbounds": ["Yandex-ping", "proxy"],
+      "url": "https://yandex.ru/portal/generate_204",
+      "interval": "1m",
+      "tolerance": 100
+    },
+    {
       "tag": "direct",
       "type": "direct"
     }

@@ -10,8 +10,12 @@
 (колонка capabilities); тэги [name] в итоговую строку добавляются только при
 экспорте в whitelist для генерации итогового конфига.
 
-Сервер, прошедший проверку до ВСЕХ целевых сайтов, помечается тэгом [Global] —
-такие серверы попадают в общий outbound 'proxy' через фильтры config.
+Особые метки собираются блоком "merge" того же файла: группа — это список
+тэгов целей и порог min_matches. Сервер, прошедший порог, помечается в БД
+одним общим тегом вместо тегов группы. Пример: [Global] — любые 3 из 3 целей
+gstatic / yandex-portal / cloudflare (generate_204). Раньше [Global] требовал
+пройти ВСЕ цели профиля разом, и добавление девятой цели отнимало метку у
+всех разом.
 
 Задержка здесь — это TTFB: время до ЗАГОЛОВКОВ ответа (stream=True), а не
 время выкачивания страницы. Тело обрывается через REACHABILITY_BODY_BYTES.
@@ -102,6 +106,135 @@ def load_targets(path: str | Path | None = None) -> list[dict]:
             "headers": dict(t.get("headers") or {"User-Agent": BROWSER_UA}),
         })
     return out
+
+
+# --- Группы слияния тегов (блок merge) ---------------------------------------
+def _merge_rule(rule: dict) -> dict | None:
+    """Одна запись блока merge: {tag, tags, min_matches, ...} или None, если пуста.
+
+    min_matches по умолчанию — все перечисленные теги (то есть прежнее
+    «прошёл все цели группы»); число меньше длины списка задаёт «любые N из».
+    remove_tags по умолчанию True: смысл записи в том, чтобы вместо N тегов
+    группы в профиле остался ОДИН общий.
+    """
+    tag = str(rule.get("tag") or "").strip()
+    tags = list(dict.fromkeys(
+        str(t).strip() for t in (rule.get("tags") or []) if str(t).strip()
+    ))
+    if not tag or not tags:
+        return None
+    raw_min = rule.get("min_matches")
+    try:
+        min_matches = int(raw_min) if raw_min is not None else len(tags)
+    except (TypeError, ValueError):
+        min_matches = len(tags)
+    # Порог вне диапазона 1..len(tags) сделал бы группу либо вечной, либо
+    # недостижимой: «3 из 2» не наберёт никто, «0 из 3» — любой сервер.
+    min_matches = max(1, min(min_matches, len(tags)))
+    return {
+        "tag": tag,
+        "tags": tags,
+        "min_matches": min_matches,
+        "remove_tags": bool(rule.get("remove_tags", True)),
+    }
+
+
+def load_merge_rules(path: str | Path | None = None) -> list[dict]:
+    """Группы слияния тегов: блок merge из файла целей плюс окружение.
+
+    Запись группы: сервер, прошедший min_matches целей из tags, получает ОДИН
+    общий тег tag вместо тегов этих целей. Пример: три generate_204 (gstatic,
+    yandex-portal, cloudflare) -> [Global].
+
+    Источника два, и они складываются: правила из REACHABILITY_MERGE_TAGS идут
+    первыми, группы из файла добавляются к ним. Тег, названный в обоих местах,
+    берётся из окружения — так рабочую группу можно переопределить, не трогая
+    файл.
+
+    Ошибки здесь не поднимаются: недоступный или битый файл — это отсутствие
+    групп, а не падение прогона. Профиль целей грузится отдельно и о своей
+    беде сообщает сам.
+    """
+    rules = default_merge_rules()
+    try:
+        cfg_path = Path(path) if path else Path(
+            str(get_settings().paths.reachability_targets_file)
+        )
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        data = None
+    raw = data.get("merge") if isinstance(data, dict) else None
+    if isinstance(raw, list):
+        for rule in raw:
+            if not isinstance(rule, dict):
+                continue
+            parsed = _merge_rule(rule)
+            # Тег, названный в окружении, из файла не дублируется: правило
+            # окружения идёт первым и при совпадении тега выигрывает оно.
+            if parsed and not any(parsed["tag"] == r["tag"] for r in rules):
+                rules.append(parsed)
+    if not rules:
+        return []
+    warn_about_missing_merge_targets(rules)
+    return rules
+
+
+def default_merge_rules() -> list[dict]:
+    """Группы слияния из REACHABILITY_MERGE_TAGS, если она задана.
+
+    Формат строки: "Global=gstatic,yandex-portal,cloudflare:3;Fast=a,b:2".
+    Порог после «:» необязателен — без него нужны все теги группы.
+    Настройка НЕ отменяет блок merge из файла: она добавляется к нему и
+    идёт первой (при совпадении тега выигрывает она).
+    """
+    raw = str(get_settings().reach.merge_tags or "").strip()
+    if not raw:
+        return []
+    rules: list[dict] = []
+    for chunk in raw.split(";"):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        tag, _, rest = chunk.partition("=")
+        body, _, threshold = rest.partition(":")
+        parsed = _merge_rule({
+            "tag": tag.strip(),
+            "tags": [s.strip() for s in body.split(",") if s.strip()],
+            "min_matches": threshold.strip() or None,
+        })
+        if parsed:
+            rules.append(parsed)
+    return rules
+
+
+def warn_about_missing_merge_targets(rules: list[dict],
+                                     targets: list[dict] | None = None) -> list[str]:
+    """Логирует группы merge, ссылающиеся на цели, которых в профиле нет.
+
+    Опечатка в имени тега не ломает прогон, но делает группу недостижимой:
+    min_matches из трёх тегов не наберётся, если один из них не проверяется.
+    Возвращает имена отсутствующих тегов — ради этого списка функция и
+    вызывается повторно из чекера, когда цели уже загружены.
+    """
+    if not rules:
+        return []
+    if targets is None:
+        try:
+            targets = load_targets()
+        except Exception:  # noqa: BLE001 — предупреждение не стоит падения
+            return []
+    known = {
+        str(t.get("tag") or t.get("name") or "").strip().lower() for t in targets
+    }
+    missing = sorted({
+        tag for rule in rules for tag in rule["tags"] if tag.lower() not in known
+    })
+    if missing:
+        LOGGER.warning(
+            "Merge: теги %s перечислены в группах, но таких целей нет в профиле — "
+            "группа останется недостижимой", ", ".join(missing),
+        )
+    return missing
 
 
 # --- Кэш в рамках одного запуска --------------------------------------------
@@ -472,21 +605,97 @@ def check_reachability(proxy_line: str, *, targets: list[dict] | None = None,
     return res_map.get(proxy_line.strip()) or {"error": "нет результата", "targets": {}}
 
 
-def profile_to_tags(targets: list[dict], reach_result: dict[str, dict]) -> list[str]:
+def _reached_tags(targets: list[dict], reach_result: dict[str, dict]) -> list[str]:
+    """Теги целей, которые прокси прошёл. Порядок — как в списке целей.
+
+    Тег, совпавший с уже добавленным, пропускается: два имени цели могут
+    указывать на один URL и один тег, и профиль тогда молча терял бы часть
+    совпадений группы merge (порог «3 из 3» не набрался бы у сервера,
+    прошедшего все три URL, — просто потому что целей с таким тегом две).
+    """
+    out: list[str] = []
+    for t in targets:
+        if not (reach_result.get(t["name"]) or {}).get("ok"):
+            continue
+        tag = str(t.get("tag") or t["name"])
+        if tag not in out:
+            out.append(tag)
+    return out
+
+
+def profile_merge_tags(targets: list[dict], reach_result: dict[str, dict],
+                       merge_rules: list[dict] | None = None) -> list[str]:
+    """Общие теги групп, набранных прокси (например ["Global"]).
+
+    Порядок — как в списке групп; первое правило, забравшее тег, выигрывает.
+    """
+    if merge_rules is None:
+        merge_rules = load_merge_rules()
+    reached = _reached_tags(targets, reach_result)
+    lowered = {tag.lower() for tag in reached}
+    matched: list[str] = []
+    claimed: set[str] = set()
+    for rule in merge_rules or []:
+        tag = rule["tag"]
+        if tag in claimed:
+            continue
+        # Цель группы засчитывается только если её тег вообще проверялся:
+        # иначе опечатка в merge давала бы совпадение «всех» тегов на пустом месте.
+        hits = [t for t in rule["tags"] if t.lower() in lowered]
+        if len(hits) >= rule["min_matches"]:
+            matched.append(tag)
+            claimed.add(tag)
+    return matched
+
+
+def profile_to_tags(targets: list[dict], reach_result: dict[str, dict],
+                    merge_rules: list[dict] | None = None) -> list[str]:
     """Превращает результат пробы в упорядоченный список тэгов [name].
 
     Тэг добавляется для каждой цели, где ok=True. Порядок — как в списке целей.
+
+    Группы merge сворачивают свои теги в один общий: сервер, прошедший три
+    generate_204, получает один тэг Global вместо трёх тегов этих целей
+    (у группы remove_tags=True). Теги остальных целей остаются на месте.
     """
-    reached = [t["tag"] for t in targets
-               if (reach_result.get(t["name"]) or {}).get("ok")]
-    return reached
+    if merge_rules is None:
+        merge_rules = load_merge_rules()
+    reached = _reached_tags(targets, reach_result)
+    merged: list[str] = []
+    hidden: set[str] = set()
+    # Регистр имени группы и её тегов: сервер, прошедший цель yandex-portal,
+    # не должен получать сворачивание группы ["yandex-portal"].
+    lowered = {tag.lower() for tag in reached}
+    for rule in merge_rules or []:
+        tag = rule["tag"]
+        hits = [t for t in rule["tags"] if t.lower() in lowered]
+        if len(hits) < rule["min_matches"]:
+            continue
+        # Тег группы может быть и именем самой цели: тогда сворачивать нечего.
+        if rule["remove_tags"]:
+            hidden.update(t.lower() for t in rule["tags"] if t != tag)
+        if tag not in merged:
+            merged.append(tag)
+    out = merged + [
+        tag for tag in reached
+        if tag.lower() not in hidden and tag not in merged
+    ]
+    return list(dict.fromkeys(out))
 
 
-def profile_is_global(targets: list[dict], reach_result: dict[str, dict]) -> bool:
-    """True, если прокси достиг ВСЕХ целей списка (кандидат на [Global])."""
-    if not targets:
-        return False
-    return all((reach_result.get(t["name"]) or {}).get("ok") for t in targets)
+def profile_is_global(targets: list[dict], reach_result: dict[str, dict],
+                      merge_rules: list[dict] | None = None,
+                      global_tag: str | None = None) -> bool:
+    """True, если прокси набрал группу с тегом Global (кандидат на [Global]).
+
+    Раньше здесь было «достиг ВСЕХ целей списка»: порог задавала не цель, а
+    весь профиль, и стоило добавить девятую цель — метка [Global] пропадала
+    у всех. Теперь порог берётся из группы merge (три generate_204), а
+    остальные цели на неё не влияют.
+    """
+    if global_tag is None:
+        global_tag = str(getattr(get_settings().reach, "global_tag", "") or "Global")
+    return global_tag in profile_merge_tags(targets, reach_result, merge_rules)
 
 
 if __name__ == "__main__":
@@ -513,8 +722,9 @@ if __name__ == "__main__":
         print(json.dumps(res, ensure_ascii=False, indent=2))
         if res.get("targets") and not res.get("error"):
             all_targets = load_targets()
-            reached = profile_to_tags(all_targets, res["targets"])
-            print("Тэги: " + ", ".join(f"[{t}]" for t in reached) or "(нет)")
+            merge_rules = load_merge_rules()
+            reached = profile_to_tags(all_targets, res["targets"], merge_rules)
+            print("Тэги: " + (", ".join(f"[{t}]" for t in reached) or "(нет)"))
             for name, entry in res["targets"].items():
                 print(
                     f"  {name}: ttfb={entry.get('ttfb_ms')}мс "
@@ -522,5 +732,11 @@ if __name__ == "__main__":
                     f"тело {entry.get('body_bytes')}Б)"
                     + (f" ошибка: {entry['error']}" if entry.get("error") else "")
                 )
-            if profile_is_global(all_targets, res["targets"]):
-                print("=> [Global] (достиг всех целей)")
+            for rule in merge_rules:
+                hits = [t for t in rule["tags"]
+                        if (res["targets"].get(t) or {}).get("ok")]
+                mark = "=>" if len(hits) >= rule["min_matches"] else "  "
+                print(
+                    f"{mark} [{rule['tag']}]: {len(hits)}/{rule['min_matches']} "
+                    f"из {list(rule['tags'])}"
+                )

@@ -1,5 +1,7 @@
 .vercel
 *.log
+logs/
+tests/
 *.pyc
 __pycache__
 singbox-subscribe/source/
@@ -33,3 +35,4 @@ sbc-1.14-ray-tab.json
 sbc-1.14-nika-phone.json
 sbc-1.14-nika-tab.json
 sbc-1.14-server.json
+singbox-subscribe/tests/test_pipeline_core.py

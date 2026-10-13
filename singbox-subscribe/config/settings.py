@@ -223,6 +223,7 @@ class ReachSettings:
     per_proxy_concurrency: int
     min_stable: int
     global_tag: str
+    merge_tags: str
 
 
 @dataclass(frozen=True)
@@ -359,6 +360,7 @@ _LAYOUT: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] = (
         ("REACHABILITY_PER_PROXY_CONCURRENCY", "per_proxy_concurrency"),
         ("REACHABILITY_MIN_STABLE", "min_stable"),
         ("REACHABILITY_GLOBAL_TAG", "global_tag"),
+        ("REACHABILITY_MERGE_TAGS", "merge_tags"),
     )),
     ("speed", "SPEED_", (
         ("SPEED_ENABLED", "enabled"), ("SPEED_SITE_URL", "site_url"),
@@ -532,6 +534,9 @@ class Settings:
         val["REACHABILITY_PER_PROXY_CONCURRENCY"] = get('REACHABILITY_PER_PROXY_CONCURRENCY', 1, _as_int)
         val["REACHABILITY_MIN_STABLE"] = get('REACHABILITY_MIN_STABLE', 0, _as_int)
         val["REACHABILITY_GLOBAL_TAG"] = get('REACHABILITY_GLOBAL_TAG', "Global")
+        # Группы слияния тегов сверх блока merge из reachability_targets.json:
+        # "Global=gstatic,yandex-portal,cloudflare:3;Fast=a,b:2".
+        val["REACHABILITY_MERGE_TAGS"] = get('REACHABILITY_MERGE_TAGS', "")
         val["BEST_TOP"] = get('BEST_TOP', 0, _as_int)
         val["SPEED_ENABLED"] = get('SPEED_ENABLED', True, _as_bool)
         val["SPEED_SITE_URL"] = get('SPEED_SITE_URL', "https://gemini.google.com/")
