@@ -3,11 +3,11 @@
   "format_version": 1,
   "merge": [
     {
-      "comment": "Global: сервер, прошедший ЛЮБЫЕ 3 из 3 целей ниже, помечается в БД ровно тегом Global и выводится из базы одним тэгом [Global] вместо трёх [gstatic][yandex-portal][cloudflare]. Прежнее правило «Global = прошёл ВСЕ цели профиля» отменено: оно делало метку заложником всего списка и на боевой базе её выполнял один сервер из 38.",
       "tag": "Global",
-      "tags": ["gstatic", "yandex-portal", "cloudflare"],
+      "list": ["gstatic", "yandex", "cloudflare"],
       "min_matches": 3,
-      "remove_tags": true
+      "remove_tags": true,
+      "comment": "Сервер, прошедший ЛЮБЫЕ 3 из 3 целей списка, помечается в БД ровно тегом Global и выводится из базы одним тэгом [Global] вместо трёх [gstatic][yandex-portal][cloudflare]. Прежнее правило «Global = прошёл ВСЕ цели профиля» отменено: оно делало метку заложником всего списка и на боевой базе её выполнял один сервер из 38."
     }
   ],
   "targets": [
@@ -107,18 +107,6 @@
       "max_ping_ms": 2000,
       "timeout_ms": 6000,
       "expected_statuses": [200, 204, 301, 302, 403, 429],
-      "headers": {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-      }
-    },
-    {
-      "name": "yandex-portal",
-      "tag": "yandex-portal",
-      "comment": "Тот же URL, что у цели yandex, под отдельным именем: имя цели — ключ пробы и тега, и вторая запись с именем yandex молча вытеснила бы первую.",
-      "url": "https://yandex.ru/portal/generate_204",
-      "max_ping_ms": 2000,
-      "timeout_ms": 6000,
-      "expected_statuses": [200, 301, 302, 403, 429],
       "headers": {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
       }

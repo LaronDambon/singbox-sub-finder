@@ -69,7 +69,7 @@ class ReachabilityChecker(Checker):
         except Exception as exc:  # noqa: BLE001 — нет файла целей = фича выключена
             LOGGER.warning("Список целей не загружен, reachability выключен: %s", exc)
             self._targets = []
-        # Группы merge — из того же файла плюс REACHABILITY_MERGE_TAGS.
+        # Группы merge — из блока merge файла reachability_targets.json.
         # Грузятся ДО расчёта вытесняемых тегов: имя группы (Global) тоже
         # принадлежит этому чекеру и должно исчезать у тех, кто её не набрал.
         try:

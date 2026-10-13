@@ -36,3 +36,7 @@ sbc-1.14-nika-phone.json
 sbc-1.14-nika-tab.json
 sbc-1.14-server.json
 singbox-subscribe/tests/test_pipeline_core.py
+
+# Рабочая папка агента: временные скрипты, логи прогонов, черновики.
+# Всё, что кладётся сюда, НЕ коммитится и не мешает деплою.
+.agent/

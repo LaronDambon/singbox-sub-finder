@@ -109,17 +109,29 @@ def load_targets(path: str | Path | None = None) -> list[dict]:
 
 
 # --- Группы слияния тегов (блок merge) ---------------------------------------
-def _merge_rule(rule: dict) -> dict | None:
-    """Одна запись блока merge: {tag, tags, min_matches, ...} или None, если пуста.
+def _merge_list(rule: dict) -> list:
+    """Список целей группы: ключ list, а для совместимости ещё и tags.
 
-    min_matches по умолчанию — все перечисленные теги (то есть прежнее
-    «прошёл все цели группы»); число меньше длины списка задаёт «любые N из».
-    remove_tags по умолчанию True: смысл записи в том, чтобы вместо N тегов
-    группы в профиле остался ОДИН общий.
+    Структура записи в файле:
+        {"tag": "Global", "list": ["gstatic", "yandex-portal", "cloudflare"]}
+    """
+    for key in ("list", "tags"):
+        value = rule.get(key)
+        if isinstance(value, (list, tuple)) and value:
+            return list(value)
+    return []
+
+
+def _merge_rule(rule: dict) -> dict | None:
+    """Одна запись блока merge: {tag, list, min_matches, ...} или None, если пуста.
+
+    min_matches по умолчанию — вся длина списка (нужны все цели группы); число
+    меньше длины задаёт «любые N из». remove_tags по умолчанию True: смысл
+    записи в том, чтобы вместо N тегов группы в профиле остался ОДИН общий.
     """
     tag = str(rule.get("tag") or "").strip()
     tags = list(dict.fromkeys(
-        str(t).strip() for t in (rule.get("tags") or []) if str(t).strip()
+        str(t).strip() for t in _merge_list(rule) if str(t).strip()
     ))
     if not tag or not tags:
         return None
@@ -133,6 +145,9 @@ def _merge_rule(rule: dict) -> dict | None:
     min_matches = max(1, min(min_matches, len(tags)))
     return {
         "tag": tag,
+        "list": tags,
+        # tags — тот же список под прежним именем: на него смотрят вызовы,
+        # написанные до появления ключа list.
         "tags": tags,
         "min_matches": min_matches,
         "remove_tags": bool(rule.get("remove_tags", True)),
@@ -140,70 +155,49 @@ def _merge_rule(rule: dict) -> dict | None:
 
 
 def load_merge_rules(path: str | Path | None = None) -> list[dict]:
-    """Группы слияния тегов: блок merge из файла целей плюс окружение.
+    """Группы слияния тегов из блока merge файла reachability_targets.json.
 
-    Запись группы: сервер, прошедший min_matches целей из tags, получает ОДИН
-    общий тег tag вместо тегов этих целей. Пример: три generate_204 (gstatic,
-    yandex-portal, cloudflare) -> [Global].
+    Структура блока::
 
-    Источника два, и они складываются: правила из REACHABILITY_MERGE_TAGS идут
-    первыми, группы из файла добавляются к ним. Тег, названный в обоих местах,
-    берётся из окружения — так рабочую группу можно переопределить, не трогая
-    файл.
+        "merge": [
+          {"tag": "Global", "list": ["gstatic", "yandex-portal", "cloudflare"]},
+          {"tag": "Core",   "list": ["openai", "gemini"], "min_matches": 1}
+        ]
+
+    Сервер, прошедший min_matches целей из list, получает ОДИН общий тег tag
+    вместо тегов этих целей (при remove_tags: true). Пример: три generate_204
+    (gstatic, yandex-portal, cloudflare) -> [Global].
+
+    Единственный источник групп — этот файл: настройка REACHABILITY_MERGE_TAGS
+    удалена, чтобы правило не приходило из двух мест и не расходилось с
+    профилем целей, который лежит рядом.
 
     Ошибки здесь не поднимаются: недоступный или битый файл — это отсутствие
     групп, а не падение прогона. Профиль целей грузится отдельно и о своей
     беде сообщает сам.
     """
-    rules = default_merge_rules()
     try:
         cfg_path = Path(path) if path else Path(
             str(get_settings().paths.reachability_targets_file)
         )
         data = json.loads(cfg_path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
-        data = None
+        return []
     raw = data.get("merge") if isinstance(data, dict) else None
-    if isinstance(raw, list):
-        for rule in raw:
-            if not isinstance(rule, dict):
-                continue
-            parsed = _merge_rule(rule)
-            # Тег, названный в окружении, из файла не дублируется: правило
-            # окружения идёт первым и при совпадении тега выигрывает оно.
-            if parsed and not any(parsed["tag"] == r["tag"] for r in rules):
-                rules.append(parsed)
+    if not isinstance(raw, list):
+        return []
+    rules: list[dict] = []
+    for rule in raw:
+        if not isinstance(rule, dict):
+            continue
+        parsed = _merge_rule(rule)
+        # Один тег — одна группа: вторая запись с тем же tag не добавит
+        # ничего, кроме путаницы в порядке применения.
+        if parsed and not any(parsed["tag"] == r["tag"] for r in rules):
+            rules.append(parsed)
     if not rules:
         return []
     warn_about_missing_merge_targets(rules)
-    return rules
-
-
-def default_merge_rules() -> list[dict]:
-    """Группы слияния из REACHABILITY_MERGE_TAGS, если она задана.
-
-    Формат строки: "Global=gstatic,yandex-portal,cloudflare:3;Fast=a,b:2".
-    Порог после «:» необязателен — без него нужны все теги группы.
-    Настройка НЕ отменяет блок merge из файла: она добавляется к нему и
-    идёт первой (при совпадении тега выигрывает она).
-    """
-    raw = str(get_settings().reach.merge_tags or "").strip()
-    if not raw:
-        return []
-    rules: list[dict] = []
-    for chunk in raw.split(";"):
-        chunk = chunk.strip()
-        if not chunk or "=" not in chunk:
-            continue
-        tag, _, rest = chunk.partition("=")
-        body, _, threshold = rest.partition(":")
-        parsed = _merge_rule({
-            "tag": tag.strip(),
-            "tags": [s.strip() for s in body.split(",") if s.strip()],
-            "min_matches": threshold.strip() or None,
-        })
-        if parsed:
-            rules.append(parsed)
     return rules
 
 
