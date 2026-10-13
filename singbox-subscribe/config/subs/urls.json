@@ -3,5 +3,11 @@
     "22": "https://raw.githubusercontent.com/wuqb2i4f/xray-config-toolkit/main/output/base64/mix-uri",
     "23": "https://github.com/igareck/vpn-configs-for-russia/raw/refs/heads/main/BLACK_VLESS_RUS.txt",
     "24": "https://github.com/Mr-Meshky/vify/raw/refs/heads/main/configs/vless.txt",
-    "25": "https://raw.githubusercontent.com/V2RayRoot/V2RayConfig/refs/heads/main/Config/vless.txt"
+    "25": "https://raw.githubusercontent.com/V2RayRoot/V2RayConfig/refs/heads/main/Config/vless.txt",
+
+    "27": "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt",
+    "28": "https://raw.githubusercontent.com/mahdibland/ShadowsocksAggregator/master/Eternity.txt",
+    "29": "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt",
+    "30": "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/sub",
+    "38": "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt"
 }
