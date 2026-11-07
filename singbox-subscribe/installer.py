@@ -37,11 +37,30 @@ import subprocess
 import sys
 from pathlib import Path
 
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from config.layout import (  # noqa: E402  — путь настраивается выше
+    ENV_DATA_DIR,
+    ENV_PROGRAM_DIR,
+    data_root,
+    default_data_dir,
+    default_program_dir,
+    ensure_data_dirs,
+    program_dir,
+    program_writable,
+)
+
 #: Папка пакета (здесь лежит этот файл).
 ROOT = Path(__file__).resolve().parent
 
-#: Корень репозитория: рабочие файлы (config.yaml, .env, source/, logs/).
-PROJECT_ROOT = ROOT.parent
+#: Каталог изменяемых данных: config.yaml, .env, source/, logs/, output/.
+#: У системной установки это профиль пользователя, у старой (из клона) —
+#: сам клон. Разбор — в config/layout.py.
+PROJECT_ROOT = data_root()
+
+#: Куда поставлена программа. Это НЕ PROJECT_ROOT: код и данные разъехались.
+INSTALL_DIR = program_dir()
 
 #: Адрес репозитория — нужен, когда скрипт запущен вне клона и должен его
 #: скачать сам (см. bootstrap).
@@ -185,9 +204,26 @@ def find_git() -> str | None:
 # ===========================================================================
 # шаги установки
 # ===========================================================================
+def venv_location(ui: Ui) -> Path:
+    """Где держать .venv.
+
+    Обычно рядом с кодом: окружение принадлежит программе и едет с ней.
+    Но в Program Files и в /opt писать нельзя без root, поэтому если каталог
+    программы закрыт на запись — уносим окружение в каталог данных. Лучше
+    рабочая установка с окружением «не на своём месте», чем установка,
+    которая падает на создании venv.
+    """
+    preferred = INSTALL_DIR / VENV_DIR_NAME
+    if preferred.exists() or program_writable():
+        return preferred
+    fallback = PROJECT_ROOT / VENV_DIR_NAME
+    ui.info(f"каталог программы только для чтения — окружение будет в {fallback}")
+    return fallback
+
+
 def ensure_venv(ui: Ui, *, recreate: bool = False) -> Path:
-    """Создаёт .venv в корне репозитория и возвращает путь к интерпретатору."""
-    venv_dir = PROJECT_ROOT / VENV_DIR_NAME
+    """Создаёт .venv и возвращает путь к интерпретатору."""
+    venv_dir = venv_location(ui)
     python = venv_python(venv_dir)
 
     if recreate and venv_dir.exists():
@@ -214,9 +250,18 @@ def ensure_venv(ui: Ui, *, recreate: bool = False) -> Path:
     return python
 
 
+def code_root() -> Path:
+    """Корень кода: папка, где лежат requirements.txt и сама программа.
+
+    Это НЕ каталог данных. У системной установки код в /opt или Program
+    Files, а config.yaml и база — в профиле пользователя; путать их нельзя.
+    """
+    return ROOT.parent
+
+
 def install_requirements(ui: Ui, python: Path, *, upgrade: bool = False) -> None:
     """Ставит зависимости из requirements.txt."""
-    req = PROJECT_ROOT / "requirements.txt"
+    req = code_root() / "requirements.txt"
     if not req.exists():
         raise InstallError(f"нет файла зависимостей: {req}")
 
@@ -286,24 +331,74 @@ def init_config(ui: Ui, python: Path, *, force: bool = False) -> None:
 def init_env_file(ui: Ui, python: Path) -> None:
     """Создаёт .env из шаблона, если его нет. Пустой — тоже создаём."""
     env_file = PROJECT_ROOT / ".env"
-    example = PROJECT_ROOT / ".env.example"
     if env_file.exists():
         ui.ok(".env уже есть — оставляю как есть")
         return
-    if not example.exists():
-        ui.warn(".env.example не найден — создайте .env вручную")
-        return
-    shutil.copyfile(example, env_file)
-    ui.ok(".env создан из .env.example (ключи пока пустые)")
+    # Шаблон лежит в пакете (он часть поставки), а сам .env — в данных.
+    for example in (PROJECT_ROOT / ".env.example", code_root() / ".env.example"):
+        if example.exists():
+            shutil.copyfile(example, env_file)
+            ui.ok(".env создан из .env.example (ключи пока пустые)")
+            return
+    ui.warn(".env.example не найден — создайте .env вручную")
+
+
+def seed_user_config(ui: Ui) -> None:
+    """Переносит в каталог данных то, что поставляется вместе с кодом.
+
+    Шаблоны деплоя и список целей reachability приезжают в репозитории, но
+    принадлежат пользователю: он их правит под себя. В системной установке
+    каталог программы только для чтения, поэтому при первом запуске копируем
+    их в данные — и дальше программа читает уже оттуда.
+
+    Существующие файлы НЕ перезаписываются: у человека там может быть своя
+    правка, и затирать её обновлением нельзя.
+    """
+    package_config = ROOT / "config"
+    targets = (
+        ("templates", package_config / "templates"),
+        ("subs", package_config / "subs"),
+    )
+    copied = 0
+    for name, source in targets:
+        if not source.is_dir():
+            continue
+        destination = PROJECT_ROOT / "config" / name
+        destination.mkdir(parents=True, exist_ok=True)
+        for item in sorted(source.iterdir()):
+            if not item.is_file():
+                continue
+            target = destination / item.name
+            if target.exists():
+                continue
+            shutil.copyfile(item, target)
+            copied += 1
+
+    # reachability_targets.json лежит прямо в config/ репозитория.
+    source = package_config / "reachability_targets.json"
+    if source.exists():
+        destination = PROJECT_ROOT / "config" / "reachability_targets.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not destination.exists():
+            shutil.copyfile(source, destination)
+            copied += 1
+
+    if copied:
+        ui.ok(f"Настройки разложены в {PROJECT_ROOT / 'config'} ({copied} файл(ов))")
+    else:
+        ui.ok("Настройки уже на месте")
 
 
 def prepare_dirs(ui: Ui) -> None:
     """Создаёт рабочие каталоги: без них первый запуск ругается."""
-    for name in ("source", "logs", "output"):
-        path = PROJECT_ROOT / name
-        path.mkdir(parents=True, exist_ok=True)
-    (PROJECT_ROOT / "source" / "downloaded").mkdir(parents=True, exist_ok=True)
-    ui.ok("Рабочие каталоги готовы: source/, logs/, output/")
+    try:
+        ensure_data_dirs(PROJECT_ROOT)
+    except OSError as exc:
+        raise InstallError(
+            f"не удалось создать каталоги данных в {PROJECT_ROOT}: {exc}\n"
+            f"Задайте другой каталог через {ENV_DATA_DIR}."
+        ) from exc
+    ui.ok(f"Рабочие каталоги готовы: {PROJECT_ROOT}")
 
 
 def check_singbox_binary(ui: Ui) -> bool:
@@ -349,11 +444,13 @@ def cmd_install(args) -> int:
         return 1
     ui.ok(f"Python {version}")
 
-    if not (PROJECT_ROOT / "requirements.txt").exists():
-        ui.fail(f"не найден корень репозитория: {PROJECT_ROOT}")
+    code = code_root()
+    if not (code / "requirements.txt").exists():
+        ui.fail(f"не найден код программы: {code}")
         ui.info("Запускайте скрипт из клонированного репозитория.")
         return 1
-    ui.ok(f"Репозиторий: {PROJECT_ROOT}")
+    ui.ok(f"Программа: {code}")
+    ui.ok(f"Данные:    {PROJECT_ROOT}")
 
     ui.step("Виртуальное окружение")
     python = ensure_venv(ui, recreate=args.recreate_venv)
@@ -362,9 +459,10 @@ def cmd_install(args) -> int:
     install_requirements(ui, python, upgrade=args.upgrade)
 
     ui.step("Рабочие файлы")
+    prepare_dirs(ui)
+    seed_user_config(ui)
     init_config(ui, python)
     init_env_file(ui, python)
-    prepare_dirs(ui)
     check_singbox_binary(ui)
 
     if args.browser:
@@ -380,13 +478,17 @@ def cmd_install(args) -> int:
     run_preflight(ui, python)
 
     ui.title("Готово")
+    ui.plain(f"Программа: {code}")
+    ui.plain(f"Данные:    {PROJECT_ROOT}")
+    ui.plain()
     ui.plain("Запуск:")
-    ui.plain(f"  {venv_activate_hint(PROJECT_ROOT / VENV_DIR_NAME)}")
+    ui.plain(f"  {venv_activate_hint(venv_location(ui))}")
+    ui.plain(f"  cd {code}")
     ui.plain("  python start.py")
     ui.plain()
     ui.plain("Дальше стоит прогнать мастер настройки — он спросит про чекеры,")
     ui.plain("ключи и деплой:")
-    ui.plain("  python singbox-subscribe/setup.py")
+    ui.plain(f"  python {code / 'singbox-subscribe' / 'setup.py'}")
     return 0
 
 
@@ -399,14 +501,19 @@ def cmd_update(args) -> int:
         ui.fail(version)
         return 1
 
+    # Обновляем КОД, а не данные: репозиторий — это каталог программы.
+    # У системной установки он в /opt или Program Files, и данные туда не
+    # переезжают.
+    code = code_root()
+
     git = find_git()
     if git is None:
         ui.warn("git не найден — обновляю только зависимости и конфиг")
     else:
         ui.step("Обновление кода")
-        if (PROJECT_ROOT / ".git").exists():
+        if (code / ".git").exists():
             status = subprocess.run(
-                [git, "status", "--porcelain"], cwd=str(PROJECT_ROOT),
+                [git, "status", "--porcelain"], cwd=str(code),
                 capture_output=True, text=True,
             )
             if status.stdout.strip() and not args.force:
@@ -418,7 +525,7 @@ def cmd_update(args) -> int:
                 ui.info("чтобы обновить принудительно (правки будут отброшены).")
             else:
                 cmd = [git, "pull", "--ff-only"] + (["--force"] if args.force else [])
-                result = subprocess.run(cmd, cwd=str(PROJECT_ROOT),
+                result = subprocess.run(cmd, cwd=str(code),
                                         capture_output=True, text=True)
                 if result.returncode != 0:
                     detail = (result.stderr or result.stdout or "").strip()
@@ -433,7 +540,7 @@ def cmd_update(args) -> int:
             ui.info(f"Клонируйте заново: git clone {REPO_URL}")
 
     ui.step("Зависимости")
-    python = venv_python(PROJECT_ROOT / VENV_DIR_NAME)
+    python = venv_python(venv_location(ui))
     if not python.exists():
         ui.warn("окружения нет — создаю")
         python = ensure_venv(ui)
@@ -442,6 +549,7 @@ def cmd_update(args) -> int:
     ui.step("Файлы установки")
     ui.ok("config.yaml, .env, source/, logs/ не тронуты — это ваши данные")
     prepare_dirs(ui)
+    seed_user_config(ui)
 
     ui.step("Проверка после обновления")
     run_preflight(ui, python)

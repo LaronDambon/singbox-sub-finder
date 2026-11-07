@@ -73,26 +73,38 @@ python -m pipeline config export   # напечатать шаблон в stdout
 ## Раскладка: код отдельно, файлы отдельно
 
 Внутри пакета — только исполняемый код. Всё, что пользователь правит или
-накапливает, лежит **рядом** с пакетом, в корне репозитория:
+накапливает, лежит в **каталоге данных**, отдельно от программы:
 
 ```
-singbox-subs-finder/
-  start.py, config.yaml, .env        точка входа и настройки
-  config/subs/urls.json              список ссылок на подписки
-  config/templates/*.json            шаблоны конфигурации для деплоя
-  config/reachability_targets.json   цели проверки reachability
-  source/servers.db                  центральная база
-  source/whitelist.txt, merge.txt    выгрузки
-  source/downloaded/                 скачанные подписки
-  logs/                              логи
-  output/                            результат локального деплоя
-  singbox-subscribe/                 ПАКЕТ: только код
+<каталог данных>/                     Windows: %LOCALAPPDATA%\singbox-subs-finder
+  config.yaml, .env                   Linux:   ~/.local/share/singbox-subs-finder
+  config/subs/urls.json               список ссылок на подписки
+  config/templates/*.json             шаблоны конфигурации для деплоя
+  config/reachability_targets.json    цели проверки reachability
+  source/servers.db                   центральная база
+  source/whitelist.txt, merge.txt     выгрузки
+  source/downloaded/                  скачанные подписки
+  logs/                               логи
+  output/                             результат локального деплоя
+
+<каталог программы>/                  Windows: %ProgramFiles%\singbox-subs-finder
+  start.py, requirements.txt          Linux:   /opt/singbox-subs-finder
+  singbox-subscribe/                  ПАКЕТ: только код
+  .venv/                              окружение (в данных, если нет прав записи)
 ```
 
-Смысл разделения: пакет можно обновлять, не задевая файлы пользователя, а сами
-файлы видно сразу и не надо искать их внутри кода. Пути в `config.yaml`
-записываются **относительно корня репозитория** — `config/templates`, а не
-`singbox-subscribe/config/templates`.
+Смысл разделения: программу можно обновлять и переустанавливать, не задевая
+файлы пользователя, а сами файлы видно сразу и не надо искать их внутри кода.
+Пути в `config.yaml` записываются **относительно каталога данных** —
+`config/templates`, а не `singbox-subscribe/config/templates`.
+
+Относительные пути, ведущие внутрь пакета (например `urltest_template`),
+считаются от **корня пакета**, а не от данных: шаблоны проверок приезжают
+вместе с программой и меняются только вместе с ней.
+
+**Старая установка из клона репозитория продолжает работать**: если рядом с
+пакетом есть `config.yaml`, каталогом данных считается сам клон. Каталоги
+задаются переменными `SINGBOX_PROGRAM_DIR` и `SINGBOX_DATA_DIR`.
 
 ## sing-box
 

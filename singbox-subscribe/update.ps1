@@ -1,13 +1,3 @@
-﻿<#
-.SYNOPSIS
-    ОБЁРТКА. Вся логика — в installer.py рядом с этим файлом.
-
-.DESCRIPTION
-    Файл намеренно тонкий: находит Python, передаёт аргументы и зовёт
-    модуль. Так установка, обновление и мастер на Windows и Linux ведут
-    себя одинаково, и шаг достаточно починить в одном месте.
-#>
-
 [CmdletBinding()]
 param(
     [switch]$Force,
@@ -36,7 +26,7 @@ function Find-Python {
 
 $python = Find-Python
 if (-not $python) {
-    Write-Host 'Python 3 не найден: https://www.python.org/downloads/' -ForegroundColor Red
+    Write-Host 'Python 3 not found: https://www.python.org/downloads/' -ForegroundColor Red
     exit 1
 }
 
@@ -44,8 +34,6 @@ $cliArgs = @("$here\installer.py", 'update')
 if ($Force) { $cliArgs += '--force' }
 if ($Quiet) { $cliArgs += '--quiet' }
 
-# PYTHONIOENCODING: без него PowerShell 5.1 срывается при чтении русского
-# вывода дочернего процесса (Exception in thread Thread-N _readerthread).
 $env:PYTHONIOENCODING = 'utf-8'
 $env:PYTHONUTF8 = '1'
 

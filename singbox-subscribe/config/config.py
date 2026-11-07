@@ -89,12 +89,25 @@ import yaml
 # ============================================================================
 
 ROOT = Path(__file__).resolve().parent.parent          # …/singbox-subscribe
-PROJECT_ROOT = ROOT.parent                             # корень репозитория
+
+#: Где лежит код, а где — изменяемые данные. Разложено по разным местам
+#: намеренно: программу обновляют (и она живёт в /opt или Program Files),
+#: а данные обновление трогать не должно. Всё это — в config/layout.py,
+#: чтобы у установщика, preflight и самой программы был ОДИН ответ.
+from .layout import PACKAGE_ROOT, config_file, data_root, env_file
+
+DATA_ROOT = data_root()                                # корень изменяемых данных
+
+#: Прежнее имя корня: у СТАРОЙ установки это клон репозитория, у новой —
+#: каталог данных в профиле пользователя. Оставлено, потому что от него
+#: считаются пути к рабочим файлам в схеме ниже, и потому что им пользуются
+#: скрипты, которым нужен «каталог, где всё лежит».
+PROJECT_ROOT = DATA_ROOT
 
 #: Основной конфиг: то, что можно править и коммитить.
-CONFIG_FILE = PROJECT_ROOT / "config.yaml"
+CONFIG_FILE = config_file()
 #: Секреты (ключи, токены) живут ТОЛЬКО здесь: файл в .gitignore.
-ENV_FILE = PROJECT_ROOT / ".env"
+ENV_FILE = env_file()
 
 #: Значения, которыми может быть обёрнуто значение в .env.
 _QUOTES = '"', "'"
@@ -436,11 +449,18 @@ _SCHEMA: tuple = (
     Field("pipeline", "custom_checkers_dir", "path", ROOT / "pipeline" / "checkers" / "custom", "Папка с ПОЛЬЗОВАТЕЛЬСКИМИ проверяющими алгоритмами", legacy=("PIPELINE_CUSTOM_CHECKERS_DIR",)),
 
     # ----------------------------------- PATHS: файлы и каталоги проекта
-    # Пути к РАБОЧИМ файлам считаются от PROJECT_ROOT (корень репозитория), а
-    # не от ROOT (пакет). Пакет — только исполняемый код; шаблоны, подписки,
-    # база и логи лежат рядом с ним, чтобы их было видно и можно было править,
-    # не залезая внутрь пакета. Для пользователя config/ и source/ — его
-    # файлы, а singbox-subscribe/ — «чёрный ящик» программы.
+    # Пути делятся на ДВЕ семьи, и это не формальность:
+    #
+    #   * ИЗМЕНЯЕМЫЕ ДАННЫЕ считаются от PROJECT_ROOT (= DATA_ROOT) — корня
+    #     данных. У системной установки это профиль пользователя
+    #     (%LOCALAPPDATA%\singbox-subs-finder, ~/.local/share/...), у старой,
+    #     из клона репозитория, — сам клон. Обновление программы первый
+    #     каталог не трогает: база и настройки переживают переустановку.
+    #   * КОД и ШАБЛОНЫ считаются от ROOT (пакет singbox-subscribe). Они
+    #     приезжают вместе с программой и меняются только вместе с ней.
+    #
+    # Поэтому база, подписки и логи лежат рядом с config.yaml (их видно и
+    # можно править руками), а шаблоны проверок — внутри пакета.
     Field("paths", "urls_file", "path", PROJECT_ROOT / "config" / "subs" / "urls.json", "Список ссылок на подписки", legacy=("URLS_FILE",)),
     Field("paths", "merge_file", "path", PROJECT_ROOT / "source" / "merge.txt", "Файл пула проверки", legacy=("MERGE_FILE",)),
     Field("paths", "whitelist_file", "path", PROJECT_ROOT / "source" / "whitelist.txt", "Выгрузка живых серверов", legacy=("WHITELIST_FILE",)),
@@ -456,6 +476,8 @@ _SCHEMA: tuple = (
     Field("paths", "sing_box_output_dir", "path", ROOT / ".tmp_singbox", "Куда sing-box пишет временные конфиги батчей", legacy=("SING_BOX_OUTPUT_DIR",)),
 
     # -------------------------------------------------- LOG: логирование
+    # Логи — данные, а не код: они живут рядом с config.yaml, в каталоге
+    # данных. Программу можно переустановить, журнал работы останется.
     Field("log", "dir_path", "path", PROJECT_ROOT / "logs", "Каталог логов", legacy=("LOG_DIR_PATH", "LOG_DIR")),
     Field("log", "level", "level", 20, "ПОРОГ: что попадает в файлы и консоль", values="DEBUG, INFO, WARNING, ERROR, CRITICAL, OFF", legacy=("LOG_LEVEL",)),
     Field("log", "console_level", "level", 20, "Порог КОНСОЛИ (файлы можно подробнее, консоль тише)", values="DEBUG, INFO, WARNING, ERROR, CRITICAL, OFF", legacy=("LOG_CONSOLE_LEVEL",)),

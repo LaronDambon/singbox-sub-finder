@@ -35,15 +35,19 @@ PROJECT_ROOT = ROOT.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from config.layout import config_file, data_root, env_file  # noqa: E402
 from installer import (  # noqa: E402  — путь настраивается выше
     InstallError,
     Ui,
     is_windows,
+    venv_location,
     venv_python,
 )
 
-CONFIG_FILE = PROJECT_ROOT / "config.yaml"
-ENV_FILE = PROJECT_ROOT / ".env"
+#: Каталог данных: здесь и только здесь лежат настройки пользователя.
+DATA_ROOT = data_root()
+CONFIG_FILE = config_file()
+ENV_FILE = env_file()
 
 #: Наборы чекеров на выбор. Порядок — от самого дешёвого к полному: время
 #: проверки растёт вместе с ним, и человек должен видеть, что выбирает.
@@ -337,7 +341,7 @@ def run_wizard(ui: Ui, *, assume_yes: bool = False) -> int:
     if needs_browser and not assume_yes:
         ui.plain()
         ui.warn("browser_service требует chromium и входа в аккаунт:")
-        ui.plain(f"  {venv_python(PROJECT_ROOT / '.venv')} -m playwright install chromium")
+        ui.plain(f"  {venv_python(venv_location(ui))} -m playwright install chromium")
         ui.plain("  python singbox-subscribe/browser.py login gemini")
 
     # ---------------------------------------------------------- 3. деплой

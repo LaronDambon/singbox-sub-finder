@@ -7,7 +7,13 @@ __pycache__
 source/
 
 # Секреты: ключи и токены живут ТОЛЬКО здесь и не коммитятся.
-# Обычные настройки — в config.yaml в корне репозитория, он коммитится.
+# Обычные настройки — в config.yaml, он коммитится.
+#
+# В системной установке данные лежат ВНЕ репозитория (см.
+# singbox-subscribe/config/layout.py): программа в /opt или Program Files,
+# а config.yaml, .env, config/, source/, logs/ и output/ — в профиле
+# пользователя. Эти правила остаются на случай, когда каталог данных задан
+# внутрь репозитория (SINGBOX_DATA_DIR) или установка старая, из клона.
 # Environments
 .env
 .venv
@@ -33,6 +39,13 @@ singbox-subscribe/sing-box/browser_*.json
 singbox-subscribe/sing-box/*.out.log
 source/tests/
 output/
+# Данные установки, если SINGBOX_DATA_DIR указывает внутрь репозитория:
+# это личные настройки, база и логи, коммитить их нечего.
+/data/
+/config/subs/
+/config/templates/
+/config/reachability_targets.json
+/logs/
 
 # Test & benchmark artifacts
 singbox-subscribe/.tmp_tests/

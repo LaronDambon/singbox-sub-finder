@@ -49,10 +49,26 @@ from typing import Any
 #: Корень пакета singbox-subscribe — исполняемый код (config/, script/, pipeline/).
 ROOT = Path(__file__).resolve().parent
 
-#: Корень репозитория — РАБОЧИЕ файлы пользователя: config/ (шаблоны и
-#: подписки), source/ (база и списки), logs/, output/. Пути в config.yaml
-#: пишутся относительно него, поэтому относительные пути считаются отсюда.
-PROJECT_ROOT = ROOT.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from config.layout import (  # noqa: E402  — путь настраивается выше
+    PACKAGE_ROOT,
+    code_root_of,
+    config_file,
+    data_root,
+    env_file,
+)
+
+#: Корень данных — РАБОЧИЕ файлы пользователя: config/ (шаблоны и подписки),
+#: source/ (база и списки), logs/, output/. Пути в config.yaml пишутся
+#: относительно него, поэтому относительные пути считаются отсюда.
+#: У системной установки это профиль пользователя, у старой — клон.
+PROJECT_ROOT = data_root()
+
+#: Корень кода: requirements.txt, .git, сам пакет. Отдельно от данных —
+#: программу обновляют, данные при этом не трогают.
+CODE_ROOT = code_root_of()
 
 #: Три состояния проверки. OK — можно работать; WARN — работать можно, но
 #: что-то не будет сделано; FAIL — то, что включено, работать не будет.
@@ -189,7 +205,8 @@ def load_secrets() -> None:
         from dotenv import load_dotenv
     except Exception:  # noqa: BLE001 — пакет необязателен, как и в deploy_config
         return
-    for candidate in (PROJECT_ROOT / ".env", ROOT / ".env"):
+    for candidate in (env_file(), PROJECT_ROOT / ".env", ROOT / ".env",
+                      CODE_ROOT / ".env"):
         if candidate.exists():
             try:
                 load_dotenv(candidate, override=False)
@@ -336,7 +353,8 @@ def _env_file_values() -> dict:
     """Содержимое .env как словарь. Пустой словарь, если файла нет."""
     if _ENV_VALUES:
         return _ENV_VALUES
-    for candidate in (PROJECT_ROOT / ".env", ROOT / ".env"):
+    for candidate in (env_file(), PROJECT_ROOT / ".env", ROOT / ".env",
+                      CODE_ROOT / ".env"):
         if not candidate.exists():
             continue
         try:
@@ -394,7 +412,7 @@ def check_python() -> Check:
 
 def check_config_file() -> Check:
     """Есть ли config.yaml. Без него работают только значения по умолчанию."""
-    path = PROJECT_ROOT / "config.yaml"
+    path = config_file()
     if not path.exists():
         return Check(
             "config_file", "Файл config.yaml", FAIL, "не найден: %s" % path,
@@ -436,7 +454,7 @@ def check_config_loads(settings) -> Check:
 
 def check_env_file() -> Check:
     """Есть ли .env. В нём ЖИВУТ ТОЛЬКО СЕКРЕТЫ, обычные настройки — в config.yaml."""
-    path = PROJECT_ROOT / ".env"
+    path = env_file()
     if not path.exists():
         return Check(
             "env_file", "Файл .env (секреты)", WARN, "не найден: %s" % path,
@@ -605,8 +623,8 @@ def check_ip_source(settings) -> Check:
     used_in = []
     try:
         for name in templates:
-            path = PROJECT_ROOT / "config" / "templates" / name
-            if path.exists() and ph in path.read_text(encoding="utf-8", errors="replace"):
+            path = _template_path(name)
+            if path is not None and ph in path.read_text(encoding="utf-8", errors="replace"):
                 used_in.append(name)
     except Exception:  # noqa: BLE001 — не смогли прочитать = считаем, что нет
         pass
@@ -663,6 +681,30 @@ def check_ip_source(settings) -> Check:
                  "нужен для %s; %s" % (", ".join(used_in), info))
 
 
+def _templates_dir() -> Path | None:
+    """Каталог шаблонов деплоя.
+
+    Сначала данные: шаблоны правит пользователь, и установщик кладёт их
+    рядом с config.yaml. Если там пусто — берём поставку из пакета, чтобы
+    системная установка без копирования всё равно запускалась.
+    """
+    for folder in (PROJECT_ROOT / "config" / "templates",
+                   ROOT / "config" / "templates"):
+        if folder.is_dir():
+            return folder
+    return None
+
+
+def _template_path(name: str) -> Path | None:
+    """Путь к шаблону по имени: данные важнее поставки."""
+    for folder in (PROJECT_ROOT / "config" / "templates",
+                   ROOT / "config" / "templates"):
+        candidate = folder / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _configured_templates(settings) -> list:
     """Какие шаблоны будут собираться: deploy.templates, иначе deploy.template."""
     raw = _read(settings, "deploy.templates", None)
@@ -675,9 +717,9 @@ def _configured_templates(settings) -> list:
         items = [one] if one else []
     # "all" разворачиваем в реальные имена файлов.
     if any(i.lower() == "all" for i in items):
+        folder = _templates_dir()
         try:
-            folder = PROJECT_ROOT / "config" / "templates"
-            if folder.exists():
+            if folder is not None:
                 items = [f.name for f in sorted(folder.glob("*.json"))]
         except Exception:  # noqa: BLE001
             pass

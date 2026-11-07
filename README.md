@@ -22,6 +22,17 @@ irm https://raw.githubusercontent.com/LaronDambon/singbox-sub-finder/main/bootst
 Скрипт проверит Python и git, развернёт репозиторий, создаст окружение и
 поставит зависимости.
 
+| | Windows | Linux / macOS |
+|---|---|---|
+| **программа** | `%ProgramFiles%\singbox-subs-finder` | `/opt/singbox-subs-finder` |
+| **данные** | `%LOCALAPPDATA%\singbox-subs-finder` | `~/.local/share/singbox-subs-finder` |
+
+Программа и данные лежат **врозь**: обновление кода не задевает базу,
+`config.yaml` и `.env`. На Windows установка в `Program Files` требует
+прав администратора — запустите PowerShell от имени администратора.
+Подробности и переменные для смены каталогов — в
+[документации по установке](docs/install.md).
+
 <details>
 <summary>Если репозиторий уже скачан</summary>
 
