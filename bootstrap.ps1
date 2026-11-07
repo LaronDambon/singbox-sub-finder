@@ -1,27 +1,4 @@
-﻿<#
-.SYNOPSIS
-    ЗАГРУЗЧИК: скачивает репозиторий и запускает установку.
-
-.DESCRIPTION
-    Предназначен для запуска ОДНОЙ КОМАНДОЙ, без клонирования вручную:
-
-      irm https://raw.githubusercontent.com/LaronDambon/singbox-sub-finder/main/bootstrap.ps1 | iex
-
-    Что делает:
-      1. проверяет python и git;
-      2. клонирует репозиторий в .\singbox-subs-finder;
-      3. запускает внутри install.ps1.
-
-    Повторный запуск не ломает установку: если каталог уже есть, он
-    обновляется, а не затирается — config.yaml, .env и база остаются.
-
-    Переменные (задайте ДО вызова):
-      $env:SINGBOX_DIR     куда ставить (по умолчанию .\singbox-subs-finder)
-      $env:SINGBOX_BRANCH  ветка (по умолчанию main)
-      $env:SINGBOX_REPO    адрес репозитория
-#>
-
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 if ($env:SINGBOX_REPO)   { $repo   = $env:SINGBOX_REPO }   else { $repo   = 'https://github.com/LaronDambon/singbox-sub-finder.git' }
 if ($env:SINGBOX_BRANCH) { $branch = $env:SINGBOX_BRANCH } else { $branch = 'main' }
@@ -34,13 +11,10 @@ function Die  { param($m) Write-Host $m -ForegroundColor Red; exit 1 }
 Say 'Установка singbox-subs-finder'
 Write-Host ''
 
-# --- что нужно --------------------------------------------------------------
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     Die 'git не найден. Установите: https://git-scm.com/download/win'
 }
 
-# py -3 предпочтительнее: python в PATH часто оказывается заглушкой из
-# Microsoft Store, которая молча открывает магазин вместо запуска.
 $pythonExe  = $null
 $pythonArgs = @()
 foreach ($c in @(@{Exe='py'; Args=@('-3')}, @{Exe='python'; Args=@()}, @{Exe='python3'; Args=@()})) {
@@ -54,7 +28,7 @@ foreach ($c in @(@{Exe='py'; Args=@('-3')}, @{Exe='python'; Args=@()}, @{Exe='py
 }
 
 if (-not $pythonExe) {
-    Die 'Python 3 не найден. Установите его: https://www.python.org/downloads/ — при установке отметьте галочку Add python.exe to PATH.'
+    Die 'Python 3 не найден. Установите: https://www.python.org/downloads/'
 }
 
 $pyVersion = & $pythonExe @($pythonArgs + @('--version')) 2>&1
@@ -63,9 +37,8 @@ Write-Host "  git:     $(git --version)"
 Write-Host "  каталог: $dir"
 Write-Host ''
 
-# --- получение кода ---------------------------------------------------------
 if (Test-Path (Join-Path $dir '.git')) {
-    Say 'Каталог уже есть — обновляю'
+    Say 'Каталог уже есть, обновляю'
     git -C $dir fetch --depth 1 origin $branch
     git -C $dir checkout $branch 2>$null
     $ref = 'origin/' + $branch
@@ -75,13 +48,12 @@ if (Test-Path (Join-Path $dir '.git')) {
     git clone --depth 1 --branch $branch $repo $dir
 }
 
-# --- установка --------------------------------------------------------------
 Say 'Запускаю установку'
 Write-Host ''
 
-$installer = Join-Path $dir 'singbox-subscribe\install.ps1'
+$installer = Join-Path $dir 'singbox-subscribe/install.ps1'
 if (-not (Test-Path $installer)) {
-    Die "не найден $installer в ветке $branch"
+    Die ('не найден install.ps1 в ветке ' + $branch)
 }
 
 & $installer @args
