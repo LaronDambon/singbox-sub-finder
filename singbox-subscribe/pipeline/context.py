@@ -77,6 +77,11 @@ def default_settings() -> Settings:
         # sing-box
         singbox_path=Path(get_settings().paths.sing_box_path),
         global_tag=get_settings().reach.global_tag,
+        # Уровни отбора лучших/резервных: их читает стадия экспорта, которая
+        # пишет whitelist.txt. Без проброса ctx.setting("best_top") вернул бы
+        # тихий 0, и файл вышел бы без меток.
+        best_top=get_settings().core.best_top,
+        best_reserve=get_settings().core.best_reserve,
     )
 
 

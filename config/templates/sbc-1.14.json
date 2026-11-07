@@ -37,9 +37,18 @@
         "tag": "hosts_fix",
         "type": "hosts",
         "predefined": {
-          "dns.yandex.ru": ["77.88.8.8", "77.88.8.1"],
-          "dns.google": ["8.8.8.8", "8.8.4.4"],
-          "cloudflare-dns.com": ["104.16.248.249", "104.16.249.249"]
+          "dns.yandex.ru": [
+            "77.88.8.8",
+            "77.88.8.1"
+          ],
+          "dns.google": [
+            "8.8.8.8",
+            "8.8.4.4"
+          ],
+          "cloudflare-dns.com": [
+            "104.16.248.249",
+            "104.16.249.249"
+          ]
         }
       },
       {
@@ -185,194 +194,57 @@
   ],
   "outbounds": [
     {
-      "tag": "proxy",
-      "type": "urltest",
-      "outbounds": ["{all}"],
-      "filter": [
-        {
-          "action": "include",
-          "keywords": ["Global"]
-        }
+      "tag": "alldeploy",
+      "type": "block",
+      "tags": [
+        "github",
+        "openrouter",
+        "gemini-chat",
+        "openai",
+        "youtube",
+        "telegram",
+        "microsoft",
+        "global"
       ],
-      "url": "https://www.gstatic.com/generate_204",
-      "interval": "1m",
-      "tolerance": 50
-    },
-    {
-      "tag": "OpenrouterAI-ping",
-      "type": "urltest",
-      "outbounds": ["{all}"],
-      "filter": [
+      "blocks": [
         {
-          "action": "include",
-          "keywords": ["openrouter"]
-        }
-      ],
-      "url": "https://openrouter.ai",
-      "interval": "10m",
-      "tolerance": 50 
-    },
-    {
-      "tag": "OpenrouterAI",
-      "type": "urltest",
-      "outbounds": ["OpenrouterAI-ping", "proxy"],
-      "url": "https://openrouter.ai",
-      "interval": "1m",
-      "tolerance": 100 
-    },
-    {
-      "tag": "OpenAI-ping",
-      "type": "urltest",
-      "outbounds": ["{all}"],
-      "filter": [
+          "tag": "alldeploy-reserved",
+          "type": "urltest",
+          "outbounds": [
+            "{all}"
+          ],
+          "filter": [
+            {
+              "action": "include",
+              "keywords": [
+                "alldeploy-reserve"
+              ]
+            }
+          ],
+          "url": "alldeploy",
+          "interval": "10m",
+          "tolerance": 100
+        },
         {
-          "action": "include",
-          "keywords": ["openai"]
+          "tag": "alldeploy",
+          "type": "urltest",
+          "outbounds": [
+            "{all}",
+            "alldeploy-reserved"
+          ],
+          "filter": [
+            {
+              "action": "include",
+              "keywords": [
+                "alldeploy-best"
+              ]
+            }
+          ],
+          "url": "alldeploy",
+          "interval": "2m",
+          "tolerance": 100
         }
-      ],
-      "url": "https://api.openai.com/v1/",
-      "interval": "10m",
-      "tolerance": 50
-    },
-    {
-      "tag": "OpenAI",
-      "type": "urltest",
-      "outbounds": ["OpenAI-ping", "proxy"],
-      "url": "https://api.openai.com/v1/",
-      "interval": "1m",
-      "tolerance": 100
-    },
-    {
-      "tag": "Youtube-ping",
-      "type": "urltest",
-      "outbounds": ["{all}"],
-      "filter": [
-        {
-          "action": "include",
-          "keywords": ["youtube"]
-        }
-      ],
-      "url": "https://www.youtube.com/generate_204",
-      "interval": "10m",
-      "tolerance": 50
-    },
-    {
-      "tag": "Youtube",
-      "type": "urltest",
-      "outbounds": ["Youtube-ping", "proxy"],
-      "url": "https://www.youtube.com/generate_204",
-      "interval": "1m",
-      "tolerance": 100
-    },
-    {
-      "tag": "Gemini-ping",
-      "type": "urltest",
-      "outbounds": ["{all}"],
-      "filter": [
-        {
-          "action": "include",
-          "keywords": ["gemini"]
-        }
-      ],
-      "url": "https://gemini.google.com/",
-      "interval": "10m",
-      "tolerance": 50
-    },
-    {
-      "tag": "Gemini",
-      "type": "urltest",
-      "outbounds": ["Gemini-ping", "proxy"],
-      "url": "https://gemini.google.com/",
-      "interval": "1m",
-      "tolerance": 100
-    },
-    {
-      "tag": "Telegram-ping",
-      "type": "urltest",
-      "outbounds": ["{all}"],
-      "filter": [
-        {
-          "action": "include",
-          "keywords": ["telegram"]
-        }
-      ],
-      "url": "https://api.telegram.org",
-      "interval": "10m",
-      "tolerance": 50
-    },
-    {
-      "tag": "Telegram",
-      "type": "urltest",
-      "outbounds": ["Telegram-ping", "proxy"],
-      "url": "https://api.telegram.org",
-      "interval": "1m",
-      "tolerance": 100
-    },
-    {
-      "tag": "Github-ping",
-      "type": "urltest",
-      "outbounds": ["{all}"],
-      "filter": [
-        {
-          "action": "include",
-          "keywords": ["github"]
-        }
-      ],
-      "url": "https://www.github.com",
-      "interval": "10m",
-      "tolerance": 50
-    },
-    {
-      "tag": "Github",
-      "type": "urltest",
-      "outbounds": ["Github-ping", "proxy"],
-      "url": "https://www.github.com",
-      "interval": "1m",
-      "tolerance": 100
-    },
-    {
-      "tag": "Microsoft-ping",
-      "type": "urltest",
-      "outbounds": ["{all}"],
-      "filter": [
-        {
-          "action": "include",
-          "keywords": ["microsoft"]
-        }
-      ],
-      "url": "https://www.microsoft.com",
-      "interval": "10m",
-      "tolerance": 50
-    },
-    {
-      "tag": "Microsoft",
-      "type": "urltest",
-      "outbounds": ["Microsoft-ping", "proxy"],
-      "url": "https://www.microsoft.com",
-      "interval": "1m",
-      "tolerance": 100
-    },
-    {
-      "tag": "Yandex-ping",
-      "type": "urltest",
-      "outbounds": ["{all}"],
-      "filter": [
-        {
-          "action": "include",
-          "keywords": ["yandex"]
-        }
-      ],
-      "url": "https://yandex.ru/portal/generate_204",
-      "interval": "10m",
-      "tolerance": 50
-    },
-    {
-      "tag": "Yandex",
-      "type": "urltest",
-      "outbounds": ["Yandex-ping", "proxy"],
-      "url": "https://yandex.ru/portal/generate_204",
-      "interval": "1m",
-      "tolerance": 100
+      ]
     },
     {
       "tag": "direct",
@@ -384,7 +256,7 @@
       "server": "yandex-fast"
     },
     "auto_detect_interface": true,
-    "final": "proxy",
+    "final": "global",
     "rules": [
       {
         "inbound": [
@@ -414,14 +286,21 @@
         "method": "default"
       },
       {
-        "rule_set": ["whitelist-ru" , "ipwhitelist-ru", "geosite-crypto", "geo-direct", "geosite-ru", "geoip-ru"],
+        "rule_set": [
+          "whitelist-ru",
+          "ipwhitelist-ru",
+          "geosite-crypto",
+          "geo-direct",
+          "geosite-ru",
+          "geoip-ru"
+        ],
         "outbound": "direct"
       },
       {
         "rule_set": [
           "geosite-github"
         ],
-        "outbound": "Github"
+        "outbound": "github"
       },
       {
         "ip_is_private": true,
@@ -431,39 +310,39 @@
         "domain_suffix": [
           "openrouter.ai"
         ],
-        "outbound": "OpenrouterAI"
+        "outbound": "openrouter"
       },
       {
-        "domain_suffix": [
-          "gemini.google.com",
-          "gemini.gstatic.com"
+        "rule_set": [
+          "geosite-google",
+          "geoip-google"
         ],
-        "outbound": "Gemini"
+        "outbound": "gemini-chat"
       },
       {
         "rule_set": [
           "geosite-openai"
         ],
-        "outbound": "OpenAI"
+        "outbound": "openai"
       },
       {
         "rule_set": [
           "geosite-youtube"
         ],
-        "outbound": "Youtube"
+        "outbound": "youtube"
       },
       {
         "rule_set": [
           "geoip-telegram",
           "geosite-telegram"
         ],
-        "outbound": "Telegram"
+        "outbound": "telegram"
       },
       {
         "rule_set": [
           "geosite-microsoft"
         ],
-        "outbound": "Microsoft"
+        "outbound": "microsoft"
       }
     ],
     "rule_set": [

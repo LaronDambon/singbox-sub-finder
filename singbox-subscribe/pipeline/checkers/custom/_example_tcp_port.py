@@ -5,7 +5,7 @@
 живым. Это НЕ проверка проксирования, только живость хоста — зато работает
 без бинарника sing-box и показывает, как писать свои алгоритмы.
 
-Включение: PIPELINE_CHECKERS=tcp_port,url_probe
+Включение: singbox.enabled_checkers: [tcp_port, url_probe]
 ( tcp_port будет первым решающим, url_probe даст задержку).
 
 Запуск: python -m pipeline checkers

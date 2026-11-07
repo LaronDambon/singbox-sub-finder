@@ -69,6 +69,10 @@ class ExportStage:
             result["whitelist"] = await db.export_whitelist(
                 Path(self.ctx.setting("whitelist_file")),
                 global_tag=self.ctx.setting("global_tag", "Global"),
+                # Лучшие и резервные: файл whitelist.txt пишется именно здесь,
+                # и без этих параметров метки в него не попадали.
+                best_top=int(self.ctx.setting("best_top", 0) or 0),
+                best_reserve=int(self.ctx.setting("best_reserve", 0) or 0),
             )
             LOGGER.info("Экспорт из базы: whitelist %d", result["whitelist"])
 
@@ -79,15 +83,76 @@ class ExportStage:
 
     @staticmethod
     def _deploy():
-        """Деплой собранного конфига. Ошибки не поднимаются: цикл не ломаем."""
-        from deploy_config import deploy, deploy_multi
+        """Публикация конфига: локально и/или в GitHub. Ошибки не поднимаются.
+
+        Два способа независимы. Локальный пишет файл на диск этой машины и
+        работает БЕЗ токенов и репозитория; GitHub-овый пушит в репозиторий.
+        Включены могут быть оба сразу — тогда собирается один и тот же конфиг
+        и публикуется двумя путями (см. deploy.local и deploy.repo).
+        """
+        from deploy_config import (deploy, deploy_multi, local_deploy,
+                                   local_deploy_multi)
 
         # Настройки читаются здесь, в точке использования. Константы на
         # уровне модуля вернули бы имя каждой настройки в коде вторым разом —
         # ровно ту связь, которую убирает config.settings.
-        repo = get_settings().deploy.repo
-        path = get_settings().deploy.path
-        templates = [t for t in get_settings().deploy.templates.replace(",", " ").split() if t]
+        settings = get_settings().deploy
+        repo = settings.repo
+        path = settings.path
+        # deploy.templates приходит и списком (так его пишет config.yaml:
+        # templates: [all]), и строкой через запятую (старая форма .env).
+        # Приводим к списку, прежде чем звать .split().
+        raw_templates = settings.templates
+        if isinstance(raw_templates, (list, tuple, set)):
+            templates = [str(t).strip() for t in raw_templates if str(t).strip()]
+        else:
+            templates = [t for t in str(raw_templates or "").replace(",", " ").split() if t]
+
+        results: dict = {}
+        want_local = bool(settings.local)
+        # GitHub-деплой без репозитория — это не «деплой с ошибкой», а
+        # незаполненная настройка: ругаться в каждом цикле незачем.
+        want_github = bool(str(repo or "").strip())
+
+        if want_local:
+            local_path = settings.local_path
+            try:
+                if templates:
+                    LOGGER.info("Деплой локальный: dir=%s templates=%s",
+                                local_path, templates)
+                    results["local"] = local_deploy_multi(
+                        templates=templates, path=local_path,
+                    )
+                else:
+                    LOGGER.info("Деплой локальный: dir=%s template=%s",
+                                local_path, settings.template)
+                    results["local"] = local_deploy(
+                        path=Path(str(local_path)) / str(settings.template),
+                        template=settings.template,
+                    )
+                res = results["local"]
+                if res.get("ok"):
+                    LOGGER.info("Локальный деплой выполнен: %s",
+                                res.get("dir") or res.get("path"))
+                else:
+                    LOGGER.warning("Локальный деплой не выполнен: %s", res.get("error"))
+                for item in res.get("results") or []:
+                    if isinstance(item, dict) and not item.get("ok"):
+                        LOGGER.warning("  не записан %s: %s",
+                                       item.get("template") or "?",
+                                       item.get("error") or "причина не указана")
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Локальный деплой не выполнен: %s", exc)
+
+        if not want_github:
+            if not want_local:
+                # Ни одного способа публикации: это не ошибка, а выключенный
+                # деплой. Скажем один раз в логе, чтобы отсутствие файла не
+                # выглядело загадкой.
+                LOGGER.info("Деплой выключен: ни deploy.local, ни deploy.repo не заданы")
+                return None
+            return results
+
         try:
             if templates:
                 LOGGER.info("Деплой (мульти): repo=%s templates=%s", repo, templates)
@@ -95,7 +160,7 @@ class ExportStage:
                     repo=repo, templates=templates, path=path, silent=True,
                 )
             else:
-                template = get_settings().deploy.template
+                template = settings.template
                 LOGGER.info("Деплой: repo=%s template=%s", repo, template)
                 res = deploy(
                     repo=repo, template=template,
@@ -103,7 +168,9 @@ class ExportStage:
                 )
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Деплой не выполнен: %s", exc)
-            return None
+            results["github"] = None
+            return results if want_local else None
+        results["github"] = res
         failed_items = [i for i in (res.get("results") or [])
                         if isinstance(i, dict) and not i.get("ok")]
         if res.get("ok"):
@@ -125,4 +192,6 @@ class ExportStage:
         for item in res.get("results") or []:
             if isinstance(item, dict) and item.get("url"):
                 item["url"] = redact(item["url"])
-        return res
+        # Возвращаем ОБА результата, если работали оба способа: иначе отчёт
+        # терял бы локальную часть и выглядел как «деплой не выполнялся».
+        return results if want_local else res

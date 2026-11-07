@@ -46,15 +46,18 @@ from urllib.parse import urlparse
 
 import requests
 
+# ROOT — папка пакета (код). Рабочие файлы (source/, logs/, config/)
+# лежат в корне репозитория: PROJECT_ROOT. Пути в конфиге — от него же.
 ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = ROOT.parent
 
 from config.settings import get_settings
 
 from script.logger_utils import get_project_logger
-from script.core import reserve_ports
+from script.core import release_ports, reserve_ports
 from script.batch_singbox import (
     build_batch_config, normalize_key, parse_outbound,
-    ports_ready, start_singbox,
+    ports_ready, start_singbox, stop_singbox,
 )
 
 LOGGER = get_project_logger("country_check")
@@ -212,7 +215,7 @@ def _run_batch(items: list[tuple[str, int]], results: dict[str, dict],
         e["port"] = p
 
     config = build_batch_config(active, ROOT / str(get_settings().paths.countrytest_template))
-    config_path = ROOT / "source" / "tests" / f"country_batch_{items[0][1]}_{len(items)}.json"
+    config_path = PROJECT_ROOT / "source" / "tests" / f"country_batch_{items[0][1]}_{len(items)}.json"
     proc = start_singbox(config, config_path)
 
     started_ok = False
@@ -220,12 +223,8 @@ def _run_batch(items: list[tuple[str, int]], results: dict[str, dict],
         started_ok = ports_ready([e["port"] for e in active], STARTUP_WAIT_SECONDS)
 
     if not started_ok:
-        if proc is not None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except Exception:  # noqa: BLE001
-                proc.kill()
+        stop_singbox(proc)
+        release_ports(ports)
         try:
             config_path.unlink(missing_ok=True)
         except OSError:
@@ -258,11 +257,8 @@ def _run_batch(items: list[tuple[str, int]], results: dict[str, dict],
                 line = futures[fut]
                 results[line] = fut.result()
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except Exception:  # noqa: BLE001
-            proc.kill()
+        stop_singbox(proc)
+        release_ports(ports)
         try:
             config_path.unlink(missing_ok=True)
         except OSError:

@@ -2,7 +2,7 @@
 
 Положите сюда .py-файл с классом-наследником Checker — он подхватится
 автоматически и появится в ``python -m pipeline checkers`` и в выборе
-PIPELINE_CHECKERS.
+singbox.enabled_checkers.
 
 Минимальный пример (см. также example_ping.py):
 

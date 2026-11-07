@@ -41,10 +41,40 @@ async def run_exclusive(func: Callable[..., Any], /, *args, **kwargs) -> Any:
     """Выполняет блокирующий запуск sing-box, не давая пересечься с другим.
 
     Блокирующий код дополнительно уходит в поток, чтобы event loop не вставал.
+
+    Замок снимается только после того, как РАБОТА реально закончилась, а не
+    после того, как её перестали ждать. Раньше вызывающая сторона оборачивала
+    это в asyncio.wait_for, и по таймауту await прерывался — но поток с
+    sing-box продолжал жить и держать свои порты, а замок уже был свободен.
+    Следующий чекер (service_access, speed) стартовал поверх работающего
+    предыдущего и получал занятые порты. Именно это выглядело как «конфиги
+    запускаются мимо pipeline».
+
+    Поэтому поток и замок связываются явно: пока future не завершится, замок
+    не отпускается, даже если нас перестали ждать.
     """
     loop = asyncio.get_running_loop()
     from functools import partial
 
     target = partial(func, **kwargs) if kwargs else func
-    async with get_lock():
-        return await loop.run_in_executor(None, target, *args)
+    lock = get_lock()
+    await lock.acquire()
+    future = loop.run_in_executor(None, target, *args)
+    # Отпускаем замок строго в колбэке завершения future, а не в finally
+    # ожидающего: отмена ожидания (wait_for/CancelledError) не должна
+    # освобождать замок, пока sing-box ещё работает.
+    released = False
+
+    def _release(_fut=None):
+        nonlocal released
+        if not released:
+            released = True
+            loop.call_soon_threadsafe(lock.release)
+
+    future.add_done_callback(_release)
+    try:
+        return await future
+    except asyncio.CancelledError:
+        # Ждать перестали, но работа продолжается: замок отпустит _release,
+        # когда поток действительно закончит. Пробрасываем отмену наверх.
+        raise

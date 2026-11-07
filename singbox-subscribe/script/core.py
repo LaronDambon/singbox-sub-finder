@@ -2,6 +2,7 @@ import json, os, time, requests, importlib, argparse, yaml, ruamel.yaml
 import re
 import socket
 import sys
+import threading
 from utils import tool
 import warnings
 from copy import deepcopy
@@ -132,7 +133,10 @@ def add_prefix(nodes, subscribe):
 def add_emoji(nodes, subscribe):
     if subscribe.get('emoji'):
         for node in nodes:
-            node['tag'] = tool.rename(node['tag'])
+            # Тип передаём явно: в подписях вида "[🇺🇸] [vm-no-ws] [...]"
+            # от имени остаётся один флаг, и без протокола два разных
+            # сервера США получили бы одинаковый тег "🇺🇸".
+            node['tag'] = tool.rename(node['tag'], node.get('type'))
             if node.get('detour'):
                 node['detour'] = tool.rename(node['detour'])
 
@@ -753,10 +757,40 @@ def validate_config_groups(config, *, strict: bool = True) -> list:
     return sorted(empty)
 
 
+def _unique_node_tags(nodes):
+    """Присваивает узлам уникальные теги.
+
+    Разные серверы сплошь и рядом приходят с ОДИНАКОВЫМ именем: подписка
+    отдаёт несколько узлов с общим префиксом ("🏳[openproxylist.com] vmess-"),
+    и имя у них совпадает до символа. sing-box такие дубли не принимает:
+    "initialize outbound[N]: duplicate tag" — и конфиг не стартует вовсе.
+
+    Дубли переименовываются в "<имя> #2", "<имя> #3". Меняем копию, а не
+    исходный узел: список узлов принадлежит вызывающему коду.
+    """
+    seen: dict[str, int] = {}
+    out = []
+    for index, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            continue
+        node = dict(node)
+        base = node.get("tag") or f"node_{index}"
+        count = seen.get(base, 0) + 1
+        seen[base] = count
+        if count > 1:
+            node["tag"] = f"{base} #{count}"
+        out.append(node)
+    return out
+
+
 def build_singbox_config_from_nodes(base_template, nodes):
     """Создаёт один sing-box конфиг из списка узлов."""
     config = deepcopy(base_template)
     outbounds = config.get("outbounds", [])
+
+    # Дубли имён разводим ДО всего остального: иначе группа ссылается на
+    # один тег несколько раз, а sing-box падает на duplicate tag.
+    nodes = _unique_node_tags(nodes)
 
     # Собираем все теги узлов
     all_tags = []
@@ -806,8 +840,266 @@ def build_singbox_config_from_nodes(base_template, nodes):
         if not any(ob.get("tag") == tag for ob in outbounds):
             outbounds.append(node)
 
+    # Порядок обязателен.
+    #
+    # 1. Сервис без группы <метка>-best не создаётся ВООБЩЕ: нет лучших
+    #    серверов — нет сервиса. Уходят все три его группы и правило.
+    # 2. Пустая группа резерва сервис не отменяет: он просто соберётся без
+    #    4-го сервера. Убираем только ссылку на неё.
+    # 3. Остатки перенаправляются в proxy.
+    outbounds = _drop_servicless_groups(outbounds)
+    _drop_empty_group_refs(outbounds)
+    outbounds = _drop_empty_groups(outbounds)
     config["outbounds"] = outbounds
+    _drop_dangling_rules(config, outbounds)
+    _repoint_empty_groups(config, outbounds)
     return config
+
+
+#: Суффикс группы «лучших». Её отсутствие отменяет сервис целиком.
+BEST_SUFFIX = "-best"
+
+#: Суффикс группы резерва. Пустая группа резерва сервис НЕ отменяет.
+RESERVED_SUFFIX = "-reserved"
+
+
+def _drop_servicless_groups(outbounds) -> list:
+    """Убирает сервисы, у которых не собралась группа лучших.
+
+    Логика одна: НЕТ серверов — НЕТ outbound. Группа "<метка>-best" — это
+    те серверы, которые сервис реально проходят и отобраны по задержке.
+    Если она пуста, то сервис не набрал НИ ОДНОГО сервера, и создавать
+    ради него группу-пустышку с правилом маршрута нельзя: обращаться к
+    такой группе не к кому.
+
+    Удаляется ВСЯ тройка сервиса, а не только пустая группа:
+        <метка>, <метка>-best, <метка>-reserved
+    иначе главная группа остаётся без лучших, а ссылка на неё в route
+    ведёт в пустоту.
+
+    Пустая группа РЕЗЕРВА сервис не отменяет: сервис собран, просто в нём
+    меньше четырёх серверов. Такую группу снимет обычный _drop_empty_groups,
+    а ссылку на неё — _drop_empty_group_refs.
+
+    Группы без суффикса "-best" не трогаются вовсе: общая группа proxy
+    собирается по своей метке (Global) и живёт по своим правилам.
+    """
+    groups = [
+        ob for ob in outbounds
+        if isinstance(ob, dict) and ob.get("type") in ("urltest", "selector")
+    ]
+    tags = {str(ob.get("tag")) for ob in groups}
+
+    # Пустые группы лучших: их сервисы не создаются.
+    dead: set[str] = set()
+    for ob in groups:
+        tag = str(ob.get("tag"))
+        if not tag.endswith(BEST_SUFFIX):
+            continue
+        if ob.get("outbounds"):
+            continue
+        base = tag[: -len(BEST_SUFFIX)]
+        dead.update({base, tag, base + RESERVED_SUFFIX})
+
+    if not dead:
+        return list(outbounds)
+
+    result = [
+        ob for ob in outbounds
+        if not (isinstance(ob, dict) and str(ob.get("tag")) in dead)
+    ]
+    # Ссылки на удалённый сервис снимаем и из уцелевших групп.
+    for ob in result:
+        if not isinstance(ob, dict):
+            continue
+        members = ob.get("outbounds")
+        if not isinstance(members, list):
+            continue
+        cleaned = [m for m in members if not (isinstance(m, str) and m in dead)]
+        if cleaned != members:
+            ob["outbounds"] = cleaned
+    return result
+
+
+def _drop_empty_groups(outbounds) -> list:
+    """Удаляет группы, оставшиеся без участников.
+
+    sing-box НЕ принимает группу с пустым списком outbounds: он падает на
+    старте с "initialize outbound[N]: missing tags" и не поднимается
+    вовсе. Поэтому пустую группу из конфига приходится убирать целиком —
+    вместе со ссылками на неё из других групп.
+
+    Ссылки снимаются повторно, каскадом: удаление одной пустой группы
+    может опустошить другую, которая ссылалась только на неё.
+    """
+    result = list(outbounds)
+    for _ in range(8):
+        empty = {
+            str(ob.get("tag")) for ob in result
+            if isinstance(ob, dict)
+            and ob.get("type") in ("urltest", "selector")
+            and not (ob.get("outbounds") or [])
+        }
+        if not empty:
+            break
+        result = [
+            ob for ob in result
+            if not (isinstance(ob, dict) and str(ob.get("tag")) in empty)
+        ]
+        for ob in result:
+            if not isinstance(ob, dict):
+                continue
+            members = ob.get("outbounds")
+            if not isinstance(members, list):
+                continue
+            cleaned = [m for m in members if not (isinstance(m, str) and m in empty)]
+            if cleaned != members:
+                ob["outbounds"] = cleaned
+    return result
+
+
+def _drop_dangling_rules(config, outbounds) -> list:
+    """Убирает правила маршрута, ведущие в НЕСУЩЕСТВУЮЩУЮ группу.
+
+    Группа не создаётся, если сервис не набрал ни одного сервера (см.
+    _drop_empty_groups). Правило маршрута в такую группу остаётся ссылкой
+    в никуда: sing-box либо откажется стартовать, либо отправит трафик
+    сервиса в общий контур, и пользователь будет думать, что сервис
+    работает. Поэтому правило УДАЛЯЕТСЯ: нет outbound — нет обращения.
+
+    Правила на существующие outbound не трогаются вовсе, включая
+    ip_is_private -> direct и whitelist-ru -> direct.
+
+    Правило с НЕСКОЛЬКИМИ outbound (список) чистится поэлементно: из него
+    выбрасываются только пропавшие имена. Если не осталось ни одного,
+    правило удаляется целиком.
+    """
+    known = {
+        str(o.get("tag")) for o in outbounds
+        if isinstance(o, dict) and o.get("tag")
+    }
+    route = config.get("route") or {}
+    rules = route.get("rules")
+    if not isinstance(rules, list):
+        return []
+
+    kept: list = []
+    dropped: list[str] = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            kept.append(rule)
+            continue
+        out = rule.get("outbound")
+        if isinstance(out, str):
+            if out in known:
+                kept.append(rule)
+            else:
+                dropped.append(out)
+            continue
+        if isinstance(out, list):
+            alive = [o for o in out if isinstance(o, str) and o in known]
+            if not alive:
+                dropped.extend(str(o) for o in out if isinstance(o, str))
+                continue
+            if alive != out:
+                rule = dict(rule)
+                rule["outbound"] = alive
+            kept.append(rule)
+            continue
+        kept.append(rule)
+
+    route["rules"] = kept
+    config["route"] = route
+    return dropped
+
+
+def _repoint_empty_groups(config, outbounds) -> list:
+    """Направляет правила маршрута из пустых групп в общую.
+
+    Сервисная группа собирается пустой, когда её метку не набрал ни один
+    сервер. Правило маршрута в такой группе отдаёт трафик в никуда: группа
+    есть, участников нет. Перенаправляем правило в общую группу (proxy) —
+    она собирается по самой лёгкой проверке и пустой почти не бывает.
+
+    Шаг идёт ПОСЛЕ сборки узлов: только тогда видно, какие группы вышли
+    пустыми. Раньше он выполнялся на шаблоне, где пустыми были все группы
+    без разбора, и не делал ничего.
+
+    Группы не удаляем: клиент видит их в конфиге и понимает, какого
+    сервиса нет в базе. Возвращает список перенаправленных правил.
+    """
+    groups = {
+        str(o.get("tag")): o for o in outbounds
+        if isinstance(o, dict) and o.get("type") in ("urltest", "selector")
+    }
+    empty = {tag for tag, ob in groups.items() if not (ob.get("outbounds") or [])}
+
+    # Куда перенаправлять: ТОЛЬКО общая группа. Она собирается по самой
+    # лёгкой проверке (generate_204) и пустой почти не бывает.
+    #
+    # Брать «любую непустую» нельзя: под неё подходила группа
+    # <Сервис>-reserved, и весь трафик уходил в резервный контур одного
+    # случайного сервиса. Это не только бессмысленно, но и ломает конфиг —
+    # у группы резерва нет собственного участника-выхода.
+    fallback = None
+    for name in ("proxy", "global", "Global"):
+        if name in groups and name not in empty:
+            fallback = name
+            break
+    if fallback is None:
+        return []
+
+    repointed = []
+    route = config.get("route") or {}
+    for rule in route.get("rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        out = rule.get("outbound")
+        current = out if isinstance(out, str) else None
+        if current is None or current not in empty:
+            continue
+        rule["outbound"] = fallback
+        repointed.append({"from": current, "to": fallback})
+    final = route.get("final")
+    if isinstance(final, str) and final in empty:
+        route["final"] = fallback
+        repointed.append({"from": final, "to": fallback})
+    return repointed
+
+
+def _drop_empty_group_refs(outbounds) -> None:
+    """Убирает из групп ссылки на группы, оставшиеся без участников.
+
+    Группа <Сервис> описана как ["{all}", "<Сервис>-reserved"]. После
+    фильтрации "{all}" превращается в лучшие узлы сервиса, а имя
+    "-reserved" остаётся как есть — даже если сам резерв пуст. Так в
+    группе оказывался единственный участник "openrouter-reserved",
+    который никуда не ведёт: сервис «работал», а трафик не шёл.
+
+    Пустую группу из конфига НЕ удаляем: клиент видит её и понимает,
+    какой сервис не набрал серверов. Убираем только ссылки на неё.
+    """
+    closed = set()
+    for _ in range(4):
+        empty = {
+            str(ob.get("tag")) for ob in outbounds
+            if isinstance(ob, dict)
+            and ob.get("type") in ("urltest", "selector")
+            and not (ob.get("outbounds") or [])
+        }
+        if empty == closed:
+            break
+        closed = empty
+        for ob in outbounds:
+            if not isinstance(ob, dict):
+                continue
+            members = ob.get("outbounds")
+            if not isinstance(members, list):
+                continue
+            cleaned = [m for m in members
+                       if not (isinstance(m, str) and m in empty and m != ob.get("tag"))]
+            if cleaned != members:
+                ob["outbounds"] = cleaned
 
 
 def find_free_port():
@@ -819,9 +1111,65 @@ def find_free_port():
 
 #: Верхний порт, который вообще можно занять.
 MAX_PORT = 65535
+
+#: Диапазон, из которого берём порты для inbound'ов sing-box.
+#:
+#: Почему НЕ эфемерный. Windows отдаёт эфемерные порты из 49152-65535
+#: (netsh int ipv4 show dynamicport tcp). reserve_ports раньше начинал обход
+#: от порта, который только что выдала ОС, то есть шёл ПРЯМО по эфемерному
+#: диапазону — и ОС в тот же момент могла отдать тот же номер другому
+#: процессу. На 16 параллельных батчах это давало 2-6 отказов:
+#:   listen tcp 127.0.0.1:55159: bind: An attempt was made to access a socket
+#:   in a way forbidden by its access permissions
+#: При этом тот же порт успешно биндился из Python секундой позже — то есть
+#: порт был свободен, но занят в момент гонки.
+#:
+#: Свой диапазон ниже эфемерного эту гонку убирает: никто, кроме нас, эти
+#: номера не выдаёт. Верхняя граница 49000 выбрана ниже 49152, нижняя 40000 —
+#: выше обычных сервисов, которые могут занимать 3000-9000.
+PORT_RANGE_START = 40000
+PORT_RANGE_END = 49000
 #: Сколько неудачных проверок подряд допускаем, прежде чем признать неудачу.
 #: Нужно, чтобы цикл не крутился вечно, если свободных портов не хватит.
 PORT_SCAN_LIMIT = 20000
+
+
+#: Порты, выданные reserve_ports и ещё не возвращённые в оборот.
+#: Без этого два подряд вызова reserve_ports возвращали пересекающиеся
+#: наборы (замерено: A=[52909,52910,52911], B=[52910,52911,52912]), и два
+#: sing-box дрались за один и тот же порт — снаружи это выглядело как
+#: «батч не стартовал» и уходило в деление пополам.
+_RESERVED_PORTS: set[int] = set()
+#: Порты, которые УЖЕ побывали в работе. Их не выдаём повторно, пока есть
+#: свежие: при делении батча пополам родитель освобождает свои порты прямо
+#: перед рекурсией, и без этого списка ребёнок получал ровно те же номера
+#: (замерено: parent [58411,58412,58413] -> child [58412,58413,58414]).
+#: sing-box родителя к этому моменту ещё не отпустил сокеты, поэтому ребёнок
+#: не мог забиндиться и снова «не стартовал» — рекурсия вырождалась в цикл.
+_USED_PORTS: set[int] = set()
+_RESERVED_LOCK = threading.Lock()
+
+
+def release_ports(ports: "list[int] | tuple[int, ...] | None") -> None:
+    """Возвращает порты в оборот после того, как sing-box остановлен.
+
+    Вызывать обязательно: иначе набор выданных портов растёт за прогон,
+    и reserve_ports начнёт перебирать всё больше занятых кандидатов.
+    """
+    if not ports:
+        return
+    with _RESERVED_LOCK:
+        for p in ports:
+            _RESERVED_PORTS.discard(int(p))
+
+
+def _first_candidate() -> int:
+    """Первый кандидат для подбора: начало СВОЕГО диапазона.
+
+    Раньше здесь был find_free_port() — порт, который только что выдала ОС.
+    Это ставило нас в эфемерный диапазон, где с нами соревнуется система.
+    """
+    return PORT_RANGE_START
 
 
 def reserve_ports(count: int) -> list[int]:
@@ -834,36 +1182,83 @@ def reserve_ports(count: int) -> list[int]:
 
     На краю диапазона берём у ОС новый эфемерный порт и продолжаем с него,
     вместо того чтобы падать.
+
+    Выданные порты помечаются занятыми до release_ports(): проверка bind()
+    socket закрывает, то есть сама по себе порт НЕ удерживает, и без пометки
+    следующий вызов выдавал те же номера повторно.
     """
     ports: list[int] = []
-    used: set[int] = set()
-    candidate = find_free_port()
+    # Начинаем со СВОЕГО диапазона, а не с эфемерного порта ОС: эфемерный
+    # занят гонкой с системой (см. PORT_RANGE_START).
+    candidate = _first_candidate()
     misses = 0
-    while len(ports) < count:
-        if misses > PORT_SCAN_LIMIT:
-            raise RuntimeError(
-                "свободных портов не нашлось: нужно %d, пропущено %d подряд"
-                % (count, misses),
-            )
-        if candidate > MAX_PORT:
-            candidate = find_free_port()
-            misses += 1
-            continue
-        if candidate in used:
-            misses += 1
-            candidate += 1
-            continue
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind(("127.0.0.1", candidate))
-            except OSError:
+    #: Пока False — избегаем и использованных портов тоже. Став True, когда
+    #: свежих не осталось; зарезервированные не берём никогда.
+    _allow_reuse = False
+    #: Прошли ли свой диапазон хотя бы раз (защита от бесконечного цикла).
+    _wrapped = False
+    # Весь подбор идёт под ОДНИМ замком.
+    #
+    # Раньше проверка «порт свободен» и запись в _RESERVED_PORTS были
+    # разнесены, и два потока успевали взять один и тот же номер: оба видели
+    # его свободным, оба удачно биндились (проверка сразу закрывает сокет и
+    # порт не удерживает) и оба его записывали. Замерено на 16 параллельных
+    # батчах: 4 падали с «listen tcp 127.0.0.1:51490: bind: Only one usage of
+    # each socket address», а выданные наборы пересекались:
+    # [51487..51490] и [51488..51491]. Снаружи это выглядело как «батч не
+    # стартовал, делю пополам».
+    with _RESERVED_LOCK:
+        while len(ports) < count:
+            if misses > PORT_SCAN_LIMIT:
+                # Свежих не осталось. Раньше здесь ОЧИЩАЛСЯ _USED_PORTS
+                # целиком, и защита от повтора пропадала: два соседних набора
+                # снова пересекались (замерено: [54644..54649] и [54646..54651]),
+                # а sing-box, которого только что убили, ещё держал порт —
+                # отсюда «socket access permissions» на bind.
+                #
+                # Теперь повторяем только ИСПОЛЬЗОВАННЫЕ порты, но по-прежнему
+                # никогда не берём зарезервированные: занятые прямо сейчас
+                # (в полёте) опасны, а отслужившие — просто старые номера.
+                # bind ниже всё равно проверяет фактическую занятость.
+                if not _allow_reuse:
+                    _allow_reuse = True
+                    misses = 0
+                    candidate = find_free_port()
+                    continue
+                misses = 0
+                candidate = find_free_port()
+                continue
+            if candidate > PORT_RANGE_END:
+                if not _wrapped:
+                    # Прошли свой диапазон — один раз пробуем эфемерный,
+                    # чтобы не сдаваться на загруженной машине.
+                    _wrapped = True
+                    candidate = find_free_port()
+                    misses += 1
+                    continue
+                candidate = PORT_RANGE_START
+                misses += 1
+                continue
+            if candidate in _RESERVED_PORTS:
                 misses += 1
                 candidate += 1
                 continue
-        ports.append(candidate)
-        used.add(candidate)
-        misses = 0
-        candidate += 1
+            if not _allow_reuse and candidate in _USED_PORTS:
+                misses += 1
+                candidate += 1
+                continue
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind(("127.0.0.1", candidate))
+                except OSError:
+                    misses += 1
+                    candidate += 1
+                    continue
+            # Регистрируем СРАЗУ, под тем же замком: иначе следующий поток
+            # увидит порт свободным и заберёт его себе.
+            _RESERVED_PORTS.add(candidate)
+            _USED_PORTS.add(candidate)
+            ports.append(candidate)
+            misses = 0
+            candidate += 1
     return ports
-
-

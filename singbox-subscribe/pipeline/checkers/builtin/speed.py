@@ -116,8 +116,6 @@ class SpeedChecker(Checker):
             outcomes[line] = CheckOutcome(
                 ok=None,
                 capabilities=tiers.get(tier, ""),
-                # Категория одна: новая метка заменяет старую, а не дописывается.
-                capabilities_replace=(tag_prefix,),
                 detail=payload.get("error") or "; ".join(detail_parts) or None,
                 data={
                     "speed_mbps": mbps,

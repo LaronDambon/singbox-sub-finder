@@ -58,15 +58,13 @@ class UrlProbeChecker(Checker):
         self._dispatcher: BatchDispatcher | None = None
 
     async def setup(self, ctx) -> None:
-        import os
-
         settings = ctx.settings
         self.batch_size = int(settings.get("batch_size", self.batch_size))
         self.max_attempts = int(settings.get("max_attempts", self.max_attempts))
         # Ключа "timeout" в настройках прогона НЕТ, поэтому строка
         # settings.get("timeout", ...) всегда возвращала self.timeout и
         # ничего не меняла — чтение с виду живое, а по делу мёртвое.
-        self.urltest = get_settings().urltest.url
+        self.urltest = ctx.setting("url_probe.url", self.urltest)
         # Один батч на вызов check(): параллелизмом занимается диспетчер,
         # когда он сам набирает серверы из базы.
         self.slots = 1
@@ -84,10 +82,18 @@ class UrlProbeChecker(Checker):
                 "Бинарник sing-box не найден по пути %s — проверка вернёт «не проверено».",
                 self._dispatcher.singbox_path,
             )
-        if (os.getenv("SING_BOX_PORT") or "").strip():
+        # Порт берётся из config.yaml (singbox.port) — окружение для настроек
+        # больше не читается. Логируем, только если он отличается от значения
+        # по умолчанию: это признак, что порт задавали осознанно.
+        # Импорт идёт через ctx, а НЕ локальным "from config.settings import
+        # get_settings": такой импорт в теле setup() делал get_settings
+        # локальной переменной на всю функцию, и обращение к ней ВЫШЕ по коду
+        # падало с UnboundLocalError.
+        base_port = int(ctx.setting("singbox.port", 7891) or 7891)
+        if base_port != 7891:
             LOGGER.info(
-                "SING_BOX_PORT=%s задан, но каждый батч берёт СВОЙ свободный порт.",
-                os.getenv("SING_BOX_PORT"),
+                "singbox.port=%s задан, но каждый батч берёт СВОЙ свободный порт.",
+                base_port,
             )
 
     async def check(self, ctx: CheckContext) -> CheckResult:

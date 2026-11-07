@@ -108,7 +108,7 @@ def _cmd_checkers(args) -> int:
         mark = "*" if item["name"] in active else " "
         print(f"{mark}{item['name']:<17} {role:<10} {item['description']}")
     print()
-    print(f"* — включён в PIPELINE_CHECKERS={get_settings().pipeline.checkers!r}")
+    print(f"* — включён в singbox.enabled_checkers={get_settings().pipeline.checkers!r}")
     return 0
 
 
@@ -161,6 +161,119 @@ def _cmd_logs(args) -> int:
     return 0
 
 
+#: Настройки, которые зависят от машины и НЕ имеют осмысленного умолчания.
+#: Пустыми они безвредны (деплой выключен — ничего не читается), но как
+#: только пользователь включает деплой, их надо заполнить. Список нужен,
+#: чтобы сказать это в момент инициализации, а не по пустой папке потом.
+_DEPLOY_TODO = (
+    ("deploy.repo",
+     "owner/repo для публикации в GitHub (пусто = только локальный деплой)"),
+    ("deploy.ip_source",
+     "файл или http(s)-ссылка с текущим IP — нужен, только если шаблон "
+     "содержит {{SERVER_IP}}"),
+)
+
+
+def _deploy_hint(settings) -> None:
+    """Что осталось заполнить, если деплой включён.
+
+    Печатается ПОСЛЕ создания файла: до этого момента показывать нечего,
+    значений ещё нет. Молчим, когда деплой выключен, — тогда эти поля не
+    читаются вовсе, и напоминание было бы шумом.
+    """
+    if not bool(_read(settings, "deploy.enabled", False)):
+        print()
+        print("  деплой выключен (deploy.enabled: false) — публиковать некуда.")
+        print("  Чтобы собирать конфиг в файл на этой машине (токены не нужны):")
+        print("    deploy:")
+        print("      enabled: true")
+        print("      local: true")
+        return
+
+    empty = [(path, why) for path, why in _DEPLOY_TODO
+             if not _has_value(_read(settings, path))]
+    if empty:
+        print()
+        print("  деплой включён, но не всё заполнено:")
+        for path, why in empty:
+            print(f"    {path:<18} — {why}")
+    local = bool(_read(settings, "deploy.local", False))
+    repo = str(_read(settings, "deploy.repo", "") or "").strip()
+    if not local and not repo:
+        print()
+        print("  ВНИМАНИЕ: ни deploy.local, ни deploy.repo не заданы —")
+        print("  сборка пройдёт, но конфиг никуда не попадёт.")
+        print("  Проще всего начать с локального деплоя: deploy.local: true")
+    print()
+    print("  Подробный отчёт о готовности: python -m preflight")
+
+
+def _has_value(value) -> bool:
+    """Есть ли у настройки непустое значение."""
+    if value is None:
+        return False
+    if isinstance(value, (dict, list, tuple, set)):
+        return len(value) > 0
+    return str(value).strip() != ""
+
+
+def _read(settings, path: str, default=None):
+    """Значение настройки: подходит и Settings (setting), и Config (value)."""
+    for name in ("setting", "value"):
+        getter = getattr(settings, name, None)
+        if callable(getter):
+            return getter(path, default)
+    return default
+
+
+def _cmd_config(args) -> int:
+    """Работа с конфигурацией: создать, показать, выгрузить.
+
+    Конфиг — обычный config.yaml в корне репозитория; секреты остаются в
+    .env и сюда не попадают. Команда нужна, чтобы файл было чем создать:
+    без него настройки берутся из значений по умолчанию, и это работает,
+    но человек ждёт, что конфиг есть.
+    """
+    from config.config import CONFIG_FILE, ENV_FILE, ConfigError, render_config, write_config
+
+    action = getattr(args, "action", "show")
+
+    if action == "init":
+        try:
+            path = write_config(CONFIG_FILE, force=bool(args.force))
+        except ConfigError as exc:
+            print(exc)
+            return 1
+        print(f"создан {path}")
+        print(f"  строк: {len(path.read_text(encoding='utf-8').splitlines())}")
+        print("  значения по умолчанию уже рабочие; раскомментируйте нужное.")
+        if ENV_FILE.exists():
+            print(f"  секреты остаются в {ENV_FILE.name} — он не коммитится.")
+        # Деплой зависит от машины: репозиторий и путь к IP у всех разные, и
+        # умолчания для них осмысленного нет. Говорим об этом сразу — иначе
+        # узнаётся это по пустому каталогу после прогона.
+        _deploy_hint(get_settings())
+        return 0
+
+    if action == "export":
+        # Печать в stdout: так конфиг можно сохранить куда угодно или
+        # сравнить с текущим, ничего не перезаписывая.
+        sys.stdout.write(render_config())
+        return 0
+
+    # show
+    settings = get_settings()
+    print(f"источник: {settings.origin()}")
+    print(f"файл:     {CONFIG_FILE}")
+    print(f"секреты:  {ENV_FILE if ENV_FILE.exists() else '(нет .env)'}")
+    print()
+    for path, info in settings.describe().items():
+        mark = " [секрет]" if info["secret"] else ""
+        print(f"  {path:<52} {str(info['value']):<22} ({info['source']}){mark}")
+    _deploy_hint(settings)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m pipeline",
@@ -203,6 +316,16 @@ def build_parser() -> argparse.ArgumentParser:
             help="удалить обработанные записи очереди",
         ))
     add("logs", _cmd_logs, "где лежат логи и сколько они занимают", with_json=False)
+    # config — единственная команда без --checkers: она про файл настроек,
+    # а не про прогон.
+    p_cfg = sub.add_parser("config", help="конфигурация: init | show | export")
+    p_cfg.add_argument("action", nargs="?", default="show",
+                       choices=["init", "show", "export"],
+                       help="init — создать config.yaml, show — показать "
+                            "действующие значения, export — напечатать шаблон")
+    p_cfg.add_argument("--force", action="store_true",
+                       help="перезаписать существующий config.yaml")
+    p_cfg.set_defaults(func=_cmd_config)
     return parser
 
 

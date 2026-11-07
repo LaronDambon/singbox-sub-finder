@@ -11,9 +11,51 @@ from dotenv import load_dotenv
 # override=False: уже заданные в окружении переменные не перезаписываются.
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env", override=False)
-API_SCRIPT = ROOT / "singbox-subscribe" / "gensub_api.py"
-MAIN_SCRIPT = ROOT / "singbox-subscribe" / "main.py"
+PACKAGE = ROOT / "singbox-subscribe"
+API_SCRIPT = PACKAGE / "gensub_api.py"
+MAIN_SCRIPT = PACKAGE / "main.py"
 CHECK_INTERVAL_SECONDS = 30 * 60
+
+#: Переменная для отключения проверок: у кого всё настроено, тот не хочет
+#: видеть отчёт при каждом запуске. OFF/0/no — и блок пропускается целиком.
+PREFLIGHT_OFF = {"0", "off", "no", "false", "нет", "выкл"}
+
+
+def run_preflight() -> int:
+    """Проверяет готовность установки ДО запуска детей.
+
+    Возвращает код возврата для процесса: 0 — можно работать, 1 — есть
+    ошибки. Это НЕ запрет: решение остаётся за вызывающим, и по умолчанию
+    main() продолжает запуск даже при ошибках. Смысл проверки — показать,
+    чего не хватает и как это добавить или выключить, а не упасть.
+
+    Ошибки самой проверки (нет модуля, сломан конфиг) не должны мешать
+    запуску: ловим всё и идём дальше.
+    """
+    if (os.environ.get("PREFLIGHT") or "").strip().lower() in PREFLIGHT_OFF:
+        return 0
+    if not (PACKAGE / "preflight.py").exists():
+        return 0
+    try:
+        sys.path.insert(0, str(PACKAGE))
+        import preflight
+    except Exception as exc:  # noqa: BLE001 — проверка не важнее запуска
+        print("[preflight] проверки недоступны: %s" % exc)
+        return 0
+    try:
+        print("[preflight] проверка готовности установки...", flush=True)
+        report = preflight.run_all()
+        print(report.render(), flush=True)
+        if report.failed:
+            print(
+                "[preflight] Ошибки не мешают запуску, но перечисленное выше "
+                "работать не будет. Исправьте или выключите (см. подсказки).",
+                flush=True,
+            )
+        return 0 if report.ok else 1
+    except Exception as exc:  # noqa: BLE001
+        print("[preflight] проверка не выполнена: %s" % exc)
+        return 0
 
 
 def is_main_running() -> bool:
@@ -59,6 +101,15 @@ def start_process(script_path: Path, name: str) -> subprocess.Popen:
 def main() -> int:
     if not API_SCRIPT.exists() or not MAIN_SCRIPT.exists():
         print("Required script files are missing.")
+        return 1
+
+    # Проверки идут ПЕРВЫМИ: пока не запущены дети, отчёт не тонет в их выводе,
+    # и видно его целиком. Запуск при ошибках не блокируется — см. run_preflight.
+    preflight_code = run_preflight()
+    if preflight_code and "--strict" in sys.argv:
+        # Строгий режим — только по явному запросу: он для проверки установки,
+        # а не для повседневного запуска.
+        print("[preflight] --strict: запуск остановлен из-за ошибок выше.")
         return 1
 
     api_process = start_process(API_SCRIPT, "API")

@@ -4,20 +4,35 @@ logs/
 tests/
 *.pyc
 __pycache__
-singbox-subscribe/source/
+source/
 
-# Environments 
-.env 
-.venv 
-env/ 
+# Секреты: ключи и токены живут ТОЛЬКО здесь и не коммитятся.
+# Обычные настройки — в config.yaml в корне репозитория, он коммитится.
+# Environments
+.env
+.venv
+env/
 venv/
-ENV/ 
-env.bak/ 
-venv.bak/ 
-# Конфиг, который sing-box генерирует на каждый проверочный батч
+ENV/
+env.bak/
+venv.bak/
+# Времянки sing-box: батч-конфиги (batch_*.json), конфиги refine/browser-проверок
+# и вывод запущенных процессов (.out.log). Всё генерируемое лежит в ОДНОМ
+# каталоге .tmp_singbox/ ВНУТРИ пакета, поэтому правило одно и каталог можно
+# чистить целиком, не задевая бинарники sing-box в sing-box/.
+#
+# Раскладка: пакет singbox-subscribe/ — это код; рядом с ним лежат рабочие
+# каталоги пользователя: config/ (шаблоны, подписки), source/ (база, списки),
+# logs/, output/. Всё, что меняется прогоном, — под игнором.
+singbox-subscribe/.tmp_singbox/
+# Старые места, куда эти файлы писались до переезда: подчищаем хвосты.
 singbox-subscribe/sing-box/merged_config.json
 singbox-subscribe/sing-box/batch_*.json
-singbox-subscribe/source/tests/
+singbox-subscribe/sing-box/refine_*.json
+singbox-subscribe/sing-box/browser_*.json
+singbox-subscribe/sing-box/*.out.log
+source/tests/
+output/
 
 # Test & benchmark artifacts
 singbox-subscribe/.tmp_tests/
@@ -40,3 +55,16 @@ singbox-subscribe/tests/test_pipeline_core.py
 # Рабочая папка агента: временные скрипты, логи прогонов, черновики.
 # Всё, что кладётся сюда, НЕ коммитится и не мешает деплою.
 .agent/
+# Внутренний браузер: сессии и куки. Основная защита в том, что папка сессий
+# лежит ВНЕ репозитория (см. singbox-subscribe/browser/paths.py). Эти правила —
+# вторая линия, на случай если кто-то переопределил BROWSER_SESSIONS_DIR внутрь.
+.sessions/
+browser-profiles/
+**/browser/.sessions/
+*.cookies.json
+*cookies*.json
+storage_state.json
+**/storage.enc
+# Файлы переноса сессии браузера (экспорт cookies, зашифрованы паролем)
+*.session
+.master

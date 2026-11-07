@@ -1,0 +1,163 @@
+{
+  "comment": "Целевые сайты для профилирования достижимости прокси (reachability check). Порог max_ping_ms применяется к TTFB — времени до заголовков ответа. Профиль сервера — это теги тех целей, которые он прошёл; особые метки вроде [Global] собираются блоком merge, а не требованием пройти ВСЕ цели сразу. Цель с блоком api.rules проверяется ИНАЧЕ: не по задержке, а по вердикту, посчитанному из статуса и тела ответа (сервис работает / отказал по региону). Такие цели — это сервисный тест: их читают чекеры api_service и browser_service (через browser/services.py), а вердикты ложатся в таблицу service_bans, то есть ОДНА логика на оба транспорта — HTTP и браузер.",
+  "rules_format": {
+    "comment": "Правила читаются сверху вниз, побеждает ПЕРВОЕ совпавшее. Поэтому запреты (verdict=ban) пишутся ВЫШЕ разрешений (verdict=ok): иначе 200 с текстом 'User location is not supported' пройдёт как рабочая страница.",
+    "verdicts": {"ok": "сервис работает", "ban": "сервис отказал (отказ по региону, политике, репутации IP)", "unknown": "ответ не распознан — вердикта нет, метка не меняется"},
+    "conditions": ["status_in", "body_contains", "body_contains_all", "body_not_contains", "body_json_success", "body_json_error_status"],
+    "secrets": "Ключи в файле НЕ хранятся. Заголовок со значением '$env:ИМЯ' подставляет переменную окружения на загрузке (см. script/reachability_check.py: _expand_env). Форма '$env:ИМЯ:префикс' даёт 'префикс' + значение — нужно для Authorization: Bearer."
+  },
+  "format_version": 1,
+  "merge": [
+    {
+      "tag": "global",
+      "list": ["gstatic", "yandex", "cloudflare"],
+      "min_matches": 3,
+      "remove_tags": true,
+      "comment": "Сервер, прошедший ЛЮБЫЕ 3 из 3 целей списка, помечается в БД ровно тегом Global и выводится из базы одним тэгом [Global] вместо трёх [gstatic][yandex-portal][cloudflare]. Прежнее правило «Global = прошёл ВСЕ цели профиля» отменено: оно делало метку заложником всего списка и на боевой базе её выполнял один сервер из 38."
+    }
+  ],
+  "targets": [
+    {
+      "name": "openrouter",
+      "tag": "openrouter",
+      "comment": "Сервисная цель: раньше проверялась по TTFB и метка [openrouter] значила 'дотянулся'. Теперь вердикт даёт сам API по телу ответа — счёт моделей отдаётся только своим.",
+      "url": "https://openrouter.ai",
+      "max_ping_ms": 2000,
+      "timeout_ms": 6000,
+      "api": {
+        "comment": "Запрос без ключа вернёт 401 и НИЧЕГО не скажет о том, работает ли сервис для нас. Поэтому идём с ключом: /models/count бесплатный (не жжёт токены) и отдаёт честный отказ политики.",
+        "url": "https://openrouter.ai/api/v1/models/count",
+        "timeout_ms": 8000,
+        "headers": {
+          "Authorization": "$env:OPENROUTER_API_KEY:Bearer",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        },
+        "rules": [
+          {"verdict": "ban", "status_in": [403], "body_contains": ["Access denied by security policy"], "reason": "OpenRouter: отказ по политике безопасности (регион/IP)"},
+          {"verdict": "ban", "status_in": [401, 403], "body_json_success": false, "reason": "OpenRouter: отказ — ключ не принят или доступ закрыт"},
+          {"verdict": "ok", "status_in": [200], "body_json_success": true, "body_contains": ["count"], "reason": "OpenRouter: список моделей отдан"},
+          {"verdict": "ok", "status_in": [200], "body_contains": ["\"count\""], "reason": "OpenRouter: счёт моделей отдан"},
+          {"verdict": "ok", "status_in": [200], "body_contains": ["\"data\""], "reason": "OpenRouter: ответ получен"}
+        ],
+        "default_verdict": "unknown"
+      }
+    },
+    {
+      "name": "openai",
+      "tag": "openai",
+      "url": "https://api.openai.com/v1/",
+      "max_ping_ms": 3000,
+      "timeout_ms": 6000,
+      "expected_statuses": [401, 405, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "gemini",
+      "tag": "gemini-api",
+      "comment": "Сервисная цель. Заглушку по стране страница рисует клиентски после входа, поэтому HTTP-запрос по gemini.google.com её не видит — вердикт даёт API (блок api ниже), а страница остаётся целью профиля.",
+      "url": "https://gemini.google.com/",
+      "max_ping_ms": 4000,
+      "timeout_ms": 6000,
+      "api": {
+        "comment": "Берём метаданные модели: это бесплатный запрос, токены не тратятся. Ответы проверены с домашнего IP (там всё работает) и через серверы. Отказ по региону приходит как 400 FAILED_PRECONDITION, а НЕ 403 — поэтому проверяем и его, и текст.",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash",
+        "timeout_ms": 8000,
+        "headers": {
+          "x-goog-api-key": "$env:GEMINI_API_KEY",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        },
+        "rules": [
+          {"verdict": "ban", "body_json_error_status": ["FAILED_PRECONDITION"], "reason": "Gemini API: регион не поддерживается (FAILED_PRECONDITION)"},
+          {"verdict": "ban", "status_in": [400, 403], "body_contains": ["User location is not supported", "not supported for the API use"], "reason": "Gemini API: регион не поддерживается (текст ответа)"},
+          {"verdict": "ban", "body_json_error_status": ["PERMISSION_DENIED", "UNAUTHENTICATED", "INVALID_ARGUMENT"], "reason": "Gemini API: ключ не принят — проверьте GEMINI_API_KEY"},
+          {"verdict": "ban", "status_in": [400, 403], "body_contains": ["API_KEY_INVALID", "API key not valid"], "reason": "Gemini API: ключ не принят — проверьте GEMINI_API_KEY"},
+          {"verdict": "ok", "status_in": [200], "body_contains": ["models/gemini"], "reason": "Gemini API: метаданные модели отданы"},
+          {"verdict": "ok", "status_in": [200], "body_contains": ["inputTokenLimit"], "reason": "Gemini API: ответ получен"},
+          {"verdict": "ban", "status_in": [403], "reason": "Gemini API: отказ 403 (ключ, регион или блокировка прокси)"}
+        ],
+        "default_verdict": "unknown"
+      }
+    },
+    {
+      "name": "youtube",
+      "tag": "youtube",
+      "url": "https://www.youtube.com/generate_204",
+      "max_ping_ms": 3000,
+      "timeout_ms": 6000,
+      "expected_statuses": [200, 204, 301, 302, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "telegram",
+      "tag": "telegram",
+      "url": "https://api.telegram.org",
+      "max_ping_ms": 3000,
+      "timeout_ms": 6000,
+      "expected_statuses": [200, 401, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "github",
+      "tag": "github",
+      "url": "https://www.github.com",
+      "max_ping_ms": 3000,
+      "timeout_ms": 6000,
+      "expected_statuses": [200, 301, 302, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "microsoft",
+      "tag": "microsoft",
+      "url": "https://www.microsoft.com",
+      "max_ping_ms": 3000,
+      "timeout_ms": 6000,
+      "expected_statuses": [200, 301, 302, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "yandex",
+      "tag": "yandex",
+      "url": "https://yandex.ru/portal/generate_204",
+      "max_ping_ms": 4000,
+      "timeout_ms": 4000,
+      "expected_statuses": [200, 301, 302, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "gstatic",
+      "tag": "gstatic",
+      "comment": "Цель группы Global. generate_204 отдаёт 204 и НОЛЬ байт тела — самая дешёвая проверка из трёх.",
+      "url": "https://www.gstatic.com/generate_204",
+      "max_ping_ms": 4000,
+      "timeout_ms": 4000,
+      "expected_statuses": [200, 204, 301, 302, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    },
+    {
+      "name": "cloudflare",
+      "tag": "cloudflare",
+      "comment": "Цель группы Global. Проверено запросом: http:// отвечает 204 без редиректа, https:// на cp.cloudflare.com — 403. Схему не меняем.",
+      "url": "http://cp.cloudflare.com/generate_204",
+      "max_ping_ms": 4000,
+      "timeout_ms": 4000,
+      "expected_statuses": [200, 204, 301, 302, 403, 429],
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    }
+  ]
+}

@@ -264,9 +264,31 @@ class Database:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
     # ------------------------------------------------------- регистрация
-    async def upsert_lines(self, lines: Iterable[str]) -> dict[str, int]:
-        """Регистрирует серверы из ссылок. Новый stable = NEW_SERVER_STABLE."""
-        return await self._write(self._store.upsert_lines, list(lines))
+    async def upsert_lines(self, lines: Iterable[str],
+                           pass_mark: str = "") -> dict[str, int]:
+        """Регистрирует серверы из ссылок. Новый stable = NEW_SERVER_STABLE.
+
+        pass_mark — метка прохода: сервер, чью строку проход уже видел,
+        считается «разобранным» и при следующей проверке начнёт профиль
+        тегов с чистого листа, а не унаследует тег прошлого прогона.
+        """
+        if not pass_mark:
+            pass_mark = self._store.new_pass_mark("discovery")
+        return await self._write(self._store.upsert_lines, list(lines),
+                                 pass_mark=pass_mark)
+
+    # ------------------------------------------------------------- проходы
+    def new_pass_mark(self, prefix: str = "pass") -> str:
+        """Свежая метка прохода (см. ServerStore.new_pass_mark)."""
+        return self._store.new_pass_mark(prefix)
+
+    async def begin_capabilities_pass(self, pass_mark: str) -> int:
+        """Начинает проход: снимает у всех серверов признак «профиль записан».
+
+        После этого первый ответивший по серверу чекер пишет профиль тегов
+        СБРОСОМ, а остальные дописывают. Подробности — в ServerStore.
+        """
+        return await self._write(self._store.begin_capabilities_pass, pass_mark)
 
     async def blacklist_unparsable(self, lines: Iterable[str]) -> int:
         """Убирает из ротации строки, которые нечем проверять."""
@@ -628,9 +650,11 @@ class Database:
     async def purge_dead(self, below: int | None = None) -> int:
         return await self._write(self._store.purge_dead, below)
 
-    async def export_whitelist(self, path: str | Path, *, global_tag: str = "Global") -> int:
+    async def export_whitelist(self, path: str | Path, *, global_tag: str = "Global",
+                               best_top: int = 0, best_reserve: int = 0) -> int:
         return await self._run(
             self._store.export_whitelist_to_file, Path(path), global_tag=global_tag,
+            best_top=best_top, best_reserve=best_reserve,
         )
 
     @property

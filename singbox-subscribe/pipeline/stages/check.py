@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Sequence
 
 from config.settings import get_settings
@@ -82,7 +83,18 @@ class CheckStage:
         # Обогащение живёт по своим часам: профиль достижимости гоняет сервер
         # через несколько целевых сайтов и спокойно занимает минуту даже на
         # трёх серверах. Смешивать его с коротким таймаутом батча нельзя.
-        self.enrich_timeout = float(ctx.setting("enrich_timeout", 180))
+        # Бюджет дополнения. Раньше это было плоское число (180 с), и оно
+        # ГАРАНТИРОВАННО не покрывало работу: reachability на 111 серверах
+        # занимает ~336 с (165 с + 171 с по двум батчам), поэтому таймаут
+        # срабатывал всегда, а поток продолжал работать в фоне — то есть
+        # следующая проверка стартовала поверх живой. Теперь бюджет считается
+        # от размера батча с щедрым запасом, а настройка работает как
+        # НИЖНЯЯ граница (можно поднять, нельзя случайно занизить).
+        base_enrich = float(ctx.setting("enrich_timeout", 180))
+        self.enrich_timeout = max(
+            base_enrich,
+            base_enrich * max(1.0, self.batch_size / 50.0),
+        )
         self.startup = float(ctx.setting("batch_startup", 10.0))
         # Сначала настройки прогона (их задаёт main.py аргументами командной
         # строки), и только если их нет — настройка из окружения.
@@ -106,6 +118,12 @@ class CheckStage:
         self._failed = 0
         self._unknown = 0
         self._enriched = 0
+        # Метка прохода: профиль тегов сервера описывает ОДИН проход.
+        # Первый ответивший по серверу чекер пишет профиль сбросом и
+        # помечает сервер этой меткой, остальные дописывают. Ставится в
+        # run(); пустая метка означает «номера прохода нет» — тогда профили
+        # копятся как раньше.
+        self._pass = ""
 
     # ------------------------------------------------------------------ запуск
     def request_stop(self) -> None:
@@ -132,6 +150,16 @@ class CheckStage:
         self._unknown = 0
         self._enriched = 0
         self.stable_map = await self.db.stable_map()
+        # Номер прохода: снимаем метку у всех серверов, чтобы первый
+        # ответивший по каждому из них снова стал первым писателем.
+        self._pass = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        try:
+            reset = await self.db.begin_capabilities_pass(self._pass)
+            LOGGER.info("Проход %s: профиль тегов сброшен у %d серверов",
+                        self._pass, reset)
+        except Exception:  # noqa: BLE001 — без метки профили просто копятся
+            LOGGER.exception("Не удалось начать проход тегов, работаю без метки")
+            self._pass = ""
 
         LOGGER.info(
             "Этап проверки: батч до %d серверов, %s, решающие: %s, дополнения: %s",
@@ -237,34 +265,75 @@ class CheckStage:
             await self._enrich(reports, batch_no)
 
     async def _enrich(self, reports, batch_no: int) -> None:
-        """Считает страну и профиль для выживших серверов батча."""
+        """Считает страну и профиль для выживших, снимает метки у умерших."""
         if not self.enrichers:
             return
         alive: list[str] = []
+        dead: list[str] = []
         seen: set[str] = set()
+        seen_dead: set[str] = set()
         for report in reports:
             if report.outcome is BatchOutcome.CONFIG_ERROR:
                 continue
             for tag, verdict in report.verdicts.items():
-                if verdict.verdict is not Verdict.ALIVE:
-                    continue
                 raw = report.tag_to_line.get(tag)
-                if raw and raw not in seen:
-                    seen.add(raw)
-                    alive.append(raw)
+                if not raw:
+                    continue
+                if verdict.verdict is Verdict.ALIVE:
+                    if raw not in seen:
+                        seen.add(raw)
+                        alive.append(raw)
+                elif verdict.verdict is Verdict.DEAD:
+                    if raw not in seen_dead:
+                        seen_dead.add(raw)
+                        dead.append(raw)
+
+        # Умерший сервер не должен носить метку сервиса: у клиента он не
+        # заработает, даже если когда-то проходил проверку. Чекеры-дополнения
+        # мёртвых не видят (run_on_dead=False), поэтому метку снимает сам этап.
+        if dead:
+            await self._clear_dead_tags(dead, batch_no)
+
         if not alive:
             return
 
         ctx = self._make_ctx(alive, batch_no)
         rows: list[dict] = []
+        # Чекеры-дополнения идут СТРОГО по очереди и каждый ждёт конца
+        # предыдущего. Все они запускают sing-box, а запуск один на процесс
+        # (см. _runner.run_exclusive): пока предыдущий sing-box жив и держит
+        # свои порты, следующий стартовать не должен. Параллелить их нельзя —
+        # именно наложение и давало «батч не стартовал» на занятых портах.
+        # Свежие тэги этого прогона: чекер-дополнение может зависеть от того,
+        # что насчитал предыдущий. browser_service проверяет именно те серверы,
+        # которым reachability ТОЛЬКО ЧТО поставила [gemini], — а в базе этих
+        # тэгов ещё нет: запись идёт одним пакетом в конце (record_enrichment
+        # ниже). Без этой карты browser_service видел устаревшие данные и
+        # сообщал «нет серверов с меткой», хотя reachability их только что
+        # нашла (в логе это 11 серверов с gemini против «нет серверов»).
+        live_caps: dict = {}
+        # Серверы, чей профиль в этом проходе уже кто-то записал. Только они
+        # идут в базу с дописыванием: у остальных профиль ещё не сброшен, и
+        # первый ответивший по ним чекер обязан писать сбросом.
+        written: set[str] = set()
         for checker in self.enrichers:
             targets = list(alive)
+            # Отдаём чекеру актуальную картину: база + то, что насчитали выше.
+            ctx = self._make_ctx(alive, batch_no, extra_caps=live_caps,
+                                 pass_mark=self._pass)
             try:
                 result = await asyncio.wait_for(checker.check(ctx), timeout=self.enrich_timeout)
             except asyncio.TimeoutError:
+                # Таймаут НЕ означает «работа пропала»: поток с sing-box
+                # продолжает жить под своим замком и допишет результат в базу
+                # сам (чекеры пишут через db внутри check()). Отсюда только
+                # предупреждение — прогон не должен считать это потерей.
                 LOGGER.error(
-                    "Батч %d: чекер %s не уложился в таймаут на %d серверах",
-                    batch_no, checker.name, len(targets),
+                    "Батч %d: чекер %s не уложился в таймаут на %d серверах "
+                    "(%.0f с). Работа продолжится в фоне, но её результат "
+                    "может не попасть в ЭТОТ экспорт — метки, которые чекер "
+                    "не успел подтвердить, останутся непроставленными",
+                    batch_no, checker.name, len(targets), self.enrich_timeout,
                 )
                 continue
             except Exception as exc:  # noqa: BLE001 — обогащение не влияет на живость
@@ -276,6 +345,20 @@ class CheckStage:
                 "Батч %d: %s -> %s (%d серверов)",
                 batch_no, checker.name, result.summary, len(targets),
             )
+            # Запоминаем тэги для следующих чекеров этого же прохода.
+            # Сброс ЗАМЕНЯЕТ карту, а не дополняет её: сервер, у которого
+            # проход снял метки, не должен выглядеть помеченным для
+            # следующего чекера — иначе browser_service пошёл бы проверять
+            # сервис у сервера, который его только что потерял.
+            for line, outcome in result.outcomes.items():
+                if outcome is None:
+                    continue
+                if line not in written:
+                    continue
+                if outcome.capabilities:
+                    live_caps[line] = outcome.capabilities
+                else:
+                    live_caps[line] = ""
             for line, outcome in result.outcomes.items():
                 if outcome is None:
                     continue
@@ -287,23 +370,36 @@ class CheckStage:
                 speed_down = data.get("speed_down")
                 speed_up = data.get("speed_up")
                 has_speed = any(v is not None for v in (speed_mbps, speed_down, speed_up))
-                clearing = bool(outcome.capabilities_clear
-                                and outcome.capabilities_replace)
+                # Задержки до целей: по ним выбираются лучшие внутри группы.
+                # Без цифры остаётся только тег, и «лучшим по youtube»
+                # оказывается тот, кто просто раньше попал в базу.
+                pings = data.get("service_pings") or {}
+                has_pings = bool(pings)
+                # СБРОС — не то же самое, что «есть что записать». Пустой
+                # профиль у первого ответившего чекера означает «сервер не
+                # достиг ни одной цели», и это надо записать: иначе метки
+                # прошлых прогонов останутся на сервере навсегда.
+                reset = bool(self._pass) and line not in written
                 if not (outcome.country or outcome.capabilities or has_speed
-                        or clearing):
+                        or has_pings or reset):
                     continue
                 row = {
                     "key": _key_of(line),
                     "country": outcome.country or "",
                     "capabilities": outcome.capabilities or "",
-                    "capabilities_replace": list(outcome.capabilities_replace or ()),
-                    "capabilities_clear": clearing,
+                    "pass": self._pass if reset else "",
                 }
                 if has_speed:
                     row["speed_mbps"] = speed_mbps
                     row["speed_down"] = speed_down
                     row["speed_up"] = speed_up
+                if has_pings:
+                    row["service_pings"] = pings
                 rows.append(row)
+                if reset:
+                    # Профиль этого прохода по серверу записан: следующий
+                    # чекер дописывает к нему, а не затирает.
+                    written.add(line)
 
         if rows:
             self._enriched += await self.db.record_enrichment(rows)
@@ -443,7 +539,8 @@ class CheckStage:
                 continue
             try:
                 result = await asyncio.wait_for(
-                    checker.check(self._make_ctx(target_lines, batch_no)),
+                    checker.check(self._make_ctx(target_lines, batch_no,
+                                                  pass_mark=self._pass)),
                     timeout=self.enrich_timeout,
                 )
             except asyncio.TimeoutError:
@@ -477,7 +574,69 @@ class CheckStage:
             )
         return merged, "; ".join(verdict_errors) if verdict_errors else None
 
-    def _make_ctx(self, lines: list[str], batch_no: int) -> CheckContext:
+    async def _clear_dead_tags(self, lines: list[str], batch_no: int) -> None:
+        """У мёртвых серверов профиль тегов стирается целиком.
+
+        Чекеры-дополнения работают только по живым (run_on_dead=False), поэтому
+        мёртвый сервер никто не перепроверит — и его старая метка [gemini]
+        осталась бы навсегда. Между тем у клиента такой сервер не заработает.
+        Поэтому профиль у него снимает сам этап, сразу после проверки живости.
+
+        Раньше здесь лежал список меток-"категорий" сервисов, и снятие шло
+        только по нему: метка, которой в списке не оказалось, оставалась на
+        мёртвом сервере навсегда. Мёртвому серверу не нужно НИ одной метки —
+        значит, стирается весь профиль, а не его часть.
+
+        Профиль стирается только у серверов, ещё не помеченных текущим
+        проходом: если чекер-дополнение уже переписало профиль, второй записи
+        (пустой) быть не должно — она затрёт свежие метки.
+        """
+        pass_mark = self._pass
+        rows = [
+            {
+                "key": _key_of(line),
+                "country": "",
+                "capabilities": "",
+                "pass": pass_mark,
+            }
+            for line in lines
+        ]
+        if not rows or not pass_mark:
+            return
+        try:
+            cleared = await self.db.record_enrichment(rows)
+            LOGGER.info("Батч %d: у %d мёртвых серверов стёрт профиль тегов",
+                        batch_no, cleared)
+        except Exception:  # noqa: BLE001 — снятие метки не должно ронять прогон
+            LOGGER.exception("Батч %d: не удалось стереть метки у мёртвых", batch_no)
+
+    def _make_ctx(self, lines: list[str], batch_no: int,
+                  extra_caps: dict | None = None,
+                  pass_mark: str = "") -> CheckContext:
+        """Контекст с картами данных из базы ПЛЮС свежими тэгами прохода.
+
+        Чекерам нужны stable и capabilities по строке прокси: без них
+        отбор «только серверы с меткой [gemini]» невозможен, а ходить в базу
+        на каждую строку — это запрос на сервер.
+
+        extra_caps — тэги, которые уже насчитали чекеры ЭТОГО прохода. Они
+        важнее базы: в базе запись идёт одним пакетом в конце, поэтому для
+        следующего чекера она устарела.
+
+        pass_mark — метка прохода. Сервер, ещё не помеченный ею, считается
+        «неписаным»: его профиль ещё не сброшен, и первый ответивший чекер
+        обязан записать свой профиль сбросом, даже если по порядку он не
+        первый (reachability выключен или не увидел этот сервер).
+        """
+        caps: dict[str, str] = {}
+        stable: dict[str, int] = {}
+        try:
+            caps = self._capabilities_map()
+            stable = dict(self.stable_map)
+        except Exception:  # noqa: BLE001 — без карт чекеры просто увидят всех
+            pass
+        if extra_caps:
+            caps.update(extra_caps)
         return CheckContext(
             lines,
             index=batch_no,
@@ -485,7 +644,22 @@ class CheckStage:
             settings=self.ctx.settings,
             db=self.db,
             logger=self.ctx.logger,
+            stable_by_line=stable,
+            capabilities_by_line=caps,
+            pass_mark=pass_mark,
         )
+
+    def _capabilities_map(self) -> dict[str, str]:
+        """Строка прокси -> тэги capabilities, одним запросом к базе."""
+        from config.settings import get_settings
+        from script.server_store import ServerStore
+
+        store = ServerStore(get_settings().paths.servers_db_file)
+        with store._connect() as conn:  # noqa: SLF001 — свой же класс хранилища
+            rows = conn.execute(
+                "SELECT line, capabilities FROM servers WHERE line != ''"
+            ).fetchall()
+        return {r["line"]: (r["capabilities"] or "") for r in rows}
 
 
 def _key_of(line: str) -> str:

@@ -36,17 +36,17 @@
     Итоговый файл в репозитории называется ИМЕНЕМ ШАБЛОНА: из --path берётся только
     каталог (--path configs/latest/config.json + шаблон sbc-1.14.json ->
     configs/latest/sbc-1.14.json). Список шаблонов можно задать и через env
-    DEPLOY_TEMPLATES="a.json, b.json". Сбой одного шаблона не прерывает остальные
+    deploy.templates: [a.json, b.json] в config.yaml. Сбой одного шаблона не прерывает остальные
     (--stop-on-error — прерывает).
 
 Замена текущего IP сервера в шаблоне (плейсхолдер):
     В шаблоне вместо жёсткого адреса пишется уникальная переменная:
         "address": "{{SERVER_IP}}"
     На этапе деплоя она замещается актуальным IP из источника:
-        --ip-source /home/ray/ubuntu_server_ip/current_ip.txt   (или env DEPLOY_IP_SOURCE)
+        --ip-source /home/ray/ubuntu_server_ip/current_ip.txt   (или deploy.ip_source в config.yaml)
     Источник — путь к локальному файлу (берётся первая непустая строка) либо
     http(s)-ссылка (тело ответа). Имя переменной настраивается env
-    DEPLOY_IP_PLACEHOLDER (по умолчанию {{SERVER_IP}}). Если плейсхолдера в
+    deploy.ip_placeholder (по умолчанию {{SERVER_IP}}). Если плейсхолдера в
     шаблоне нет, IP не запрашивается и шаблон собирается как есть.
 
 Ключи читаются из переменных окружения GH_DEPLOY_TOKEN и GH_READ_TOKEN
@@ -62,8 +62,11 @@ from pathlib import Path, PurePosixPath
 
 import requests
 
-# Корень проекта: сам скрипт лежит в singbox-subscribe/
+# ROOT — папка пакета (исполняемый код); PROJECT_ROOT — корень репозитория,
+# где лежат РАБОЧИЕ файлы: config/templates (шаблоны деплоя), source/, logs/.
+# Разделение намеренное: пакет можно обновлять, не задевая файлы пользователя.
 ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = ROOT.parent
 sys.path.insert(0, str(ROOT))
 
 # Локальные секреты/настройки из .env в корне репозитория:
@@ -77,10 +80,30 @@ except Exception:  # noqa: BLE001 — пакет dotenv необязателен
 
 DEFAULT_REPO = "LaronDambon/sing-box-config"
 DEFAULT_PATH = "config.json"
-TEMPLATE_DIRS = [ROOT / "config" / "templates", ROOT / "config_template", ROOT / "templates"]
+# Шаблоны — файлы пользователя, поэтому ищем в корне репозитория. Старые
+# места оставлены последними: у кого-то шаблон мог остаться рядом с пакетом,
+# и найти его там дешевле, чем объяснять, почему «шаблон не найден».
+TEMPLATE_DIRS = [
+    PROJECT_ROOT / "config" / "templates",
+    ROOT / "config" / "templates",
+    ROOT / "config_template",
+    ROOT / "templates",
+]
 
 
 # --------------------------------------------------------------------------- настройки/секреты
+def _setting(path: str, default: str = "") -> str:
+    """Настройка деплоя из config.yaml (env для этого больше не читается).
+
+    Токены остаются в .env и берутся через _get_token: это секреты. Всё
+    остальное (репозиторий, путь, шаблон, источник IP) живёт в конфиге,
+    иначе значение из устаревшего .env молча перебивало бы файл.
+    """
+    from config.settings import get_settings
+
+    value = get_settings().setting(path, default)
+    return str(value if value is not None else default)
+
 def _get_token(args) -> str:
     """ДЕПЛОЙ-токен (write). Из --token, либо env GH_DEPLOY_TOKEN / GH_TOKEN."""
     if getattr(args, "token", None):
@@ -175,7 +198,9 @@ def _load_source_uris(args) -> list[str]:
     # export_whitelist_lines добавляет capability-тэги ([name] / [Global]) к строкам
     # на этапе экспорта для генерации итогового конфига.
     lines = store.export_whitelist_lines(
-        global_tag=get_settings().reach.global_tag, best_top=get_settings().core.best_top,
+        global_tag=get_settings().reach.global_tag,
+        best_top=get_settings().core.best_top,
+        best_reserve=get_settings().core.best_reserve,
     )
     if not lines:
         raise RuntimeError(
@@ -224,12 +249,20 @@ def _resolve_template(args):
     return _resolve_template_named(args.template)[1]
 
 
-def _env_templates() -> list[str]:
-    """Список шаблонов из env DEPLOY_TEMPLATES (имена через запятую или пробел)."""
-    raw = (os.getenv("DEPLOY_TEMPLATES") or "").strip()
-    if not raw:
-        return []
-    return [t for t in raw.replace(",", " ").split() if t.strip()]
+def _configured_templates() -> list[str]:
+    """Список шаблонов из config.yaml (deploy.templates) — имена или all.
+
+    Значение приходит и списком (так его пишет config.yaml: templates: [all]),
+    и строкой через запятую (старая форма .env). Строку дополнительно чистим
+    от квадратных скобок и кавычек — так её когда-то писали руками.
+    """
+    raw = _setting("deploy.templates", "")
+    if isinstance(raw, (list, tuple, set)):
+        items = [str(t).strip() for t in raw]
+    else:
+        raw = str(raw or "").strip().strip("[]'\"")
+        items = raw.replace(",", " ").split()
+    return [t for t in items if t]
 
 
 def _expand_template_list(templates) -> list[str]:
@@ -305,7 +338,7 @@ def _resolve_server_ip(source: str) -> str:
     s = (source or "").strip()
     if not s:
         raise RuntimeError(
-            "Источник IP не задан: укажите --ip-source или DEPLOY_IP_SOURCE "
+            "Источник IP не задан: укажите --ip-source или deploy.ip_source "
             "(путь к файлу или http(s)-ссылка)."
         )
     if s.lower().startswith(("http://", "https://")):
@@ -329,13 +362,13 @@ def _apply_server_ip(template_dict, source=None, placeholder=None):
     """Замещает плейсхолдер текущего IP во всех строковых значениях шаблона.
 
     В шаблоне вместо реального адреса пишется уникальная переменная
-    (по умолчанию {{SERVER_IP}}, см. env DEPLOY_IP_PLACEHOLDER), например:
+    (по умолчанию {{SERVER_IP}}, см. deploy.ip_placeholder), например:
         "address": "{{SERVER_IP}}"
-    На этапе деплоя она замещается актуальным IP из DEPLOY_IP_SOURCE / --ip-source.
+    На этапе деплоя она замещается актуальным IP из deploy.ip_source / --ip-source.
     Если плейсхолдера в шаблоне нет — шаблон возвращается без изменений и
     источник IP не запрашивается вовсе.
     """
-    ph = placeholder if placeholder is not None else os.getenv("DEPLOY_IP_PLACEHOLDER", "{{SERVER_IP}}")
+    ph = placeholder if placeholder is not None else _setting("deploy.ip_placeholder", "{{SERVER_IP}}")
     ph = (ph or "").strip()
     if not ph:
         return template_dict
@@ -343,7 +376,7 @@ def _apply_server_ip(template_dict, source=None, placeholder=None):
     if ph not in raw:
         return template_dict
 
-    ip = _resolve_server_ip(source if source else os.getenv("DEPLOY_IP_SOURCE", ""))
+    ip = _resolve_server_ip(source if source else _setting("deploy.ip_source", ""))
 
     def _walk(value):
         if isinstance(value, str):
@@ -366,6 +399,24 @@ def _list_templates() -> list[str]:
         if folder.exists():
             out += [f.name for f in sorted(folder.glob("*.json"))]
     return out
+
+
+def _config_templates() -> list[str]:
+    """Список шаблонов из deploy.templates в config.yaml.
+
+    Пустой список означает одиночный деплой по deploy.template: так
+    собирается ровно один конфиг, и это поведение по умолчанию.
+    """
+    try:
+        from config.settings import get_settings
+    except Exception:  # noqa: BLE001 — настройки недоступны, идём одиночным путём
+        return []
+    raw = get_settings().deploy.templates
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    return [str(t) for t in raw if str(t).strip()]
 
 
 # --------------------------------------------------------------------------- сборка
@@ -580,16 +631,16 @@ def deploy(
         deploy(silent=True)
     Возвращает dict: {ok, url, commit_sha, bytes, repo, branch, path, error, url_uses_write_token}.
     uris — уже загруженный список URI (внутренний параметр deploy_multi); None — загрузить самому.
-    ip_source — источник текущего IP для плейсхолдера в шаблоне (None — env DEPLOY_IP_SOURCE).
+    ip_source — источник текущего IP для плейсхолдера (None — deploy.ip_source).
     """
     args_auto = _AutoArgs()
     tok = token or _get_token(args_auto)
     read_tok = read_token or _get_read_token(args_auto)
-    repo = (repo or os.getenv("GH_DEPLOY_REPO", DEFAULT_REPO)).strip("/")
+    repo = (repo or _setting("deploy.repo", DEFAULT_REPO)).strip("/")
     if repo.endswith(".git"):
         repo = repo[:-4]
-    path = path or os.getenv("DEPLOY_PATH", DEFAULT_PATH)
-    template = template or os.getenv("DEPLOY_TEMPLATE", "sbc-1.14.json")
+    path = path or _setting("deploy.path", DEFAULT_PATH)
+    template = template or _setting("deploy.template", "sbc-1.14.json")
     source = (source or "whitelist").lower()
 
     a = _AutoArgs()
@@ -670,25 +721,25 @@ def deploy_multi(
     """Мульти-деплой: собирает и пушит конфиг для КАЖДОГО шаблона из списка.
 
     Итоговое имя файла в репозитории = имя файла шаблона (_multi_path_for):
-    каталог берётся из path (DEPLOY_PATH/--path), имя файла всегда от шаблона.
+    каталог берётся из path (deploy.path/--path), имя файла всегда от шаблона.
     URI-источник загружается один раз и переиспользуется для всех шаблонов;
     ветка репозитория определяется один раз. Сбой одного шаблона не останавливает
     остальные (stop_on_error=True — прерывает после первой ошибки).
 
-    templates — имена шаблонов или 'all'; None -> env DEPLOY_TEMPLATES
+    templates — имена шаблонов или 'all'; None -> deploy.templates
     (имена через запятую или пробел).
     Возвращает dict: {ok, deployed, failed, repo, branch, error, results: [...]}.
     """
-    repo = (repo or os.getenv("GH_DEPLOY_REPO", DEFAULT_REPO)).strip("/")
+    repo = (repo or _setting("deploy.repo", DEFAULT_REPO)).strip("/")
     if repo.endswith(".git"):
         repo = repo[:-4]
-    base_path = path or os.getenv("DEPLOY_PATH", DEFAULT_PATH)
+    base_path = path or _setting("deploy.path", DEFAULT_PATH)
 
-    tpl_list = _expand_template_list(templates if templates else _env_templates())
+    tpl_list = _expand_template_list(templates if templates else _configured_templates())
     if not tpl_list:
         if not silent:
             print("Мульти-деплой: список шаблонов пуст — укажите --templates имя.json [...] | all | "
-                  "--select или env DEPLOY_TEMPLATES", file=sys.stderr)
+                  "--select или deploy.templates", file=sys.stderr)
         return {"ok": False, "deployed": 0, "failed": 0, "repo": repo, "branch": branch,
                 "error": "template list is empty", "results": []}
 
@@ -759,6 +810,113 @@ def deploy_multi(
             "results": results}
 
 
+# --------------------------------------------------------------------------- локальный деплой
+def local_deploy(
+    *,
+    path=None,
+    template=None,
+    source=None,
+    file=None,
+    uris=None,
+    ip_source=None,
+):
+    """Собирает конфиг и пишет его НА ДИСК этой машины.
+
+    Тот же конфиг, что уходит в GitHub: шаблон, отбор серверов, проверка
+    групп и подстановка IP — всё берётся из одних функций. Иначе «локальный»
+    и «удалённый» конфиги разошлись бы ровно там, где должны совпадать, и
+    расхождение всплыло бы уже у клиента.
+
+    Зачем нужен: не у каждого есть репозиторий и токен, а собранный конфиг
+    нужен всем — его читает sing-box. Локальный деплой работает вообще без
+    секретов: это просто файл рядом.
+
+    Возвращает dict той же формы, что deploy(): {ok, path, bytes, error}.
+    """
+    args_auto = _AutoArgs()
+    a = _AutoArgs()
+    a.template = template or _setting("deploy.template", "sbc-1.14.json")
+    a.source = (source or "whitelist").lower()
+    a.file = file
+
+    target = Path(path) if path else Path(str(_setting("deploy.local_path", "")) or ROOT / "output")
+    # deploy.local_path — это ПАПКА (в мульти-режиме в неё кладутся файлы
+    # по имени шаблона). Одиночный деплой пишет туда файл с именем из
+    # deploy.path, иначе конфиг молча ложился бы поверх каталога и падал
+    # с IsADirectoryError.
+    if target.suffix.lower() != ".json":
+        name = Path(str(_setting("deploy.path", "config.json"))).name or "config.json"
+        target = target / name
+    try:
+        template_dict = _apply_server_ip(_resolve_template(a), ip_source)
+        if uris is None:
+            uris = _load_source_uris(a)
+        uris = _apply_server_filter(uris, template_dict)
+        config = _build_config(uris, template_dict)
+        payload = json.dumps(config, ensure_ascii=False, indent=2)
+
+        # Каталог создаём сами: без этого первый же запуск падал бы на
+        # отсутствующей папке, а она ещё и в .gitignore — то есть её заведомо
+        # нет у нового пользователя.
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(payload, encoding="utf-8")
+        return {"ok": True, "path": str(target), "bytes": len(payload.encode("utf-8")),
+                "error": None}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "path": str(target), "bytes": 0, "error": str(exc)}
+
+
+def local_deploy_multi(
+    *,
+    templates=None,
+    path=None,
+    source=None,
+    file=None,
+    ip_source=None,
+    stop_on_error=False,
+):
+    """Локальный деплой для КАЖДОГО шаблона из списка.
+
+    Раскладка повторяет GitHub-версию (_multi_path_for): из deploy.path берётся
+    каталог, а имя файла задаёт шаблон. Так один и тот же deploy.templates
+    даёт одинаковый набор файлов и локально, и в репозитории — переключение
+    между способами публикации не меняет результат.
+    """
+    tpl_list = _expand_template_list(templates if templates else _configured_templates())
+    base_dir = path or _setting("deploy.local_path", "") or str(ROOT / "output")
+    if not tpl_list:
+        return {"ok": False, "deployed": 0, "failed": 0, "dir": str(base_dir),
+                "error": "template list is empty", "results": []}
+
+    results: list[dict] = []
+    for tpl in tpl_list:
+        tpl_name = None
+        try:
+            tpl_name, _ = _resolve_template_named(tpl)
+            if tpl_name is None:
+                raise ValueError(
+                    f"Шаблон '{tpl[:40]}…' — raw-JSON: в мульти-режиме нельзя "
+                    "определить имя итогового файла. Используйте именованные "
+                    "шаблоны из config/templates."
+                )
+            res = local_deploy(
+                path=Path(base_dir) / tpl_name, template=tpl,
+                source=source, file=file, ip_source=ip_source,
+            )
+        except Exception as exc:  # noqa: BLE001
+            res = {"ok": False, "path": None, "bytes": 0, "error": str(exc)}
+        res["template"] = tpl_name or tpl
+        results.append(res)
+        if not res.get("ok") and stop_on_error:
+            break
+
+    deployed = sum(1 for r in results if r.get("ok"))
+    failed = len(results) - deployed
+    return {"ok": failed == 0 and deployed > 0, "deployed": deployed, "failed": failed,
+            "dir": str(base_dir), "error": None if not failed else _multi_failure_summary(results, failed),
+            "results": results}
+
+
 def _select_templates_interactive() -> list[str]:
     """Интерактивный выбор шаблонов из списка для мульти-деплоя.
 
@@ -803,7 +961,7 @@ def main(argv=None):
         description="Собрать конфиг по шаблону и задеплоить в private GitHub-репозиторий.",
     )
     parser.add_argument("--template", help="Имя шаблона из config/templates (или путь / raw-JSON)")
-    parser.add_argument("--repo", default=os.getenv("GH_DEPLOY_REPO", DEFAULT_REPO), help="owner/repo (default: " + DEFAULT_REPO + ")")
+    parser.add_argument("--repo", default=_setting("deploy.repo", DEFAULT_REPO), help="owner/repo (default: " + DEFAULT_REPO + ")")
     parser.add_argument("--branch", default=None, help="Ветка (по умолчанию default_branch репозитория)")
     parser.add_argument("--path", default=DEFAULT_PATH,
                         help="Путь файла внутри репозитория (default: config.json); в мульти-режиме используется только каталог из него")
@@ -839,9 +997,18 @@ def main(argv=None):
         help="Мульти-деплой: прерваться после первой ошибки (по умолчанию — продолжать остальные)",
     )
     parser.add_argument(
+        "--local", action="store_true",
+        help="Локальный деплой: писать конфиг в файл на этой машине, без "
+             "GitHub и токенов (по умолчанию deploy.local)",
+    )
+    parser.add_argument(
+        "--local-path", default=None,
+        help="Куда писать при --local (по умолчанию deploy.local_path)",
+    )
+    parser.add_argument(
         "--ip-source", default=None,
         help="Источник текущего IP для плейсхолдера в шаблоне: путь к файлу или http(s)-ссылка "
-             "(по умолчанию env DEPLOY_IP_SOURCE, например /home/ray/ubuntu_server_ip/current_ip.txt)",
+             "(по умолчанию deploy.ip_source, например /home/ray/ubuntu_server_ip/current_ip.txt)",
     )
     args = parser.parse_args(argv)
 
@@ -858,8 +1025,43 @@ def main(argv=None):
             return 1
         args.templates = chosen
 
-    # Мульти-деплой: --templates / --select / env DEPLOY_TEMPLATES.
-    multi_templates = args.templates or _env_templates()
+    # Локальный деплой: ни репозитория, ни токенов не требуется. Режим
+    # включён, если позвали с --local ИЛИ так стоит deploy.local, а GitHub
+    # при этом не просили явно (--repo). Порядок важен: явный --repo всегда
+    # означает «публикуй в GitHub».
+    from config.settings import get_settings as _gs
+
+    _deploy = _gs().deploy
+    want_local = bool(args.local or (_deploy.local and not args.repo))
+    local_dir = args.local_path or _deploy.local_path
+
+    if want_local:
+        multi_templates = args.templates or _config_templates()
+        if multi_templates:
+            res = local_deploy_multi(
+                templates=multi_templates,
+                path=local_dir,
+                source=args.source,
+                file=args.file,
+                ip_source=args.ip_source,
+                stop_on_error=args.stop_on_error,
+            )
+        else:
+            res = local_deploy(
+                path=local_dir,
+                template=args.template,
+                source=args.source,
+                file=args.file,
+                ip_source=args.ip_source,
+            )
+        if not res.get("ok"):
+            return 1
+        target = res.get("dir") or res.get("path")
+        print("Локальный деплой: %s" % target)
+        return 0
+
+    # Мульти-деплой: --templates / --select / deploy.templates.
+    multi_templates = args.templates or _config_templates()
     if multi_templates:
         res = deploy_multi(
             templates=multi_templates,

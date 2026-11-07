@@ -1,0 +1,55 @@
+{
+  "comment": [
+    "Правила проверки доступности сервисов для script/service_check.py.",
+    "Модуль ходит на url сервиса через проверяемый прокси, применяет правила",
+    "по порядку и выносит вердикт: ok (приложение доступно), ban (регион-блок),",
+    "unknown (не удалось определить). Пара (exit-IP, сервис) пишется в таблицу",
+    "service_bans базы servers.db.",
+    "",
+    "Добавление нового сервиса: новая запись в services (name/url/rules).",
+    "Условия правила (ключ 'if', все условия через AND):",
+    "  status_in              - список допустимых HTTP-статусов;",
+    "  final_url_contains     - подстрока или список альтернатив в финальном URL;",
+    "  final_url_not_contains - ни одна подстрока не должна быть в финальном URL;",
+    "  body_contains          - ЛЮБАЯ из подстрок найдена в теле;",
+    "  body_not_contains      - ни одна из подстрок не должна быть в теле.",
+    "Первое совпавшее правило задаёт вердикт, иначе default_verdict.",
+    "Порядок важен: ban-правила должны стоять раньше ok-правил"
+  ],
+  "defaults": {
+    "timeout_ms": 15000,
+    "max_body_bytes": 2000000,
+    "drain_timeout_ms": 25000,
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      "Accept-Language": "en-US,en;q=0.9,ru;q=0.8"
+    },
+    "exit_ip_url": "http://ip-api.com/json/?fields=query",
+    "exit_ip_timeout_ms": 8000
+  },
+  "services": [
+    {
+      "name": "claude",
+      "title": "claude.ai",
+      "url": "https://claude.ai/",
+      "rules": [
+        {"if": {"final_url_contains": "app-unavailable-in-region"}, "verdict": "ban", "reason": "redirect на App unavailable in region"},
+        {"if": {"status_in": [403, 429], "body_contains": ["Just a moment", "cf-chl", "Checking your browser", "unusual traffic", "captcha"]}, "verdict": "unknown", "reason": "Cloudflare-челлендж, а не бан по региону"},
+        {"if": {"status_in": [200], "final_url_not_contains": ["login", "consent"]}, "verdict": "ok", "reason": "страница приложения отдана"}
+      ],
+      "default_verdict": "unknown"
+    },
+    {
+      "name": "gemini",
+      "title": "gemini.google.com",
+      "url": "https://gemini.google.com/",
+      "rules": [
+        {"if": {"body_contains": ["isn't available in your country", "is not available in your country", "not available in your region", "isn’t available in your region", "unavailable in your country", "not supported in your country", "not available in your location", "country is not supported", "answer/13575153", "не поддерживается в вашей стране", "Мы сообщим, когда это изменится", "account-rejected-container"]}, "verdict": "ban", "reason": "явный текст о недоступности в регионе"},
+        {"if": {"status_in": [200], "body_contains": ["BardChatUi"]}, "verdict": "ok", "reason": "SPA-бандл приложения отдан"},
+        {"if": {"status_in": [403, 429], "body_contains": ["Just a moment", "cf-chl", "Checking your browser", "unusual traffic", "captcha"]}, "verdict": "unknown", "reason": "Cloudflare-челлендж, а не бан по региону"},
+        {"if": {"status_in": [451]}, "verdict": "ban", "reason": "отказ по региону (HTTP 451 Unavailable For Legal Reasons)"}
+      ],
+      "default_verdict": "unknown"
+    }
+  ]
+}

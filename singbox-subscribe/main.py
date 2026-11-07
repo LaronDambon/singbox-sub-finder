@@ -47,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--checkers", default=None,
-        help="проверяющие алгоритмы через запятую (перекрывает PIPELINE_CHECKERS)",
+        help="проверяющие алгоритмы через запятую (перекрывает singbox.enabled_checkers)",
     )
     parser.add_argument(
         "--no-discovery", action="store_true",

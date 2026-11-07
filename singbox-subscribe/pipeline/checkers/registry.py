@@ -28,7 +28,7 @@ import importlib.util
 import inspect
 import sys as _sys
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from pipeline.logging_setup import get_logger
 from pipeline.checkers.base import Checker, discover_checker_files
@@ -104,19 +104,72 @@ def discover(custom_dir: str | Path | None = None) -> list[Checker]:
     return list(found.values())
 
 
-def _parse_selection(selection: str | None) -> list[str] | None:
-    """Разбирает PIPELINE_CHECKERS. None — значит «все найденные»."""
-    raw = (selection or "").strip().lower()
-    if not raw or raw in {"all", "*"}:
-        return None
-    if raw in {"none", "-", "off"}:
-        return []
-    return [item.strip() for item in raw.replace(";", ",").split(",") if item.strip()]
+def _parse_selection(selection: str | Sequence[str] | None) -> list[str] | None:
+    """Разбирает список чекеров. None — значит «все найденные».
 
+    Принимает и список (так его пишет config.yaml: checkers: [url_probe,
+    reachability]), и строку через запятую (старая форма из .env, а также
+    аргумент --checkers в командной строке).
+    """
+    if selection is None:
+        return None
+    if isinstance(selection, (list, tuple, set)):
+        items = [str(item).strip().lower() for item in selection if str(item).strip()]
+    else:
+        raw = str(selection).strip().lower()
+        if not raw:
+            return None
+        items = [item.strip() for item in raw.replace(";", ",").split(",") if item.strip()]
+    if not items:
+        return None
+    if len(items) == 1 and items[0] in {"all", "*"}:
+        return None
+    if len(items) == 1 and items[0] in {"none", "-", "off"}:
+        return []
+    return items
+
+
+#: Порядок внутри дополнений. Чем больше число, тем позже чекер.
+#: Проверки сервиса (api_service и browser_service) обязаны идти ПОСЛЕ
+#: reachability: они уточняют метку [gemini], которую reachability только что
+#: поставила, и без неё им нечего проверять.
+#: Порядок по замыслу:
+#:   country      — страна (дёшево, ни от чего не зависит);
+#:   reachability — грубая метка [gemini] по TTFB;
+#:   service_access — дешёвый HTTP-отбор: снимает бан там, где сервис явно
+#:                  закрыт, и тем самым УМЕНЬШАЕТ число кандидатов;
+#:   api_service  — проверка сервиса по API: ДЕШЁВАЯ и потому раньше браузера.
+#:                  Делает ту же работу, что browser_service, другим
+#:                  транспортом: обычный HTTP-запрос с ключом вместо сессии
+#:                  браузера. Включается по умолчанию, браузер — нет;
+#:   browser_service — браузерная проверка по тому, что осталось (дорогая:
+#:                  3-20 с на сервер, заходы по одному);
+#:   speed        — замер скорости (дорогой по трафику, идёт последним).
+#: Оба сервисных чекера делят ОДНУ таблицу вердиктов (service_bans) и один
+#: список сервисов, поэтому их порядок между собой роли не играет: кто
+#: отработал, тот и поставил метку, а второй увидит свежий вердикт в кэше.
+_ENRICH_ORDER = {
+    "country": 10,
+    "reachability": 20,
+    "service_access": 30,
+    "api_service": 35,
+    "browser_service": 40,
+    "speed": 50,
+}
 
 def sort_checkers(checkers: Iterable[Checker]) -> list[Checker]:
-    """Решающие чекеры — первыми, дополнения — после них."""
-    return sorted(checkers, key=lambda c: 0 if c.decides_availability else 1)
+    """Решающие чекеры — первыми, дополнения — после них, в заданном порядке.
+
+    Одного деления «решающий/дополнение» мало: внутри дополнений порядок
+    важен. reachability ставит метку, browser_service её уточняет, а
+    service_access и speed идут уже по уточнённым данным.
+    """
+    def key(c: Checker):
+        if c.decides_availability:
+            return (0, 0)
+        return (1, _ENRICH_ORDER.get(getattr(c, "name", ""), 15))
+
+    return sorted(checkers, key=key)
 
 
 def build(selection: str | None = None, *, custom_dir: str | Path | None = None) -> list[Checker]:
@@ -128,6 +181,16 @@ def build(selection: str | None = None, *, custom_dir: str | Path | None = None)
     checkers = build(custom_dir="~/my_checkers")        # + своя папка
     ```
     """
+    # Явный аргумент важнее настройки. Раньше при selection=None брались ВСЕ
+    # найденные чекеры — то есть PIPELINE_CHECKERS не действовал вообще, и
+    # отключить чекер через .env было нельзя (в логе это выглядело как
+    # «Чекеры: url_probe, country, service_access, speed, reachability,
+    # browser_service» при заданном списке из трёх).
+    if selection is None:
+        from config.settings import get_settings
+
+        selection = get_settings().pipeline.checkers
+
     wanted = _parse_selection(selection)
     available = discover(custom_dir)
 

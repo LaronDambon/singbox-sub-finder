@@ -47,7 +47,10 @@ from typing import Iterable, Sequence
 from config.settings import get_settings
 from utils.tool import set_country_in_name
 
+# ROOT — папка пакета (код). Рабочие файлы (source/, logs/, config/)
+# лежат в корне репозитория: PROJECT_ROOT. Пути в конфиге — от него же.
 ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = ROOT.parent
 
 STABLE_SUFFIX_RE = re.compile(r"-stable-(-?\d+)\s*$")
 
@@ -64,6 +67,14 @@ CREATE TABLE IF NOT EXISTS servers (
     checks         INTEGER NOT NULL DEFAULT 0,
     fails          INTEGER NOT NULL DEFAULT 0,
     capabilities   TEXT NOT NULL DEFAULT '',
+    -- Метка ПРОХОДА, которая написала capabilities. Проход нумеруется по
+    -- своей первой записи профиля: первый чекер (reachability) эту метку
+    -- ставит и ЗАТИРАЕТ профиль целиком, остальные (api_service,
+    -- browser_service) видят ту же метку и ДОПИСЫВАЮТ к ней свои теги.
+    -- Так профиль каждого сервера описывает ОДИН прогон, а не копится
+    -- годами: раньше тег, полученный когда-то и никем не перепроверенный,
+    -- жил в базе вечно.
+    capabilities_pass TEXT NOT NULL DEFAULT '',
     excluded       INTEGER NOT NULL DEFAULT 0,
     -- Замер скорости в МБ/с. Раньше измерение выбрасывалось и оставался
     -- только тег вроде speed-slow, по которому нельзя отличить 0.4 МБ/с
@@ -71,6 +82,13 @@ CREATE TABLE IF NOT EXISTS servers (
     speed_mbps     REAL,
     speed_down     REAL,
     speed_up       REAL,
+    -- Задержка (TTFB, мс) до КАЖДОЙ цели проверки, JSON-объектом:
+    -- {"youtube": 200, "google": 100}. Раньше измерение выбрасывалось и
+    -- оставался только факт «цель достигнута» — тег. Без цифры нельзя
+    -- выбрать сервер, у которого ИМЕННО этот сервис отзывается быстрее
+    -- прочих: у двух серверов с тегом [youtube] задержки 200 и 3000 мс,
+    -- а по общему ping_ms этого не видно.
+    service_pings  TEXT NOT NULL DEFAULT '',
     first_seen     TEXT NOT NULL,
     last_seen      TEXT NOT NULL,
     last_checked   TEXT
@@ -82,9 +100,9 @@ CREATE INDEX IF NOT EXISTS idx_servers_excluded ON servers(excluded);
 UPSERT_RESULT_SQL = """
 INSERT INTO servers (
     key, line, stable, ever_pinged, ping_ms, protocol, country, capabilities,
-    speed_mbps, speed_down, speed_up,
+    speed_mbps, speed_down, speed_up, service_pings,
     available, checks, fails, first_seen, last_seen, last_checked
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
 ON CONFLICT(key) DO UPDATE SET
     stable         = excluded.stable,
     ever_pinged    = MAX(servers.ever_pinged, excluded.ever_pinged),
@@ -94,6 +112,10 @@ ON CONFLICT(key) DO UPDATE SET
     speed_mbps     = COALESCE(excluded.speed_mbps, servers.speed_mbps),
     speed_down     = COALESCE(excluded.speed_down, servers.speed_down),
     speed_up       = COALESCE(excluded.speed_up, servers.speed_up),
+    -- COALESCE: прогон без reachability (или сервер без ответов) не должен
+    -- стирать прошлые замеры — иначе «лучший по сервису» мигал бы через
+    -- прогон и выбор становился бы случайным.
+    service_pings  = COALESCE(NULLIF(excluded.service_pings, ''), servers.service_pings),
     protocol       = CASE WHEN excluded.protocol != '' THEN excluded.protocol ELSE servers.protocol END,
     country        = CASE WHEN excluded.country != '' THEN excluded.country ELSE servers.country END,
     capabilities   = CASE WHEN excluded.capabilities != '' THEN excluded.capabilities ELSE servers.capabilities END,
@@ -108,6 +130,18 @@ ON CONFLICT(key) DO UPDATE SET
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _now_shifted(*, hours: int = 0) -> str:
+    """Метка времени со сдвигом — для сравнения «свежее ли» в SQL.
+
+    Формат тот же, что у _now(), поэтому строковое сравнение в SQLite
+    корректно: ISO-8601 в UTC сортируется лексикографически.
+    """
+    from datetime import timedelta
+
+    return (datetime.now(timezone.utc)
+            + timedelta(hours=hours)).isoformat(timespec="seconds")
 def _as_float(value):
     """Число из строки/словаря или None. Кривые значения молча игнорируются."""
     if value is None or isinstance(value, bool):
@@ -116,6 +150,65 @@ def _as_float(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _dump_service_pings(value) -> str:
+    """Замеры задержки до целей -> компактный JSON для колонки service_pings.
+
+    На вход: {"youtube": 200.4, "google": 100} либо уже готовая строка JSON.
+    Значения приводятся к int (мс) и сортируются по имени цели, чтобы одна и
+    та же картина не давала разные строки: по строке сравнивают прогоны.
+
+    Пустой/битый вход даёт "" — вызывающий код трактует это как «замеров нет»
+    и не затирает прошлые значения (COALESCE в UPSERT).
+    """
+    if not value:
+        return ""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ""
+        try:
+            value = json.loads(text)
+        except (TypeError, ValueError):
+            return ""
+    if not isinstance(value, dict):
+        return ""
+    clean: dict[str, int] = {}
+    for name, raw in value.items():
+        ms = _as_float(raw)
+        if ms is None or ms < 0:
+            continue
+        key = str(name).strip()
+        if key:
+            clean[key] = int(round(ms))
+    if not clean:
+        return ""
+    return json.dumps(clean, ensure_ascii=False, sort_keys=True)
+
+
+def load_service_pings(raw) -> dict[str, int]:
+    """Читает колонку service_pings обратно в {цель: мс}.
+
+    Битый JSON не роняет экспорт: непонятная строка просто означает «замеров
+    нет» — сервер уйдёт в резерв, а не в лучшие.
+    """
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return {str(k): int(v) for k, v in raw.items() if _as_float(v) is not None}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, int] = {}
+    for name, value in data.items():
+        ms = _as_float(value)
+        if ms is not None and ms >= 0:
+            out[str(name)] = int(round(ms))
+    return out
 
 
 
@@ -156,20 +249,31 @@ def compute_next_state(
     return max(prev - 1, alive_min - 1)
 
 
-def _merge_tags(current: str, incoming: str, replace: Sequence[str] = ()) -> str:
+def _split_tags(value) -> list[str]:
+    """Строка тегов через запятую -> список без пустых и дублей, порядок цел."""
+    out: list[str] = []
+    for tag in str(value or "").split(","):
+        tag = tag.strip()
+        if tag and tag not in out:
+            out.append(tag)
+    return out
+
+
+def _merge_tags(current: str, incoming: str) -> str:
     """Склеивает списки тэгов через запятую, сохраняя порядок и убирая дубли.
 
     Тэги из РАЗНЫХ чекеров дополняют друг друга: сервер может иметь и
-    [gemini], и [speed-fast]. Но внутри одной категории тэг — это ОДИН
-    из многих, и новый заменяет старый: без этого прогон, решивший сервер
-    быстрым, оставлял рядом метку прошлого прогона "[speed-slow][speed-ok]".
+    [gemini-api], и [speed-fast]. Поэтому склейка ничего не вытесняет —
+    вытеснение целиком лежит на чекере, который пишет профиль сбросом
+    (см. CheckOutcome.capabilities_write).
 
-    replace — префиксы категорий, которые новый тэг затирает ("speed-").
+    Раньше здесь был список категорий replace, и сравнение по нему шло по
+    двум правилам (равенство имени и префикс с дефисом) только затем, чтобы
+    "gemini" не стирал чужую метку "gemini-api" от другого транспорта.
+    Списков больше нет — значит, и вытеснять нечем.
     """
     old_tags = [t.strip() for t in current.split(",") if t.strip()]
     new_tags = [t.strip() for t in incoming.split(",") if t.strip()]
-    if replace:
-        old_tags = [t for t in old_tags if not t.startswith(tuple(replace))]
     merged: list[str] = []
     for tag in old_tags + new_tags:
         if tag not in merged:
@@ -200,6 +304,7 @@ class ServerStore:
         self._maybe_migrate_stable_zones()
         self._maybe_migrate_shield()
         self._maybe_migrate_legacy()
+        self._maybe_migrate_gemini_tags()
 
     # ------------------------------------------------------------------ util
     def _connect(self) -> sqlite3.Connection:
@@ -247,6 +352,8 @@ class ServerStore:
             ("speed_mbps", "REAL"),
             ("speed_down", "REAL"),
             ("speed_up", "REAL"),
+            ("service_pings", "TEXT NOT NULL DEFAULT ''"),
+            ("capabilities_pass", "TEXT NOT NULL DEFAULT ''"),
         ):
             if name not in cols:
                 conn.execute(f"ALTER TABLE servers ADD COLUMN {name} {decl}")
@@ -343,6 +450,45 @@ class ServerStore:
             ).fetchall()
         return {row["key"]: row["capabilities"] for row in rows}
 
+    @staticmethod
+    def new_pass_mark(prefix: str = "pass") -> str:
+        """Свежая метка прохода: префикс + время UTC до секунды.
+
+        Единая точка сборки метки. Проходы нумеруются ВРЕМЕНЕМ, а не
+        счётчиком: счётчик пришлось бы хранить в базе, а лишняя таблица ради
+        одной строки не нужна. Двух проходов в одну секунду не бывает —
+        каждый начинается с полной проверки живости.
+        """
+        name = str(prefix or "").strip() or "pass"
+        return f"{name}-{_now()}"
+
+    def begin_capabilities_pass(self, pass_mark: str) -> int:
+        """Номерует проход: у ВСЕХ серверов профиль становится «неписаным».
+
+        Метка прохода (capabilities_pass) — это признак «в этом проходе
+        профиль уже кто-то записал». Пока она не равна метке текущего
+        прохода, первый ответивший чекер считает себя первым и затирает
+        профиль целиком; тем же проходом помечаются те серверы, чьи
+        подписки попали в базу (upsert_lines).
+
+        Отсюда и побочный эффект: строка, которую в этом проходе не
+        перепроверил НИКТО, сохраняет метку прошлого прохода и при следующей
+        проверке сбрасывается первой же ответившей пробой. Мусорный тег,
+        которого больше не ставит ни один чекер, так исчезает за один круг,
+        а не живёт в базе вечно.
+
+        Возвращает число затронутых строк.
+        """
+        mark = str(pass_mark or "").strip()
+        if not mark:
+            return 0
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE servers SET capabilities_pass = ? WHERE capabilities_pass <> ?",
+                (mark, mark),
+            )
+            return cur.rowcount or 0
+
     def record_capabilities(self, rows: Sequence[dict]) -> int:
         """Обновляет только профиль достижимости для ключей.
 
@@ -375,7 +521,7 @@ class ServerStore:
         return (row["capabilities"] if row else "") or ""
 
     # ----------------------------------------------------------- регистрация
-    def upsert_lines(self, lines: Iterable[str]) -> dict[str, int]:
+    def upsert_lines(self, lines: Iterable[str], pass_mark: str = "") -> dict[str, int]:
         """Регистрирует серверы из подписок/исходников.
 
         Новый сервер получает stable=NEW_SERVER_STABLE (по умолчанию 5) и
@@ -387,6 +533,12 @@ class ServerStore:
         """
         added = updated = skipped = 0
         now = _now()
+        # Метка прохода: сервер, чью строку этот проход видел в подписке, уже
+        # «разобран» — его профиль либо перезапишет первый ответивший чекер,
+        # либо, если не перепроверит никто, он останется прошлым и будет
+        # затёрт при следующей проверке. Без штампа здесь мёртвая строка
+        # навсегда сохраняла бы тег, которого больше не ставит ни один чекер.
+        mark = str(pass_mark or "").strip()
         with self._connect() as conn:
             for raw in lines:
                 clean = str(raw).strip()
@@ -404,18 +556,21 @@ class ServerStore:
                         """
                         UPDATE servers SET
                             last_seen = ?,
+                            capabilities_pass = COALESCE(NULLIF(?, ''), capabilities_pass),
                             line = CASE WHEN available IS NULL THEN ? ELSE line END
                         WHERE key = ?
                         """,
-                        (now, clean, key),
+                        (now, mark, clean, key),
                     )
                 else:
                     added += 1
                     conn.execute(
                         "INSERT INTO servers"
-                        " (key, line, stable, ever_pinged, first_seen, last_seen)"
-                        " VALUES (?, ?, ?, 0, ?, ?)",
-                        (key, clean, int(get_settings().core.new_server_stable), now, now),
+                        " (key, line, stable, ever_pinged, first_seen, last_seen,"
+                        "  capabilities_pass)"
+                        " VALUES (?, ?, ?, 0, ?, ?, ?)",
+                        (key, clean, int(get_settings().core.new_server_stable),
+                         now, now, mark),
                     )
         return {"added": added, "updated": updated, "skipped": skipped}
 
@@ -509,6 +664,7 @@ class ServerStore:
                     _as_float(row.get("speed_mbps")),
                     _as_float(row.get("speed_down")),
                     _as_float(row.get("speed_up")),
+                    _dump_service_pings(row.get("service_pings")),
                     1 if ok else 0,
                     0 if ok else 1,
                     now, now, now,
@@ -526,10 +682,20 @@ class ServerStore:
 
         Пустые значения не затирают уже известные.
 
-        capabilities — это ОБЪЕДИНЕНИЕ, а не замена: чекеров-дополнений
-        несколько (профиль достижимости, категория скорости), и они пишут
-        в одну и ту же колонку по очереди. Если бы второй затирал первого,
-        тэг [gemini] исчезал бы там, где появился [speed-fast].
+        Профиль тегов пишется ПО ПРОХОДАМ (row["pass"]):
+
+          * первый писатель прохода (reachability или, если его нет, первый
+            ответивший чекер) идёт со write="reset" — он ЗАТИРАЕТ колонку
+            целиком и записывает свой профиль. До него в этом проходе
+            профиль не писал никто, поэтому затирать нечего;
+          * остальные (api_service, browser_service, speed) идут с
+            write="join" и дописывают свои теги к тому, что уже лежит.
+
+        Побочный эффект важен и желанен: строка, которую в этом проходе не
+        перепроверил никто, сохраняет метку ПРОШЛОГО прохода и на следующем
+        сбрасывается первым же ответившим. Так тег, снятый у всех серверов,
+        исчезает, а не висит мусором.
+
         Возвращает количество обновлённых серверов.
         """
         if not rows:
@@ -545,44 +711,54 @@ class ServerStore:
                     _as_float(row.get("speed_down")),
                     _as_float(row.get("speed_up")),
                 )
-                replace = tuple(row.get("capabilities_replace") or ())
-                # Затирание — тоже запись профиля, поэтому строка не пустая
-                # даже когда capabilities == "".
-                clearing = bool(row.get("capabilities_clear") and replace)
-                if (not country and not capabilities and not clearing
-                        and not any(s is not None for s in speed)):
+                # Замеры задержки до целей: без них «лучший по сервису» не
+                # выбрать — у двух серверов с тегом [youtube] задержки могут
+                # различаться в десятки раз.
+                pings = _dump_service_pings(row.get("service_pings"))
+                pass_mark = str(row.get("pass") or "").strip()
+                reset = bool(pass_mark)
+                names = _split_tags(capabilities)
+                # Сброс — тоже запись профиля, поэтому строка не пустая даже
+                # когда у чекера нет ни одной метки.
+                if (not country and not names and not reset
+                        and not any(s is not None for s in speed) and not pings):
                     continue
-                current = ""
-                if capabilities or (row.get("capabilities_clear") and replace):
-                    current = conn.execute(
+                if reset:
+                    # Профиль этого прохода ещё никто не писал: пишем свой
+                    # целиком, вместе с пустым (сервер не достиг ни одной
+                    # цели). Пустое значение ОБЯЗАНО затереть прошлое, иначе
+                    # снятая метка вернулась бы из базы.
+                    capabilities = ",".join(names)
+                else:
+                    # Дописывание: метку прохода НЕ трогаем. Затирать её здесь
+                    # нельзя — по ней следующие чекеры прохода узнают, что
+                    # профиль сброшен, а сброшенный в пустоту профиль иначе
+                    # пометил бы себя «писаным» уже на первом дописывании.
+                    state = conn.execute(
                         "SELECT capabilities FROM servers WHERE key = ?",
                         (row["key"],),
                     ).fetchone()
-                    current = (current["capabilities"] if current else "") or ""
-                if row.get("capabilities_clear") and replace:
-                    # Ответили, но профиля нет: снимаем метки этого класса,
-                    # оставляя чужие (speed- пишет другой чекер).
-                    capabilities = _merge_tags(current, "", replace=replace)
-                elif capabilities:
-                    capabilities = _merge_tags(current, capabilities,
-                                               replace=replace)
-                # Флаг записи профиля отдельным параметром: очистка даёт
-                # пустую строку, и проверка <> '' её бы не пропустила —
-                # метки вернулись бы в следующем же прогоне.
-                write_caps = 1 if (capabilities or clearing) else 0
+                    current = (state["capabilities"] if state else "") or ""
+                    capabilities = _merge_tags(current, capabilities)
+                # Флаг записи профиля отдельным параметром: сброс в пустоту
+                # даёт capabilities = '', и проверка <> '' её бы не пропустила.
+                write_caps = 1 if (capabilities or reset) else 0
                 cursor = conn.execute(
                     """
                     UPDATE servers SET
                         country = CASE WHEN ? <> '' THEN ? ELSE country END,
                         capabilities = CASE WHEN ? THEN ? ELSE capabilities END,
+                        capabilities_pass = CASE WHEN ? THEN ? ELSE capabilities_pass END,
                         speed_mbps = COALESCE(?, speed_mbps),
                         speed_down = COALESCE(?, speed_down),
                         speed_up = COALESCE(?, speed_up),
+                        service_pings = COALESCE(NULLIF(?, ''), service_pings),
                         last_seen = ?
                     WHERE key = ?
                     """,
                     (country, country, write_caps, capabilities,
-                     speed[0], speed[1], speed[2], now, row["key"]),
+                     reset, pass_mark,
+                     speed[0], speed[1], speed[2], pings, now, row["key"]),
                 )
                 updated += cursor.rowcount or 0
         return updated
@@ -605,6 +781,147 @@ class ServerStore:
                 """,
                 (int(get_settings().core.purge_stable_below),),
             ).fetchall()
+
+    # ------------------------------------------- service_bans: баны сервисов
+    #: Сколько часов держится бан сервиса, прежде чем пару опросят заново.
+    BAN_TTL_HOURS = 12
+
+    def _ensure_service_bans_table(self, conn) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS service_bans (
+                exit_ip      TEXT NOT NULL,
+                service      TEXT NOT NULL,
+                ban          INTEGER,
+                reason       TEXT DEFAULT '',
+                proxy_key    TEXT DEFAULT '',
+                first_seen   TEXT,
+                last_checked TEXT,
+                checked_by   TEXT DEFAULT '',
+                verdict      TEXT DEFAULT '',
+                kind         TEXT DEFAULT '',
+                PRIMARY KEY (exit_ip, service)
+            )
+            """
+        )
+        # Базы, созданные раньше, новых колонок не имеют — добавляем на месте.
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(service_bans)")}
+        for col, ddl in (
+            ("checked_by", "TEXT DEFAULT ''"),
+            ("verdict", "TEXT DEFAULT ''"),
+            ("kind", "TEXT DEFAULT ''"),
+        ):
+            if col not in existing:
+                conn.execute("ALTER TABLE service_bans ADD COLUMN %s %s" % (col, ddl))
+
+    def record_service_bans(self, rows) -> int:
+        """Пишет вердикты (exit_ip, service) -> ban и профиль проверки.
+
+        rows: [{exit_ip, service, ban, reason, proxy_key,
+                checked_by, verdict, kind}].
+        upsert по паре (exit_ip, service): свежий вердикт затирает старый.
+        """
+        if not rows:
+            return 0
+        now = _now()
+        written = 0
+        with self._connect() as conn:
+            self._ensure_service_bans_table(conn)
+            for r in rows:
+                ip = str(r.get("exit_ip") or "").strip()
+                service = str(r.get("service") or "").strip()
+                if not ip or not service:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO service_bans (
+                        exit_ip, service, ban, reason, proxy_key,
+                        first_seen, last_checked, checked_by, verdict, kind
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(exit_ip, service) DO UPDATE SET
+                        ban = excluded.ban,
+                        reason = excluded.reason,
+                        proxy_key = excluded.proxy_key,
+                        last_checked = excluded.last_checked,
+                        checked_by = excluded.checked_by,
+                        verdict = excluded.verdict,
+                        kind = excluded.kind
+                    """,
+                    (ip, service, int(r.get("ban") or 0), str(r.get("reason") or ""),
+                     str(r.get("proxy_key") or ""), now, now,
+                     str(r.get("checked_by") or ""), str(r.get("verdict") or ""),
+                     str(r.get("kind") or "")),
+                )
+                written += 1
+        return written
+
+    def banned_ips(self, service: str, *, ttl_hours=None) -> set:
+        """Exit-IP с ДЕЙСТВУЮЩИМ баном сервиса (свежим, не старше TTL)."""
+        if ttl_hours is None:
+            ttl_hours = self.BAN_TTL_HOURS
+        query = "SELECT exit_ip FROM service_bans WHERE service = ? AND ban = 1"
+        params = [service]
+        if ttl_hours > 0:
+            query += " AND last_checked >= ?"
+            params.append(_now_shifted(hours=-ttl_hours))
+        with self._connect() as conn:
+            self._ensure_service_bans_table(conn)
+            return {row["exit_ip"] for row in conn.execute(query, params)}
+
+    def banned_proxy_keys(self, service: str, *, ttl_hours=None) -> set:
+        """Ключи прокси с действующим баном — фильтр пула ДО проверки."""
+        if ttl_hours is None:
+            ttl_hours = self.BAN_TTL_HOURS
+        query = ("SELECT proxy_key FROM service_bans"
+                 " WHERE service = ? AND ban = 1 AND proxy_key != ''")
+        params = [service]
+        if ttl_hours > 0:
+            query += " AND last_checked >= ?"
+            params.append(_now_shifted(hours=-ttl_hours))
+        with self._connect() as conn:
+            self._ensure_service_bans_table(conn)
+            return {row["proxy_key"] for row in conn.execute(query, params)}
+
+    def service_report(self) -> dict:
+        """Сводка по сервисам: сколько exit-IP/прокси ok/ban/unknown."""
+        with self._connect() as conn:
+            self._ensure_service_bans_table(conn)
+            out = {}
+            for row in conn.execute(
+                """
+                SELECT service,
+                       SUM(ban = 1), SUM(ban = 0), SUM(ban IS NULL),
+                       COUNT(DISTINCT proxy_key) FILTER (WHERE ban = 0),
+                       MAX(last_checked)
+                FROM service_bans GROUP BY service
+                """
+            ):
+                out[row["service"]] = {
+                    "banned_ips": row[1] or 0, "ok_ips": row[2] or 0,
+                    "unknown": row[3] or 0, "ok_proxies": row[4] or 0,
+                    "last_checked": row[5],
+                }
+            return out
+
+    def service_working_rows(self, service: str) -> list:
+        """Строки базы для серверов, УСПЕШНО прошедших сервис (ban=0)."""
+        with self._connect() as conn:
+            self._ensure_service_bans_table(conn)
+            return conn.execute(
+                """
+                SELECT s.key, s.line, s.ping_ms, s.available, s.stable,
+                       b.exit_ip, b.last_checked AS checked
+                FROM service_bans b
+                JOIN servers s ON s.key = b.proxy_key
+                WHERE b.service = ? AND b.ban = 0
+                ORDER BY s.stable DESC, b.last_checked DESC, s.key
+                """,
+                (service,),
+            ).fetchall()
+
+    def service_working_lines(self, service: str) -> list:
+        """Строки подписки серверов, работающих на сервис (для конфига)."""
+        return [row["line"] for row in self.service_working_rows(service)]
 
     def export_lines(
         self,
@@ -651,24 +968,56 @@ class ServerStore:
         """Превращает профиль (список тэгов через запятую) в суффикс тэгов.
 
         Соглашение хранения в БД (колонка capabilities):
-          * "Global"              — сервер прошёл группу merge (см. блок
-                                     merge в reachability_targets.json;
-                                     для Global это ЛЮБЫЕ 3 из 3 generate_204)
-                                     -> экспортируется одним тэгом [Global];
+          * "Global,openrouter,gemini" — сервер прошёл группу merge И достиг
+                                     других целей
+                                     -> [Global][openrouter][gemini];
           * "openrouter,gemini"   — сервер достиг этих целей
                                      -> экспортируется как [openrouter][gemini].
-        Тэг Global НЕ дублируется, если он среди разложенных тэгов.
 
-        Раньше Global означал «прошёл ВСЕ цели списка», и после добавления
-        новых целей тэг стал заложником всего списка: замер на боевой базе
-        показал, что полный набор целей имел 1 сервер из 38 с [Global].
+        Global сворачивает теги ТОЛЬКО СВОЕЙ ГРУППЫ (цели generate_204:
+        gstatic, yandex, cloudflare) и НЕ трогает остальные.
+
+        Раньше при наличии Global возвращался РОВНО один тэг, и всё прочее
+        терялось: на боевом whitelist строки выходили как [Global] в одиночку,
+        хотя в базе у них были openrouter, openai, youtube, speed-slow.
+        Клиент по такой строке не мог выбрать сервер ни по одному из этих
+        признаков. Правка уже терялась один раз при восстановлении файла из
+        репозитория — поэтому здесь она с подробным объяснением.
         """
         if not caps:
             return ""
         tags = [t.strip() for t in caps.split(",") if t.strip()]
-        if any(t == global_tag for t in tags):
-            return f"[{global_tag}]"
-        return "".join(f"[{t}]" for t in tags)
+        if global_tag not in tags:
+            return "".join(f"[{t}]" for t in tags)
+
+        # Теги группы Global заменяет один [Global]; остальные сохраняются.
+        group = self._global_group_tags()
+        out = [f"[{global_tag}]"]
+        for t in tags:
+            if t == global_tag or t in group:
+                continue
+            out.append(f"[{t}]")
+        return "".join(out)
+
+    @staticmethod
+    def _global_group_tags() -> set:
+        """Тэги целей, которые сворачивает [Global].
+
+        Берётся из блока merge файла reachability_targets.json: группа с
+        тэгом Global перечисляет свои цели. Без файла считаем группой
+        стандартные три generate_204 — тогда поведение остаётся прежним,
+        но остальные тэги всё равно не теряются.
+        """
+        try:
+            from script.reachability_check import load_merge_rules
+
+            for rule in load_merge_rules() or []:
+                if str(rule.get("tag")) == "Global":
+                    tags = rule.get("tags") or ()
+                    return {str(t).strip() for t in tags if str(t).strip()}
+        except Exception:  # noqa: BLE001 — без файла берём стандартный набор
+            pass
+        return {"gstatic", "yandex", "cloudflare"}
 
     def export_tagged_lines(self, *,
                             min_stable: int | None = None,
@@ -676,16 +1025,23 @@ class ServerStore:
                             global_tag: str = "Global",
                             only_available: bool = False,
                             server_filter=None,
-                            best_top: int = 0) -> list[str]:
+                            best_top: int = 0,
+                            best_reserve: int = 0) -> list[str]:
         """Строки серверов по фильтру с добавленными capability-тэгами.
 
         ВАЖНО: capability-профиль ХРАНИТСЯ в БД, тэги [name] добавляются
         только здесь, на этапе экспорта для генерации итогового конфига.
         Сервер, у которого профиль полностью состоит из global_tag (достиг
         всех целей), получает ровно один тэг [Global].
+
+        best_top / best_reserve — сколько ЛУЧШИХ и РЕЗЕРВНЫХ отметить в
+        каждой группе (см. script/best_tags.py). Отбор идёт по задержке до
+        цели этой группы из колонки service_pings и делается ПОСЛЕ всех
+        фильтров ниже.
         """
         query = ("SELECT line, key, stable, ping_ms, capabilities, country, "
-                "speed_mbps, speed_down, speed_up FROM servers WHERE line != ''")
+                "speed_mbps, speed_down, speed_up, service_pings "
+                "FROM servers WHERE line != ''")
         params: list[object] = []
         if only_available:
             query += " AND available = 1 AND excluded = 0"
@@ -714,11 +1070,11 @@ class ServerStore:
         # дополнительный тег. Считается ПОСЛЕ фильтра, иначе фильтр по
         # профилю вырезал бы часть группы и «лучшим» оказался бы не тот.
         best_by_key: dict[str, str] = {}
-        if best_top:
+        if best_top or best_reserve:
             from script.best_tags import BestRules, add_best_tags
 
             # Теги скорости не ранжируются: там «лучший» — это и есть весь
-            # смысл тега, а из двух одинаковых выберется случайный.
+            # смысл тега, а из двух одинаковых задержек выберется случайный.
             skip = tuple(sorted({
                 s.strip()
                 for r in rows
@@ -726,12 +1082,12 @@ class ServerStore:
                 if s.strip().startswith("speed-")
             }))
             marked = add_best_tags(
-                [dict(r) for r in rows], rules=BestRules(top=best_top),
+                [dict(r) for r in rows],
+                rules=BestRules(top=best_top, reserve=best_reserve),
                 skip_profiles=skip,
             )
             for rec in marked:
-                base_caps = rec.get("capabilities") or ""
-                best_by_key[rec["key"]] = rec.get("capabilities") or base_caps
+                best_by_key[rec["key"]] = rec.get("capabilities") or ""
 
         out = []
         for row in rows:
@@ -775,16 +1131,24 @@ class ServerStore:
         max_stable: int | None = None,
         global_tag: str = "Global",
         only_available: bool = False,
+        best_top: int = 0,
+        best_reserve: int = 0,
     ) -> int:
         """Экспорт строк С capability-тэгами ([name] / [Global]) в файл.
 
         Это «whitelist для генерации»: тэги добавляются только здесь, на этапе
         выгрузки строк, чтобы итоговый sing-box конфиг мог фильтровать outbound'ы
         по достижимости целей. Профиль при этом остаётся в БД, а не в merge-пуле.
+
+        best_top / best_reserve пробрасываются дальше ОБЯЗАТЕЛЬНО: файловая
+        выгрузка — это ровно тот путь, которым пишется whitelist.txt. Пока
+        параметры сюда не доходили, в файле не было ни одной метки, хотя
+        отбор работал: у него просто не спрашивали.
         """
         lines = self.export_tagged_lines(
             min_stable=min_stable, max_stable=max_stable,
             global_tag=global_tag, only_available=only_available,
+            best_top=best_top, best_reserve=best_reserve,
         )
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -792,7 +1156,8 @@ class ServerStore:
         return len(lines)
 
     def export_whitelist_lines(self, *, global_tag: str = "Global",
-                               server_filter=None, best_top: int = 0) -> list[str]:
+                               server_filter=None, best_top: int = 0,
+                               best_reserve: int = 0) -> list[str]:
         """Whitelist-строки: серверы, ПИНГОВАВШИЕСЯ в последней проверке.
 
         Критерий нового принципа: available=1 (последняя проверка успешна) —
@@ -808,11 +1173,21 @@ class ServerStore:
         return self.export_tagged_lines(
             only_available=True, global_tag=global_tag,
             server_filter=server_filter, best_top=best_top,
+            best_reserve=best_reserve,
         )
 
-    def export_whitelist_to_file(self, path: str | Path, *, global_tag: str = "Global") -> int:
-        """Whitelist = available=1 (последняя проверка успешна), в файл."""
-        return self.export_tagged_to_file(path, only_available=True, global_tag=global_tag)
+    def export_whitelist_to_file(self, path: str | Path, *, global_tag: str = "Global",
+                                 best_top: int = 0, best_reserve: int = 0) -> int:
+        """Whitelist = available=1 (последняя проверка успешна), в файл.
+
+        best_top / best_reserve — уровни лучших и резервных (script/best_tags).
+        Без них whitelist.txt выходил без меток, и функция best выглядела
+        нерабочей: отбор считался, но в файл не попадал.
+        """
+        return self.export_tagged_to_file(
+            path, only_available=True, global_tag=global_tag,
+            best_top=best_top, best_reserve=best_reserve,
+        )
 
     # --------------------------------------------------- удаление из проверки
     def purge_dead(self, below: int | None = None, *, hard: bool = False) -> int:
@@ -897,8 +1272,8 @@ class ServerStore:
         }
 
     # --------------------------------------------------------- миграции/legacy
-    LEGACY_WHITELIST = ROOT / "source" / "whitelist.txt"
-    LEGACY_BLACKLIST = ROOT / "source" / "blacklist.txt"
+    LEGACY_WHITELIST = PROJECT_ROOT / "source" / "whitelist.txt"
+    LEGACY_BLACKLIST = PROJECT_ROOT / "source" / "blacklist.txt"
 
     def _maybe_migrate_stable_zones(self) -> None:
         """Однократный возврат «старых» исключённых серверов в ротацию.
@@ -948,6 +1323,33 @@ class ServerStore:
             json.dumps({"ever_pinged": marked, "shielded": shielded}, ensure_ascii=False),
             encoding="utf-8",
         )
+
+    def _maybe_migrate_gemini_tags(self) -> None:
+        """Переименовывает старые метки "gemini api"/"gemini chat" в дефисные.
+
+        Метки были с ПРОБЕЛОМ внутри: [gemini api] и [gemini chat]. Пробел
+        ломает фильтры шаблона: регулярка по "gemini-api" не находит
+        "[gemini api]", и группа сервиса выходит пустой — sing-box молча
+        не выпускает трафик. Метки переведены на дефис, но в накопленной
+        базе остались прежние значения, поэтому чиним их здесь.
+
+        Точное сравнение по целому тегу, а НЕ подстрокой: "gemini" — это
+        префикс "gemini api", и замена по вхождению стёрла бы чужую метку.
+        """
+        renames = {"gemini api": "gemini-api", "gemini chat": "gemini-chat"}
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT key, capabilities FROM servers WHERE capabilities LIKE '%gemini%'"
+            ).fetchall()
+            for row in rows:
+                caps = row["capabilities"] or ""
+                tags = [t.strip() for t in caps.split(",") if t.strip()]
+                fixed = [renames.get(t, t) for t in tags]
+                if fixed != tags:
+                    conn.execute(
+                        "UPDATE servers SET capabilities = ? WHERE key = ?",
+                        (",".join(fixed), row["key"]),
+                    )
 
     def _maybe_migrate_legacy(self) -> None:
         """Однократный импорт старых whitelist.txt/blacklist.txt в пустую базу."""

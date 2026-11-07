@@ -38,9 +38,6 @@ class ReachabilityChecker(Checker):
         # пишется в БД одним общим тегом вместо тегов этой группы.
         self._merge: list[dict] = []
         self._alive: set[str] = set()
-        # Имена целей + сам тег Global: всё, что принадлежит профилю
-        # достижимости и должно вытесняться при новом прогоне.
-        self._target_tags: tuple[str, ...] = ()
 
     async def setup(self, ctx) -> None:
         self.enabled = bool(get_settings().reach.enabled)
@@ -70,16 +67,11 @@ class ReachabilityChecker(Checker):
             LOGGER.warning("Список целей не загружен, reachability выключен: %s", exc)
             self._targets = []
         # Группы merge — из блока merge файла reachability_targets.json.
-        # Грузятся ДО расчёта вытесняемых тегов: имя группы (Global) тоже
-        # принадлежит этому чекеру и должно исчезать у тех, кто её не набрал.
         try:
             self._merge = await ctx.run_sync(load_merge_rules)
         except Exception as exc:  # noqa: BLE001 — без групп профиль просто полный
             LOGGER.warning("Группы merge не загружены, теги целей не сворачиваются: %s", exc)
             self._merge = []
-        self._target_tags = self.compute_target_tags(
-            self._targets, self.global_tag, self._merge,
-        )
         if self._targets:
             groups = ", ".join(
                 f"[{r['tag']}] = {r['min_matches']} из {list(r['tags'])}"
@@ -93,32 +85,6 @@ class ReachabilityChecker(Checker):
             )
             LOGGER.info("Reachability: группы merge: %s", groups)
 
-    @staticmethod
-    def compute_target_tags(targets: list[dict], global_tag: str = "Global",
-                            merge_rules: list[dict] | None = None) -> tuple[str, ...]:
-        """Префиксы, которые профиль достижимости вытесняет при записи.
-
-        Чекер скорости вытесняет свои теги префиксом "speed-". Без своего
-        префикса профиль объединялся с прошлым, и тег [Global], полученный
-        когда-то, жил вечно. Имена целей, сам Global и общие теги групп —
-        то, что принадлежит этому чекеру; теги скорости остаются нетронутыми.
-
-        Теги групп обязательны в этом списке: сервер, который сейчас набрал
-        только две generate_204 из трёх, больше не должен носить [Global].
-        """
-        names = {str(tg.get("name", "")).strip() for tg in targets}
-        if merge_rules is None:
-            try:
-                from script.reachability_check import load_merge_rules
-
-                merge_rules = load_merge_rules()
-            except Exception:  # noqa: BLE001 — без групп остаются имена целей
-                merge_rules = []
-        names.update(str(r.get("tag", "")).strip() for r in merge_rules or [])
-        names.add(str(global_tag))
-        names.discard("")
-        return tuple(sorted(names))
-
     async def check(self, ctx: CheckContext) -> CheckResult:
         if not self.enabled or not self._targets:
             return CheckResult()
@@ -130,6 +96,7 @@ class ReachabilityChecker(Checker):
         from script.reachability_check import (
             batch_reachability_check,
             profile_to_tags,
+            service_pings,
         )
 
         LOGGER.info("Reachability: профилирую %d живых серверов", len(lines))
@@ -147,6 +114,7 @@ class ReachabilityChecker(Checker):
             result = results.get(line) or {}
             targets_res = result.get("targets") or {}
             capabilities = ""
+            pings: dict[str, int] = {}
             # Чекер отработал (sing-box ответил), а профиля нет — значит
             # сервер не достиг ни одной цели. Прежние метки тогда
             # неправды, и их надо снять. Молча оставить их нельзя: пустой
@@ -159,29 +127,32 @@ class ReachabilityChecker(Checker):
                 # правилом, из-за которого метка зависела от всего профиля.
                 tags = profile_to_tags(self._targets, targets_res, self._merge)
                 capabilities = ",".join(tags)
+                # Замеры задержки до целей едут в базу цифрами: без них
+                # «лучший по youtube» выбирался бы по тегу, то есть случайно.
+                pings = service_pings(self._targets, targets_res, self._merge)
                 if capabilities:
                     tagged += 1
                     if any(r["tag"] in tags for r in self._merge):
                         merged += 1
                     LOGGER.info("Reachability [%s]: %s", capabilities, line[:70])
-            # Затирать надо только когда профиля НЕТ: ответили, но ни одной
-            # цели не достигли. Флаг ставится после вычисления capabilities,
-            # иначе он срабатывает и на нормальном профиле — тогда
-            # очистка стирает только что посчитанные теги. На прогоне это
-            # обнулило все целевые метки у 96 серверов.
-            clear = bool(targets_res) and not capabilities
             outcomes[line] = CheckOutcome(
                 ok=None,
                 capabilities=capabilities,
-                # Профиль ЗАМЕНЯЕТ свой прошлый, а не сливается с ним.
-                # Без этого тег, полученный когда-то, жил вечно: сервер,
-                # однажды прошедший все цели, навсегда оставался [Global],
-                # даже когда сейчас достигает двух целей из восьми.
-                # Замер на базе: из 38 серверов с [Global] полный набор
-                # целей имел ОДИН. Теги скорости не трогаем — их пишет
-                # другой чекер, и у него свой префикс вытеснения.
-                capabilities_replace=self._target_tags,
-                capabilities_clear=clear,
+                # Reachability идёт первым среди чекеров-дополнений, значит
+                # по каждому серверу он и есть первый писатель прохода —
+                # профиль он ЗАТИРАЕТ целиком, а не дописывает.
+                #
+                # Иначе тег, полученный когда-то, жил вечно: сервер, однажды
+                # прошедший все цели, навсегда оставался [Global], даже когда
+                # сейчас достигает двух целей из восьми. Замер на базе: из 38
+                # серверов с [Global] полный набор целей имел ОДИН.
+                #
+                # Пустой профиль здесь — тоже запись: сервер ответил, но не
+                # достиг ни одной цели (targets_res непустой, а тегов нет).
+                # Раньше пустой профиль просто не писался, и метки прошлых
+                # прогонов оставались на сервере навсегда.
+                capabilities_write="reset" if targets_res else "join",
+                data={"service_pings": pings} if pings else {},
                 detail=result.get("error"),
             )
         summary = f"{tagged}/{len(lines)} с тэгами"

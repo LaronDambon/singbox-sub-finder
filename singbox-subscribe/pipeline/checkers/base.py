@@ -8,7 +8,7 @@
     from pipeline.checkers import Checker, CheckOutcome, CheckResult, get_logger
 
     class MyChecker(Checker):
-        name = "my_checker"          # как включать в PIPELINE_CHECKERS
+        name = "my_checker"          # как включать в singbox.enabled_checkers
         description = "Моя проверка"
         decides_availability = True  # этот чекер решает, жив ли сервер
 
@@ -60,16 +60,26 @@ class CheckOutcome:
     capabilities: str | None = None
     detail: str | None = None
     data: dict[str, Any] = field(default_factory=dict)
-    #: Префиксы тэгов, которые этот чекер ЗАМЕНЯЕТ, а не дополняет.
-    #: Категория — это «одно из многих»: у сервера может быть ровно одна
-    #: speed-метка, а не все категории, найденные за все прошлые прогоны.
-    #: Пустой набор — обычное дополнение (тэги копятся).
-    capabilities_replace: tuple[str, ...] = ()
-    #: Чекer отработал, но его теги надо УБРАТЬ, а не дополнить.
-    #: Нужен, чтобы отличить «нечего добавить» (сервер ничего не достиг,
-    #: значит прежние метки больше неправды) от «чекер не отработал»
-    #: (тогда правки не делаем вовсе).
-    capabilities_clear: bool = False
+    #: Способ записи тегов в базу:
+    #:
+    #:   * "join"  — дописать к тому, что уже есть;
+    #:   * "reset" — ЗАТЕРЕТЬ профиль и записать только своё.
+    #:
+    #: Сброс делает ПЕРВЫЙ чекер, ответивший по этому серверу в проходе.
+    #: Профиль сервера описывает ОДИН проход, а не сумму всех прогонов за
+    #: историю: чекер, идущий ниже по порядку (api_service, browser_service,
+    #: speed), видит метку прохода и только ДОПИСЫВАЕТ свои теги.
+    #:
+    #: Раньше здесь лежали capabilities_replace (списки имён, которые чекер
+    #: вытесняет) и capabilities_clear (снять эти имена). Списки разошлись с
+    #: реальностью: у каждой категории был свой набор, никто не мог сказать,
+    #: чей тег сейчас в базе, и мусор вроде тега, снятого у всех серверов,
+    #: оставался висеть навсегда.
+    capabilities_write: str = "join"
+    #: Метка прохода. Заполняется чекером, когда он пишет профиль СБРОСОМ:
+    #: эта метка уезжает в базу вместе с профилем, и по ней следующие
+    #: чекеры прохода понимают, что профиль уже не пустой.
+    pass_mark: str = ""
 
 
 @dataclass(slots=True)
@@ -106,6 +116,14 @@ class CheckResult:
                 current.country = outcome.country
             if outcome.capabilities:
                 current.capabilities = outcome.capabilities
+            # Сброс сильнее дописывания: если один чекер по этой строке
+            # объявил сброс, профиль обязан быть переписан, а не склеен.
+            # Метка прохода едет вместе со сбросом: по ней база понимает,
+            # что профиль этого прохода уже записан.
+            if outcome.capabilities_write == "reset":
+                current.capabilities_write = "reset"
+            if outcome.pass_mark:
+                current.pass_mark = outcome.pass_mark
             if outcome.detail:
                 current.detail = outcome.detail
             if outcome.data:
@@ -130,6 +148,9 @@ class CheckContext:
         settings: dict[str, Any] | None = None,
         db: Any | None = None,
         logger: Any | None = None,
+        stable_by_line: Mapping[str, int] | None = None,
+        capabilities_by_line: Mapping[str, str] | None = None,
+        pass_mark: str = "",
     ) -> None:
         self.lines = list(lines)
         self.index = index
@@ -137,6 +158,23 @@ class CheckContext:
         self.settings = dict(settings or {})
         self.db = db
         self.logger = logger or get_logger("checker")
+        #: Метка текущего прохода: чекер-дополнение объявляет её в
+        #: CheckOutcome.pass_mark, когда пишет профиль СБРОСОМ (первым по
+        #: этому серверу в проходе).
+        self.pass_mark = str(pass_mark or "")
+        # Карты «строка прокси -> данные из базы». Нужны чекерам, которые
+        # отбирают серверы по stable или по тэгам: без них приходилось бы
+        # ходить в базу на каждую строку.
+        self._stable = dict(stable_by_line or {})
+        self._capabilities = dict(capabilities_by_line or {})
+
+    def stable_of(self, line: str) -> int | None:
+        """stable сервера по строке прокси (None, если неизвестно)."""
+        return self._stable.get(line)
+
+    def capabilities_of(self, line: str) -> str:
+        """Профиль тэгов сервера по строке прокси ('' если неизвестно)."""
+        return self._capabilities.get(line) or ""
 
     @staticmethod
     async def run_sync(func, *args, **kwargs):

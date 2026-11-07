@@ -2,7 +2,10 @@ import json
 import sys
 from pathlib import Path
 
+# ROOT — пакет (код). Шаблоны деплоя — файлы пользователя, они лежат в
+# config/templates корня репозитория: см. TEMPLATE_DIRS ниже.
 ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = ROOT.parent
 
 UTILS = ROOT / "utils"
 
@@ -14,6 +17,7 @@ from functools import lru_cache
 from script.server_store import ServerStore
 from script import core as core_mod
 from pipeline.logging_setup import get_logger, setup_logging
+import service_template as _service_template
 
 setup_logging()
 LOGGER = get_logger("gensub_api")
@@ -383,6 +387,41 @@ def _load_template_from_payload(payload_template):
     raise ValueError("template must be a JSON object or a JSON string")
 
 
+def _targets_file() -> Path:
+    """Путь к config/reachability_targets.json."""
+    settings = get_settings()
+    raw = settings.setting("paths.reachability_targets_file", "") or ""
+    if raw:
+        return Path(raw)
+    return PROJECT_ROOT / "config" / "reachability_targets.json"
+
+
+def _expand_alldeploy(template_data: dict) -> dict:
+    """Разворачивает блок alldeploy на метки из reachability_targets.json."""
+    targets_path = _targets_file()
+    if not targets_path.exists():
+        LOGGER.warning("Файл целей не найден (%s): блок alldeploy не развёрнут", targets_path)
+        return template_data
+
+    targets = _service_template.load_targets(targets_path)
+    browser_tag = str(get_settings().setting(
+        "singbox.checkers.browser_service.tag", "") or "")
+    extra = [browser_tag] if browser_tag else []
+
+    expanded, report = _service_template.expand_alldeploy(
+        template_data, targets, extra_tags=extra)
+
+    LOGGER.info("alldeploy развёрнут на %d меток: %s",
+                len(report["expanded"]), ", ".join(report["expanded"]))
+    for tag in report.get("missing") or []:
+        LOGGER.warning("Метка %s без цели в reachability_targets.json: "
+                       "блоки для неё не развёрнуты", tag)
+    for repointed in report.get("repointed") or []:
+        LOGGER.info("Правило маршрута перенаправлено: %s -> %s",
+                    repointed["from"], repointed["to"])
+    return expanded
+
+
 def build_config_from_uris(uris, template):
     template_data = _load_template_from_payload(template)
     if not hasattr(core_mod, "providers") or core_mod.providers is None:
@@ -423,6 +462,12 @@ def build_config_from_uris(uris, template):
             "warning": "No valid nodes found for the provided uris",
         }
 
+    # Плейсхолдерный блок "alldeploy" разворачивается на каждую метку из
+    # config/reachability_targets.json и из browser_service.tag. Обычный
+    # конфиг без такого блока проходит мимо без изменений.
+    if _service_template.has_alldeploy(template_data):
+        template_data = _expand_alldeploy(template_data)
+
     config = core_mod.build_singbox_config_from_nodes(template_data, nodes)
     # Не строго: веб-выдача лишь показывает предупреждение, а деплой
     # (deploy_config) проверяет строго и отказывается пушить сломанный конфиг.
@@ -431,7 +476,8 @@ def build_config_from_uris(uris, template):
 
 
 def list_builtin_templates():
-    candidates = [ROOT / "config" / "templates", ROOT / "config_template", ROOT / "templates"]
+    candidates = [PROJECT_ROOT / "config" / "templates", ROOT / "config" / "templates",
+                  ROOT / "config_template", ROOT / "templates"]
     items = []
     for folder in candidates:
         if not folder.exists():
@@ -448,7 +494,8 @@ def index():
 
 @app.route("/api/template/<path:name>")
 def api_template(name):
-    for folder in [ROOT / "config" / "templates", ROOT / "config_template", ROOT / "templates"]:
+    for folder in [PROJECT_ROOT / "config" / "templates", ROOT / "config" / "templates",
+                   ROOT / "config_template", ROOT / "templates"]:
         path = folder / name
         if path.exists() and path.is_file():
             return jsonify(json.loads(path.read_text(encoding="utf-8")))
@@ -467,6 +514,8 @@ def api_whitelist():
         store = _get_store()
         lines = store.export_whitelist_lines(
             global_tag=get_settings().reach.global_tag,
+            best_top=get_settings().core.best_top,
+            best_reserve=get_settings().core.best_reserve,
         )
         if lines:
             return "\n".join(lines), 200, {"Content-Type": "text/plain; charset=utf-8"}

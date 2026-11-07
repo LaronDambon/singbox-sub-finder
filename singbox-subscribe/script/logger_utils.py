@@ -32,8 +32,11 @@ from pipeline.logging_setup import (
     setup_logging,
 )
 
+# ROOT — папка пакета (код); PROJECT_ROOT — корень репозитория, где лежат
+# рабочие каталоги: logs/, source/, config/. См. config/config.py.
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_LOG_DIR = ROOT / "logs"
+PROJECT_ROOT = ROOT.parent
+DEFAULT_LOG_DIR = PROJECT_ROOT / "logs"
 
 
 def setup_project_logging(

@@ -28,7 +28,7 @@ from typing import Callable, Iterable, Sequence
 
 from config.settings import get_settings
 from script.logger_utils import get_project_logger
-from script.core import reserve_ports
+from script.core import release_ports, reserve_ports
 from script.batch_singbox import (
     build_batch_config, parse_outbound, ports_ready, start_singbox,
 )
@@ -62,19 +62,31 @@ def stop_singbox(proc) -> None:
     if proc is None:
         return
     try:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-            return
-        except Exception:  # noqa: BLE001
-            pass
+        # На Windows сначала снимаем ДЕРЕВО, а не сам процесс.
+        # Раньше порядок был обратный: terminate(), и если он отработал
+        # успешно (а на Windows он обычно успешен), функция выходила по
+        # return — так и не дойдя до taskkill /T. Дочери при этом оставались
+        # жить: замером найдено 10 осиротевших sing-box.exe, старейший
+        # работал 3.5 суток и держал listen-порт, из-за чего следующие
+        # запуски не могли забиндиться и «батч не стартовал».
         if os.name == "nt":
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                 capture_output=True, timeout=10, check=False,
             )
+            try:
+                proc.wait(timeout=3)
+                return
+            except Exception:  # noqa: BLE001 — убьём грубо ниже
+                pass
         else:
-            proc.kill()
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        proc.kill()
         try:
             proc.wait(timeout=3)
         except Exception:  # noqa: BLE001
@@ -117,7 +129,8 @@ def run_probe_batch(
     if not entries:
         return
 
-    for e, p in zip(entries, reserve_ports(len(entries))):
+    ports = reserve_ports(len(entries))
+    for e, p in zip(entries, ports):
         e["port"] = p
 
     config = build_batch_config(entries, template_path)
@@ -129,16 +142,34 @@ def run_probe_batch(
         started_ok = ports_ready([e["port"] for e in entries], STARTUP_WAIT_SECONDS)
 
     if not started_ok:
+        # Причина отказа раньше была НЕВИДИМА: вывод sing-box уходил в пустоту,
+        # и в логе оставалось только «не стартовал». Теперь, если включён
+        # SINGBOX_CAPTURE_LOG, рядом с конфигом лежит его вывод — читаем.
+        why = ""
+        try:
+            from script.batch_singbox import last_output
+
+            why = last_output(config_path)
+        except Exception:  # noqa: BLE001 — диагностика не должна мешать
+            why = ""
+        alive = proc is not None and proc.poll() is None
         stop_singbox(proc)
+        release_ports(ports)
         Path(config_path).unlink(missing_ok=True)
         if len(items) > 1 and depth < max_depth:
             mid = len(items) // 2
             LOGGER.warning(
-                "Батч из %d прокси не стартовал, делю пополам (%d + %d)",
-                len(items), mid, len(items) - mid,
+                "Батч из %d прокси не стартовал (процесс жив: %s, порты открылись: %s)%s"
+                " — делю пополам (%d + %d)",
+                len(items), alive, not started_ok, (" | " + why) if why else "",
+                mid, len(items) - mid,
             )
+            # results НЕ кладём в half: он уже передан позиционно вторым
+            # аргументом. Раньше ключ был здесь, и вызов падал с
+            # "got multiple values for argument 'results'" — то есть ветка
+            # деления не делила батч, а роняла весь прогон чекера.
             half = dict(
-                results=results, probe=probe, concurrency=concurrency,
+                probe=probe, concurrency=concurrency,
                 template_path=template_path, config_dir=config_dir,
                 tag_prefix=tag_prefix, depth=depth + 1, max_depth=max_depth,
             )
@@ -172,6 +203,7 @@ def run_probe_batch(
                     results[line].update(payload)
     finally:
         stop_singbox(proc)
+        release_ports(ports)
         Path(config_path).unlink(missing_ok=True)
 
 

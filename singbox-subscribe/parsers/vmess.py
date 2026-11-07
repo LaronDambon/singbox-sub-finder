@@ -8,7 +8,14 @@ def parse(data):
     # Фрагмент URI (#тэг) не является частью base64/query-тела vmess: он содержит
     # имя с эмодзи-страны и прочими не-ASCII символами, которые ломали b64Decode
     # (ValueError) и роняли разбор — такие конфиги уходили в None и чернели.
-    info = info.split('#', 1)[0]
+    #
+    # НО у vmess фрагмент несёт МЕТКИ возможностей, дописанные экспортом
+    # whitelist: "#vmess 000071-...[openai][openai-best]". Имя сервера лежит
+    # внутри base64 в поле "ps", и без переноса меток в тег фильтры шаблона
+    # не находят ни одного узла — группы собираются пустыми.
+    _fragment = ""
+    if '#' in info:
+        info, _fragment = info.split('#', 1)
     try:
         if info.find('?') > -1: #fuck странный формат URI
             server_info = urlparse(info)
@@ -73,6 +80,16 @@ def parse(data):
     except:
         return None
     content = item.get('ps').strip() if item.get('ps') else tool.genName()+'_vmess'
+    # Из фрагмента берутся ТОЛЬКО метки в квадратных скобках: сам он отброшен
+    # выше, но именно в нём лежат [openai], [openai-best] и прочие признаки,
+    # по которым шаблон отбирает узлы в группы.
+    #
+    # Служебный хвост экспорта ("vmess 000071-ping-11639-stable-96") в тег не
+    # идёт: он дублировал бы имя узла и мешал читать конфиг.
+    if _fragment.strip():
+        marks = re.findall(r'(?:\[[^\]]+\])+', _fragment)
+        if marks:
+            content = content + "".join(marks)
     node = {
         'tag': content,
         'type': 'vmess',

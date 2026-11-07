@@ -39,7 +39,18 @@ class DiscoveryStage:
 
     async def run(self, db: "Database") -> dict:
         urls_file = Path(self.ctx.setting("urls_file"))
-        download_dir = urls_file.parent.parent.parent / "source" / "downloaded"
+        # Куда складывать скачанные подписки. Берём от КАТАЛОГА БАЗЫ, а не
+        # отсчётом «на три уровня вверх от urls.json»: тот путь был привязан
+        # к тому, что urls.json лежит в config/subs внутри пакета, и после
+        # переезда рабочих файлов в корень репозитория указывал бы в никуда.
+        # База — сосед downloaded/ по смыслу: оба меняются прогоном.
+        #
+        # Путь берём у САМОЙ базы (db.path), а не из настроек: settings здесь —
+        # это Settings конвейера, и в нём поля servers_db_file нет вовсе
+        # (см. pipeline/context.default_settings), так что setting() вернул бы
+        # None и падал бы уже Path(). У объекта базы путь всегда настоящий —
+        # включая случай, когда его переопределили флагом --db.
+        download_dir = Path(db.path).parent / "downloaded"
         logger = self.ctx.logger
 
         from script.downloader import load_urls, read_source_lines

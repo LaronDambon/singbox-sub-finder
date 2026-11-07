@@ -8,3 +8,4 @@ cryptography
 paramiko
 scp
 geoip2
+playwright

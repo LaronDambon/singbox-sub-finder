@@ -513,7 +513,13 @@ def build_merge_from_urls(
             len(unparsable_lines),
         )
 
-    upsert_res = store.upsert_lines(parsable_lines)
+    # Метка прохода: импортированная строка считается «разобранной» в этом
+    # проходе. Без неё сервер, чью строку мы только что взяли из подписки и
+    # ни разу не перепроверили, сохранял бы метку прошлого прохода вместе с
+    # мусором вроде тега, которого больше не ставит ни один чекер.
+    upsert_res = store.upsert_lines(
+        parsable_lines, pass_mark=store.new_pass_mark("import"),
+    )
     logger.info(
         "База серверов: добавлено %d новых, обновлено %d известных (источников строк: %d)",
         upsert_res["added"], upsert_res["updated"], len(parsable_lines),
@@ -539,6 +545,10 @@ def build_merge_from_urls(
     exported = store.export_whitelist_to_file(
         get_settings().paths.whitelist_file,
         global_tag=get_settings().reach.global_tag,
+        # Уровни лучших и резервных. Без них файл выходил без меток -best,
+        # хотя отбор считался: функция best выглядела нерабочей именно здесь.
+        best_top=get_settings().core.best_top,
+        best_reserve=get_settings().core.best_reserve,
     )
     logger.info(
         "Экспорт whitelist.txt из базы: %d серверов, пинговавшихся в последней проверке",

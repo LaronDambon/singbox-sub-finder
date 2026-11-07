@@ -192,16 +192,174 @@ regex_patterns = {
     '🇦🇶': re.compile(r'南极|南極|(\s|-)?AQ\d*|Antarctica'),
     '🇨🇳': re.compile(r'中国|中國|江苏|北京|上海|广州|深圳|杭州|徐州|青岛|宁波|镇江|沈阳|济南|回国|back|(\s|-)?CN(?!2GIA)\d*|China'),
 }
-def rename(input_str):
-    for country_code, pattern in regex_patterns.items():
-        if input_str.startswith(country_code):
-            return country_code + ' ' + input_str[len(country_code):].strip()
-        if pattern.search(input_str):
-            if input_str.startswith('🇺🇲'):
-                return country_code + ' ' + input_str[len('🇺🇲'):].strip()
-            else:
-                return country_code + ' ' + input_str
-    return input_str
+#: Флаги-заглушки: подписка не знает страну и ставит белый флаг.
+#: В теге он бесполезен — страну определит чекер country.
+_PLACEHOLDER_FLAGS = ("🏳", "🏴", "🏳️")
+
+#: Мусор, который подписки приклеивают к имени сервера:
+#:   "[openproxylist.com]"     — домен источника;
+#:   "[vm-no-ws]"              — внутренний код узла у поставщика;
+#:   "[261106-150245.944]"     — отметка времени сборки подписки.
+#: Всё это не несёт смысла для пользователя и лишь удлиняет тег.
+_SUBSCRIPTION_NOISE = re.compile(r'\[[^\]]*\]')
+
+#: Отметка времени вида "261106-150245.944" (ГГММДД-ЧЧММСС.мс), с
+#: квадратными скобками или без них. \b здесь не годится: точка в конце
+#: не является границей слова, и шаблон не срабатывал.
+_TIMESTAMP = re.compile(r'\[?\d{6}-\d{6}(?:\.\d+)?\]?')
+
+#: Метки возможностей в конце тега: [openai], [github-best], [Global].
+#: Их дописывает экспорт whitelist, и трогать их НЕЛЬЗЯ — по ним шаблон
+#: отбирает узлы в группы. Отделяются от имени и возвращаются как есть.
+#:
+#: Метка НЕ содержит дефиса между цифрами и пробелов внутри. Это важно:
+#: без ограничения шаблон жадно съедал "[261106-150245.944]" — отметку
+#: времени сборки подписки, — и она уезжала в конец готового тега.
+_CAPABILITY_TAIL = re.compile(
+    r'((?:\[(?!\d{6}-\d{6})[A-Za-z][A-Za-z0-9_.\- ]*\])+)$')
+
+#: Протоколы, которые узнаём в имени сервера. Порядок важен: длинные
+#: раньше коротких, иначе "hysteria2" распознается как "hysteria".
+_PROTOCOLS = (
+    "hysteria2", "hysteria", "wireguard", "shadowtls", "vmess", "vless",
+    "trojan", "shadowsocks", "ssr", "tuic", "socks", "http", "https",
+    "ss", "wg", "hy2",
+)
+
+
+def _split_capability_tail(name: str) -> tuple[str, str]:
+    """Отделяет хвост из меток возможностей от имени.
+
+    "[🇺🇸] vm-no-ws[openai][openai-best]" ->
+        ("[🇺🇸] vm-no-ws", "[openai][openai-best]")
+
+    Метки нужны фильтрам шаблона, поэтому они возвращаются отдельно и
+    потом дописываются к готовому тегу.
+    """
+    m = _CAPABILITY_TAIL.search(name)
+    if not m:
+        return name, ""
+    head = name[:m.start()].rstrip()
+    if not head:
+        return name, ""
+    return head, m.group(1)
+
+
+def _clean_noise(name: str) -> str:
+    """Убирает мусор подписки и лишние пробелы из имени.
+
+    Кроме скобок и отметок времени вырезается служебный хвост экспорта
+    вида "# vmess 000071-ping-11639-stable-96". Он появляется, когда имя
+    берут из фрагмента ссылки: сам фрагмент служит для меток, а его
+    начало — идентификатор сервера, уже ненужный в теге.
+    """
+    cleaned = name
+    # Служебный хвост экспорта: "# vmess 000071-ping-11639-stable-96".
+    # Всё после "#" — идентификатор сервера и его метрики, в теге они не
+    # нужны. Содержимое хвоста заранее неизвестно (там может стоять
+    # эмодзи страны, имя протокола, отметка времени), поэтому отрезаем
+    # его целиком, а не по шаблону конкретного вида.
+    cleaned = cleaned.split('#', 1)[0]
+    cleaned = _SUBSCRIPTION_NOISE.sub(" ", cleaned)
+    cleaned = _TIMESTAMP.sub(" ", cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned.strip(' -_#')
+
+
+def _find_protocol(name: str) -> str | None:
+    """Ищет название протокола в имени сервера."""
+    low = name.lower()
+    for proto in _PROTOCOLS:
+        if re.search(r'(?<![a-z0-9])' + re.escape(proto) + r'(?![a-z0-9])', low):
+            return proto
+    return None
+
+
+def rename(input_str, node_type: str | None = None, country: str | None = None):
+    """Приводит имя сервера к читаемому виду "🇸🇪 trojan 000040-...".
+
+    node_type — тип узла из конфига ("vmess", "trojan", ...). Нужен, когда
+    от исходного имени не остаётся ничего, кроме страны: в подписях вида
+    "[🇺🇸] [vm-no-ws] [261106-150245.944]" теряется и протокол, и всё
+    остальное. Без типа два таких сервера дали бы одинаковый тег "🇺🇸".
+
+    country — флаг страны, уже определённый чекером и лежащий в колонке
+    country. Он надёжнее имени: у vmess имя живёт внутри base64 отдельно
+    от меток, и страны в нём может не быть вовсе.
+
+    Подписки отдают имена вида "🇨🇦[openproxylist.com] vmess-CA" или
+    "[🇺🇸] [vm-no-ws] [261106-150245.944]" — с доменом источника,
+    внутренним кодом узла и отметкой времени. В конфиге такие теги
+    бесполезны: по ним не понять ни страну, ни протокол, ни то, чем
+    серверы отличаются друг от друга.
+
+    Функция собирает тег заново: "<страна> <протокол> <остаток>".
+    Метки возможностей ([openai], [Global-best]) сохраняются на конце —
+    без них шаблон не разложит узлы по группам.
+    """
+    if not input_str:
+        return input_str
+
+    head, marks = _split_capability_tail(input_str)
+
+    # Флаг-заглушку убираем сразу: она не страна, а признак «подписка не
+    # знает страну». Если оставить, она уедет в конец тега как мусор.
+    for flag in _PLACEHOLDER_FLAGS:
+        head = head.replace(flag, ' ')
+
+    # Страну ищем ПО ВСЕЙ строке, а не только в начале: подписки прячут
+    # эмодзи в скобки ("[🇺🇸] [vm-no-ws] ...") или в середину имени.
+    # Сначала — настоящий эмодзи-флаг, он самый надёжный.
+    found = None
+    for country_code in regex_patterns:
+        idx = head.find(country_code)
+        if idx == -1:
+            continue
+        found = country_code
+        head = head[:idx] + ' ' + head[idx + len(country_code):]
+        break
+
+    # Затем — текстовые обозначения страны ("Japan", "Tokyo", "US").
+    if found is None:
+        for country_code, pattern in regex_patterns.items():
+            if pattern.search(head):
+                found = country_code
+                break
+
+    # Страна из имени важнее переданной снаружи: она из самого сервера.
+    # Переданная нужна, когда в имени страны нет вовсе (vmess: имя внутри
+    # base64, метки снаружи, страна — только в колонке country).
+    country = found or (country or "").strip() or None
+
+    body = _clean_noise(head)
+
+    # Протокол выносим вперёд — по нему видно тип подключения.
+    proto = _find_protocol(body)
+    if proto:
+        # Убираем найденный протокол из тела вместе с прилипшим дефисом.
+        body = re.sub(r'(?<![a-z0-9])' + re.escape(proto) + r'(?![a-z0-9])',
+                      ' ', body, flags=re.IGNORECASE)
+        body = re.sub(r'\s+', ' ', body).strip(' -_')
+        body = re.sub(r'^[-_\s]+', '', body)
+
+    # Протокол в имени есть не всегда ("srv1", "node-42"). Берём тип из
+    # конфига — он всегда точен, а без него теги разных серверов могут
+    # совпасть ("🇺🇸" и "🇺🇸" у двух разных узлов).
+    if not proto and node_type:
+        proto = str(node_type).lower()
+
+    parts = []
+    if country:
+        parts.append(country)
+    if proto:
+        parts.append(proto)
+    if body:
+        parts.append(body)
+
+    result = " ".join(parts)
+    if not result:
+        result = _clean_noise(input_str)
+    return result + marks
 
 
 def extract_proxy_name(raw_line: str) -> str | None:
@@ -252,6 +410,22 @@ def get_country_from_name(raw_line: str) -> str | None:
     return None
 
 
+def _protocol_of_line(line: str) -> str | None:
+    """Определяет протокол по схеме ссылки ("vmess://" -> "vmess").
+
+    Нужен rename, когда от исходного имени не остаётся ничего, кроме
+    страны: без протокола два разных сервера дали бы одинаковый тег.
+    """
+    m = re.match(r'^([A-Za-z0-9]+)://', line or '')
+    if not m:
+        return None
+    proto = m.group(1).lower()
+    # Схема и название протокола в sing-box совпадают не всегда.
+    aliases = {"hy2": "hysteria2", "wireguard": "wg", "http2": "http",
+               "socks5": "socks"}
+    return aliases.get(proto, proto)
+
+
 def set_country_in_name(raw_line: str, emoji: str) -> str:
     """Вписывает флаг страны в начало имени прокси, если его там ещё нет.
 
@@ -264,29 +438,55 @@ def set_country_in_name(raw_line: str, emoji: str) -> str:
     """
     emoji = (emoji or "").strip()
     line = (raw_line or "").strip()
-    if not emoji or not line:
+    if not line:
         return line
-    if get_country_from_name(line):
-        return line
+
+    # Имя пересобирается в читаемый вид "🇸🇪 trojan 000040-...": подписки
+    # отдают "[🇨🇦][openproxylist.com] vmess-CA" или
+    # "[🇺🇸] [vm-no-ws] [261106-150245.944]" — с доменом источника и
+    # отметкой времени. Флаг страны при этом уже известен из колонки
+    # country, поэтому передаём его в rename как готовую страну.
+    #
+    # Работает и БЕЗ emoji: страна может быть ещё не определена (чекер
+    # country не гонялся), но привести имя в порядок нужно всё равно —
+    # раньше пустая колонка country оставляла в конфиге сырые имена.
+    node_type = _protocol_of_line(line)
 
     if line.lower().startswith('vmess://'):
         try:
-            payload = line[8:]
-            payload += (len(payload) % 4) * '='
-            obj = json.loads(base64.b64decode(payload).decode('utf-8', 'ignore'))
-            obj['ps'] = f"{emoji} {str(obj.get('ps') or '').strip()}".strip()
+            body = line[8:]
+            b64, sep, tail = body.partition('#')
+            pad = b64 + (len(b64) % 4) * '='
+            obj = json.loads(base64.b64decode(pad).decode('utf-8', 'ignore'))
+            name = str(obj.get('ps') or '').strip()
+            # Метки возможностей ([openai], [openai-best]) дописывает
+            # _capability_tags ПОСЛЕ этой функции, в конец строки. Здесь
+            # их трогать нельзя: сюда приходит имя в чистом виде.
+            #
+            # Хвост "#..." — служебный идентификатор сервера
+            # ("🇨🇦 vmess 001364-ping-793-stable-96"), в тег он не идёт,
+            # но и выбрасывать его из ссылки нельзя: по нему ключ сервера
+            # находится при повторной записи в базу.
+            if name:
+                new_name = rename(name, node_type, emoji)
+            else:
+                new_name = f"{emoji} {node_type}".strip()
+            obj['ps'] = new_name
             blob = base64.b64encode(
                 json.dumps(obj, ensure_ascii=False).encode('utf-8')
             ).decode('ascii')
-            return 'vmess://' + blob
+            return 'vmess://' + blob + (sep + tail if sep else '')
         except Exception:
             return line
 
     if '#' in line:
         head, _, name = line.partition('#')
-        return f"{head}#{emoji} {name.strip()}".rstrip()
+        new_name = rename(name, node_type, emoji) if name.strip() else ''
+        if not new_name:
+            new_name = f"{emoji} {node_type}".strip()
+        return f"{head}#{new_name}".rstrip()
 
-    return f"{line}#{emoji}"
+    return f"{line}#{rename(emoji, node_type, emoji)}".rstrip()
 
 
 def b64Decode(str):
