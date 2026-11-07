@@ -5,70 +5,59 @@
 
 ## Установка
 
-Одной командой — она сама скачает репозиторий и всё поставит.
-
-Linux / macOS:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/LaronDambon/singbox-sub-finder/main/bootstrap.sh | bash
-```
+Нужен **Python 3.10+** и **git**. Клонируем репозиторий и ставим зависимости —
+всё живёт в одной папке.
 
 Windows (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/LaronDambon/singbox-sub-finder/main/bootstrap.ps1 | iex
-```
-
-Скрипт проверит Python и git, развернёт репозиторий, создаст окружение и
-поставит зависимости.
-
-| | Windows | Linux / macOS |
-|---|---|---|
-| **программа** | `%ProgramFiles%\singbox-subs-finder` | `/opt/singbox-subs-finder` |
-| **данные** | `%LOCALAPPDATA%\singbox-subs-finder` | `~/.local/share/singbox-subs-finder` |
-
-Программа и данные лежат **врозь**: обновление кода не задевает базу,
-`config.yaml` и `.env`. На Windows установка в `Program Files` требует
-прав администратора — запустите PowerShell от имени администратора.
-Подробности и переменные для смены каталогов — в
-[документации по установке](docs/install.md).
-
-<details>
-<summary>Если репозиторий уже скачан</summary>
-
-```bash
-./singbox-subscribe/install.sh       # Linux / macOS
-.\singbox-subscribe\install.ps1      # Windows
-```
-
-А если хочется всё вручную — так, как было раньше:
-
-```bash
+cd $env:USERPROFILE
 git clone https://github.com/LaronDambon/singbox-sub-finder
 cd singbox-sub-finder
 python -m venv .venv
-.venv\Scripts\activate          # Windows
-# source .venv/bin/activate      # Linux / macOS
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-</details>
+Linux / macOS:
+
+```bash
+cd ~
+git clone https://github.com/LaronDambon/singbox-sub-finder
+cd singbox-sub-finder
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+> **Windows:** при установке Python отметьте галочку
+> **«Add python.exe to PATH»**. Если `python --version` открывает Microsoft
+> Store — Python не установлен.
+
+Подробности, включая ограничения политики выполнения и установку браузера
+для `browser_service` — в [документации по установке](docs/install.md).
 
 ## Настройка
 
-Мастер спросит про чекеры, ключи и деплой — и запишет ответы в `config.yaml`
-и `.env`. Запускать не обязательно: умолчания уже рабочие.
+Создайте `config.yaml` со всеми настройками и комментариями:
 
 ```bash
-./singbox-subscribe/setup.sh       # Linux / macOS
-.\singbox-subscribe\setup.ps1      # Windows
+cd singbox-subscribe
+python -m pipeline config init
+```
+
+Запускать не обязательно: умолчания в схеме уже рабочие. Секреты (токены и
+ключи) лежат отдельно, в `.env` — скопируйте его из шаблона:
+
+```bash
+cp .env.example .env
 ```
 
 ## Обновление
 
 ```bash
-./singbox-subscribe/update.sh      # Linux / macOS
-.\singbox-subscribe\update.ps1     # Windows
+git pull
+pip install -r requirements.txt
 ```
 
 `config.yaml`, `.env`, база и логи не трогаются — это ваши данные.

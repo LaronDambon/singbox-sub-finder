@@ -1,139 +1,161 @@
 # Установка и запуск
 
-## Автоматически
+Установка — обычная: клонируем репозиторий и ставим зависимости. Всё живёт в
+**одной папке**, никаких установщиков и системных каталогов.
 
-Загрузчик скачивает репозиторий и запускает установку:
+## Что нужно
 
-```bash
-# Linux / macOS
-curl -fsSL https://raw.githubusercontent.com/LaronDambon/singbox-sub-finder/main/bootstrap.sh | bash
-```
+| | |
+|---|---|
+| **Python 3.10+** | https://www.python.org/downloads/ — при установке отметьте **«Add python.exe to PATH»** |
+| **git** | https://git-scm.com/download/win |
+
+Проверить, что всё на месте:
 
 ```powershell
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/LaronDambon/singbox-sub-finder/main/bootstrap.ps1 | iex
+python --version     # Windows
+python3 --version    # Linux / macOS
+git --version
 ```
 
-Он проверяет Python 3 и git, ставит программу в системный каталог и
-запускает внутри `install.sh` / `install.ps1`. Повторный запуск обновляет
-существующую установку, не затирая `config.yaml`, `.env` и базу.
+> **Windows:** если `python --version` открывает Microsoft Store или пишет
+> «не найдено» — Python не установлен либо не попал в `PATH`. Поставьте его
+> заново с галочкой «Add python.exe to PATH».
 
-## Где что лежит
+## Установка
 
-Программа и данные разведены по разным местам — намеренно. Обновление
-трогает код и не касается базы и настроек, а для данных не нужны права
-администратора.
+### Windows (PowerShell)
 
-| | Windows | Linux | macOS |
-|---|---|---|---|
-| **программа** | `%ProgramFiles%\singbox-subs-finder` | `/opt/singbox-subs-finder` | `/usr/local/opt/singbox-subs-finder` |
-| **данные** | `%LOCALAPPDATA%\singbox-subs-finder` | `~/.local/share/singbox-subs-finder` | `~/Library/Application Support/singbox-subs-finder` |
-
-В каталоге данных лежат `config.yaml`, `.env`, `config/` (подписки и
-шаблоны), `source/` (база серверов), `logs/` и `output/` — то, что нельзя
-терять. В каталоге программы — код, `.git` и `.venv`.
-
-На Windows установка в `Program Files` требует прав администратора:
-запустите PowerShell **от имени администратора**. На Linux загрузчик сам
-позовёт `sudo`, если `/opt` ему не по зубам.
-
-Обе папки переопределяются, и это не украшение — так ставится второй
-экземпляр или переносится установка на другой диск:
-
-| Переменная | Что задаёт |
-|---|---|
-| `SINGBOX_PROGRAM_DIR` | куда поставить программу |
-| `SINGBOX_DATA_DIR` | где держать данные |
-| `SINGBOX_CONFIG_FILE` | путь к `config.yaml` напрямую |
-| `SINGBOX_ENV_FILE` | путь к `.env` напрямую |
-| `SINGBOX_DIR` | прежнее имя каталога установки (поддержано) |
-| `SINGBOX_BRANCH` | ветка |
-| `SINGBOX_REPO` | адрес репозитория |
-
-**Прежние установки продолжают работать.** Если программа запущена из
-клона репозитория, рядом с которым уже лежит `config.yaml`, данные берутся
-оттуда — переезжать ничего не нужно. Новый расклад включается сам, когда
-`config.yaml` рядом с пакетом нет.
-
-## В уже скачанном репозитории
-
-```bash
-./singbox-subscribe/install.sh       # Linux / macOS
-.\singbox-subscribe\install.ps1      # Windows
+```powershell
+cd $env:USERPROFILE
+git clone https://github.com/LaronDambon/singbox-sub-finder
+cd singbox-sub-finder
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
-Ключи:
+Если активация окружения запрещена политикой выполнения:
 
-| Ключ | Что делает |
-|---|---|
-| `--browser` | сразу поставить chromium для `browser_service` (~150 МБ) |
-| `--upgrade` | переустановить пакеты, даже если они уже стоят |
-| `--recreate-venv` | пересоздать `.venv` с нуля |
-| `--quiet` | меньше подробностей |
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+```
 
-Установщик создаёт `.venv`, ставит зависимости, готовит каталоги данных
-(`config/`, `source/`, `logs/`, `output/`), раскладывает туда шаблоны и
-список целей, создаёт `config.yaml` и `.env` (если их нет) и показывает
-отчёт готовности. Существующие файлы он не трогает.
+Либо вообще без активации — просто зовите интерпретатор из окружения напрямую:
 
-Если каталог программы закрыт на запись (обычное дело для `Program Files`
-и `/opt`), `.venv` создаётся в каталоге данных: работать это не мешает, а
-падать на создании окружения установка не должна.
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
 
-**Браузер по умолчанию не ставится.** Chromium нужен только чекеру
-`browser_service`, а это тяжёлая загрузка. Поставьте его ключом `--browser`
-или позже:
+### Linux / macOS
 
 ```bash
-.venv/bin/python -m playwright install chromium          # Linux / macOS
-.\.venv\Scripts\python.exe -m playwright install chromium  # Windows
+cd ~
+git clone https://github.com/LaronDambon/singbox-sub-finder
+cd singbox-sub-finder
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Если `python3 -m venv` ругается на отсутствующий модуль:
+
+```bash
+sudo apt install python3-venv python3-pip     # Debian / Ubuntu
+sudo dnf install python3-pip                  # Fedora
+```
+
+## Конфигурация
+
+Создать `config.yaml` со всеми настройками и комментариями:
+
+```bash
+cd singbox-subscribe
+python -m pipeline config init
+```
+
+Файл появится в корне репозитория. Запускать команду не обязательно:
+умолчания в схеме уже рабочие, и программа стартует без конфига. Но с файлом
+видно, что и где настраивается.
+
+Секреты (токены и ключи) лежат **отдельно**, в `.env` — этот файл в
+`.gitignore` и не коммитится:
+
+```bash
+cp .env.example .env
+```
+
+Дальше впишите в него то, что нужно именно вам:
+
+```
+GH_DEPLOY_TOKEN=...      # только для деплоя в GitHub
+GH_READ_TOKEN=...        # read-only токен, вшивается в ссылки
+GEMINI_API_KEY=...       # для api_service
+OPENROUTER_API_KEY=...   # для api_service
+```
+
+Обычные настройки в `.env` не пишутся — только секреты. Всё остальное
+живёт в `config.yaml`.
+
+## Структура
+
+Всё лежит в одной папке — и код, и ваши файлы:
+
+```
+singbox-sub-finder/
+  start.py, requirements.txt       точка входа и зависимости
+  config.yaml                      настройки (создаётся командой выше)
+  .env                             секреты (в .gitignore)
+  config/subs/urls.json            список ссылок на подписки
+  config/templates/*.json          шаблоны конфигурации для деплоя
+  config/reachability_targets.json цели проверки reachability
+  source/servers.db                центральная база
+  source/whitelist.txt, merge.txt  выгрузки
+  source/downloaded/               скачанные подписки
+  logs/                            логи
+  output/                          результат локального деплоя
+  singbox-subscribe/               ПАКЕТ: код
+```
+
+Пути в `config.yaml` пишутся **относительно корня репозитория** —
+`config/templates`, а не `singbox-subscribe/config/templates`.
+
+## Обновление
+
+```bash
+git pull
+.venv/bin/pip install -r requirements.txt        # Windows: .\.venv\Scripts\pip.exe
+```
+
+Ваши файлы при этом не трогаются: `config.yaml`, `.env`, `source/`,
+`logs/` и `config/` — это данные, а не код.
+
+## Браузер для проверки сервисов
+
+Chromium нужен только чекеру `browser_service`, а он тяжёлый. По умолчанию
+он выключен. Поставить, когда понадобится:
+
+```bash
+.venv/bin/python -m playwright install chromium                    # Linux / macOS
+.\.venv\Scripts\python.exe -m playwright install chromium          # Windows
 ```
 
 На Linux без графической оболочки дополнительно нужны системные библиотеки
 (`playwright install-deps chromium`, спросит пароль sudo).
 
-## Вручную
+## Проверка готовности
 
-Если автоматика не подходит:
-
-```bash
-git clone https://github.com/LaronDambon/singbox-sub-finder
-cd singbox-sub-finder
-python -m venv .venv
-source .venv/bin/activate        # Windows: .\.venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-## Обновление
+Перед первым запуском стоит посмотреть, что настроено, а что нет:
 
 ```bash
-./singbox-subscribe/update.sh       # Linux / macOS
-.\singbox-subscribe\update.ps1      # Windows
+python singbox-subscribe/preflight.py
 ```
 
-Обновляет код программы (`git pull --ff-only`) и пакеты. `config.yaml`,
-`.env`, `source/`, `logs/` и `config/` **не трогаются** — это данные
-установки, а не код, и лежат они в другом каталоге. Если в репозитории есть
-незакоммиченные правки, обновление скажет об этом и остановится; ключ
-`--force` обновляет принудительно.
+## Запуск
 
-## Мастер настройки
-
-```bash
-./singbox-subscribe/setup.sh        # Linux / macOS
-.\singbox-subscribe\setup.ps1       # Windows
-```
-
-Спрашивает только то, что нельзя решить за человека: какие чекеры запускать,
-есть ли ключи для проверки сервисов, куда девать собранный конфиг. Ответы
-пишутся в `config.yaml` и `.env`; комментарии в `config.yaml` сохраняются.
-Ключ `--yes` принимает всё по умолчанию, без вопросов.
-
-## Быстрый запуск
-
-По умолчанию основной запуск — `start.py`, который поднимает API и, при необходимости, планировщик для `main.py`.
-
-Запуск вручную:
+По умолчанию основной запуск — `start.py`, который поднимает API и, при
+необходимости, планировщик для `main.py`.
 
 ```bash
 python start.py
@@ -145,7 +167,7 @@ python start.py
 python singbox-subscribe/main.py
 ```
 
-Полезные ключи запуска:
+Полезные ключи:
 
 ```bash
 python singbox-subscribe/main.py --checkers url_probe,country   # выбрать алгоритмы
@@ -155,10 +177,3 @@ python singbox-subscribe/main.py --json                         # отчёт в 
 ```
 
 Управление ядром — в разделе [Ядро pipeline](pipeline.md).
-
-Перед первым запуском стоит проверить готовность установки — что настроено, а
-что нет:
-
-```bash
-python singbox-subscribe/preflight.py
-```
