@@ -276,10 +276,15 @@ class BatchDispatcher:
             if report.outcome is BatchOutcome.CONFIG_ERROR:
                 stats.config_errors += 1
             unparsable.extend(report.unparsable)
+            # Строки, вырезанные как виновники падения sing-box: проверять их
+            # нечем (процесс на них не поднимается), поэтому — сразу в чс.
+            unparsable.extend(report.pruned_lines)
 
             for line in report.retry_lines:
                 seen_retry.setdefault(line, None)
             for line in report.unparsable:
+                seen_retry.pop(line, None)
+            for line in report.pruned_lines:
                 seen_retry.pop(line, None)
 
             for tag, verdict in report.verdicts.items():

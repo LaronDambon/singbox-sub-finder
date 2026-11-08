@@ -1,6 +1,25 @@
 from utils import tool
 import re
 from urllib.parse import urlparse, parse_qs, unquote
+
+# Ключ WireGuard — 32 байта в base64 = 44 знака (43 без паддинга).
+# Мусор в поле ключа роняет sing-box целиком, убивая весь батч:
+# FATAL create service: initialize endpoint[N]: invalid private_key
+_KEY_RE = re.compile(r'^[A-Za-z0-9+/]{43}=?$')
+
+
+def is_wg_key(value) -> bool:
+    """Похоже ли значение на настоящий ключ WireGuard (curve25519, base64)."""
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip().replace(' ', '+')
+    try:
+        raw = tool.b64Decode(candidate)
+    except Exception:
+        return False
+    return len(raw) == 32
+
+
 def parse(data):
     info = data[:]
     server_info = urlparse(info)
@@ -40,4 +59,13 @@ def parse(data):
         node['address'] = [ipv4_value]
     if netquery.get('presharedKey'):
         node['peers'][0]['pre_shared_key'] = netquery['presharedKey']
+
+    # Кривой ключ в ссылке уронил бы sing-box целиком (invalid private_key /
+    # invalid public_key) и убил бы весь батч из 50 серверов. Лучше не
+    # принимать такой узел вовсе: причина видна в логе, остальные живут.
+    if not is_wg_key(node.get('private_key')):
+        raise ValueError("некорректный ключ WireGuard (privateKey)")
+    if not is_wg_key(node['peers'][0].get('public_key')):
+        raise ValueError("некорректный ключ WireGuard (publicKey)")
+
     return (node)

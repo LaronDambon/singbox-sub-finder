@@ -102,6 +102,9 @@ class BatchReport:
     attempts: int = 1
     #: строки, которые вернуть в очередь (sing-box о них не сказал ни слова)
     retry_lines: list[str] = field(default_factory=list)
+    #: строки, вырезанные из конфига как виновники падения sing-box.
+    #: Проверить их нельзя — в очередь не возвращаются, идут в чёрный список.
+    pruned_lines: list[str] = field(default_factory=list)
     #: тег sing-box -> вердикт: точная картина «кто ответил, кто нет»
     verdicts: dict = field(default_factory=dict)
 
@@ -122,6 +125,7 @@ class BatchReport:
             "dead": self.dead,
             "silent": self.silent,
             "unparsable": len(self.unparsable),
+            "pruned": len(self.pruned_lines),
             "retry": len(self.retry_lines),
             "dns_failures": self.dns_failures,
             "dial_timeouts": self.dial_timeouts,

@@ -76,7 +76,15 @@ REASON_RE = re.compile(
 )
 
 #: Строка, где sing-box сам отчитался об ошибке (не о конкретном сервере).
-FATAL_RE = re.compile(r"(FATAL|ERROR)\[")
+#:
+#: Между уровнем и «[» стоит ЦВЕТ: sing-box пишет «\x1b[31mFATAL\x1b[0m[0000]».
+#: Регулярка ждала «FATAL[» и не находила ничего, поэтому fatal_lines всегда
+#: был пустым: причина падения батча терялась, а отчёт ограничивался общим
+#: «sing-box не вернул ни одного результата». Теперь ANSI-вставки не мешают.
+FATAL_RE = re.compile(r"(FATAL|ERROR)\x1b\[[0-9;]*m?\[|(FATAL|ERROR)\[")
+
+#: Любая ANSI-раскраска: нужна, чтобы вычищать её из строк перед разбором.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 @dataclass
@@ -130,7 +138,9 @@ class BatchCollector:
         self.lines_seen += 1
 
         if FATAL_RE.search(line):
-            self.fatal_lines.append(line)
+            # В captured/meta уходит строка без раскраски: иначе её невозможно
+            # ни прочитать глазами, ни разобрать регуляркой по номеру outbound'а.
+            self.fatal_lines.append(_ANSI_RE.sub("", line))
             LOGGER.debug("[%s] sing-box: %s", self.name, line)
             return False
 

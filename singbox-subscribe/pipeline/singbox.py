@@ -36,6 +36,7 @@ from pipeline.anomaly import AnomalyCapture, save_anomaly
 from pipeline.batch import BatchClock, BatchOutcome, BatchReport
 from pipeline.collector import BatchCollector
 from pipeline.logging_setup import get_logger
+from pipeline.offenders import drop_group_children, offender_index, prune_config
 
 LOGGER = get_logger("singbox")
 
@@ -56,9 +57,25 @@ PORT_ERROR_MARKERS = ("address already in use", "bind:", "only one usage of each
 
 _FATAL_LINE_RE = re.compile(r"FATAL\[\d+\]\s*(?P<msg>.*)")
 
+#: Сколько outbound'ов разрешено вырезать из одного батча.
+#:
+#: Один-два кривых узла — обычное дело (битая ссылка попала в подписку).
+#: Десяток на батч из 50 — это уже не ссылки, а сломанный сборщик или
+#: шаблон; тогда резать дальше бессмысленно, батч должен упасть как есть,
+#: чтобы ошибку было видно. Заодно это страховка от вырезания всего батча
+#: по одному узлу за запуск.
+MAX_PRUNE_PER_BATCH = 5
+
+#: Сколько раз пересобрать батч после вырезания виновника.
+MAX_SELFHEAL_ROUNDS = 8
+
 
 class ConfigBuildError(Exception):
     """Не удалось собрать конфиг sing-box для батча."""
+
+
+class SpawnError(Exception):
+    """sing-box не удалось запустить как процесс (не про содержимое конфига)."""
 
 
 @dataclass
@@ -234,6 +251,13 @@ async def run_batch(
     archive_root/archive_level/archive_limit — куда и при каком пороге
     складывать конфиг и вывод при аномальном исходе. При archive_level="off"
     (или лимите 0) вывод всё равно читается, но никуда не пишется.
+
+    Кривая ссылка, попавшая в батч, роняет sing-box ЦЕЛИКОМ — вся проверка
+    умирает за десятые доли секунды, и виноват в этом один узел из полусотни.
+    Поэтому запуск идёт циклом: sing-box называет номер сломанного outbound'а,
+    мы вырезаем его из конфига и запускаем снова. Строка-виновник уходит в
+    report.pruned_lines (её отправит в чёрный список диспетчер), остальные
+    проверяются как обычно.
     """
     report = BatchReport(index=index, size=len(lines), tag_prefix=tag_prefix)
     capture = AnomalyCapture(batch_index=index, size=len(lines))
@@ -272,32 +296,168 @@ async def run_batch(
 
     from script.core import find_free_port
 
-    port = find_free_port()
-    config = apply_port(built.config, port)
-    if urltest:
-        for outbound in config.get("outbounds", []):
-            if isinstance(outbound.get("outbounds"), list):
-                outbound["url"] = urltest
-
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / f"batch_{index:04d}_{tag_prefix}.json"
-    try:
-        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError as exc:
-        report.outcome = BatchOutcome.CONFIG_ERROR
-        report.error = f"не удалось записать конфиг: {exc}"
-        report.retry_lines = [built.tag_to_line[t] for t in built.tag_to_line]
-        _archive_if_needed(
-            report, capture=capture, config_text=config_text, returncode=None,
-            archive_root=archive_root, archive_level=archive_level,
-            archive_limit=archive_limit,
-        )
-        return report
 
-    collector = BatchCollector(expected=len(built.tag_to_line), name=f"батч {index}")
+    #: Кто уже вырезан. Строки уходят в report.pruned_lines — диспетчер
+    #: отправит их в чёрный список, чтобы батч не собирался с ними снова.
+    pruned_lines: list[str] = []
+    pruned_tags: set[str] = set()
+    config = built.config
+    collector = None
+    timed_out = False
+    returncode: int | None = None
+    config_text = ""
+
+    for round_no in range(MAX_SELFHEAL_ROUNDS + 1):
+        port = find_free_port()
+        config = apply_port(config, port)
+        if urltest:
+            for outbound in config.get("outbounds", []):
+                if isinstance(outbound.get("outbounds"), list):
+                    outbound["url"] = urltest
+
+        # Теги, оставшиеся в конфиге после вырезаний. Группы чистим ДО запуска:
+        # висячая ссылка на вырезанный outbound — это уже другая ошибка
+        # («outbound not found»), и батч упал бы снова, но по чужой причине.
+        live_tags = {
+            str(item.get("tag"))
+            for section in ("outbounds", "endpoints")
+            for item in (config.get(section) or [])
+            if isinstance(item, dict) and item.get("tag")
+        }
+        missing = pruned_tags - live_tags
+        if missing:
+            drop_group_children(config, missing)
+
+        expected = {
+            tag: line for tag, line in built.tag_to_line.items() if tag in live_tags
+        }
+        config_text = json.dumps(config, ensure_ascii=False, indent=2)
+        try:
+            config_path.write_text(config_text, encoding="utf-8")
+        except OSError as exc:
+            report.outcome = BatchOutcome.CONFIG_ERROR
+            report.error = f"не удалось записать конфиг: {exc}"
+            report.retry_lines = list(built.tag_to_line.values())
+            report.pruned_lines = pruned_lines
+            _archive_if_needed(
+                report, capture=capture, config_text=config_text, returncode=None,
+                archive_root=archive_root, archive_level=archive_level,
+                archive_limit=archive_limit,
+            )
+            return report
+
+        collector = BatchCollector(expected=len(expected), name=f"батч {index}")
+        try:
+            timed_out, returncode = await _run_once(
+                config_path=config_path, singbox_path=singbox_path,
+                collector=collector, capture=capture, clock=clock,
+            )
+        except SpawnError as exc:
+            report.outcome = BatchOutcome.SPAWN_ERROR
+            report.error = str(exc)
+            report.retry_lines = list(built.tag_to_line.values())
+            report.pruned_lines = pruned_lines
+            LOGGER.error("Батч %d: sing-box не запустился: %s", index, exc)
+            _archive_if_needed(
+                report, capture=capture, config_text=config_text, returncode=None,
+                archive_root=archive_root, archive_level=archive_level,
+                archive_limit=archive_limit,
+            )
+            return report
+
+        if collector.complete or timed_out:
+            break
+
+        # Батч умер, ничего не успев сказать. Если sing-box назвал виновника —
+        # вырезаем его и пробуем снова; иначе это не про конкретную строку.
+        fatal = list(collector.fatal_lines)
+        offender = offender_index(" ".join(fatal))
+        if offender is None:
+            break
+        if len(pruned_lines) >= MAX_PRUNE_PER_BATCH:
+            LOGGER.warning(
+                "Батч %d: вырезано уже %d outbound'ов, дальше не режу — "
+                "похоже на поломку сборщика или шаблона, а не на битые ссылки",
+                index, len(pruned_lines),
+            )
+            break
+
+        section, pos = offender
+        items = config.get(section)
+        victim_tag = ""
+        if (isinstance(items, list) and 0 <= pos < len(items)
+                and isinstance(items[pos], dict)):
+            victim_tag = str(items[pos].get("tag") or "")
+        if not victim_tag:
+            break
+
+        raw = built.tag_to_line.get(victim_tag)
+        if prune_config(config, section, pos) is None:
+            break
+        pruned_tags.add(victim_tag)
+
+        reason = _fatal_reason(fatal)
+        if raw:
+            pruned_lines.append(raw)
+            report.tag_to_line.pop(victim_tag, None)
+            LOGGER.warning(
+                "Батч %d: sing-box не запустился (%s) — вырезаю %s[%d] "
+                "и проверяю остальные %d; строка уйдёт в чёрный список",
+                index, reason, section, pos, len(report.tag_to_line),
+            )
+        else:
+            # Номер указал на служебный outbound (selector/urltest/direct):
+            # это уже не битая ссылка, а сломанный шаблон.
+            LOGGER.warning(
+                "Батч %d: sing-box не запустился (%s) — вырезаю служебный "
+                "%s[%d] и пробую снова", index, reason, section, pos,
+            )
+
+    report.pruned_lines = pruned_lines
+    # Вырезанные строки не проверены: ни вернуть в очередь, ни записать
+    # «не отозвался» по ним нельзя — их судьбу решает чёрный список.
+    total_to_line = {
+        tag: line for tag, line in built.tag_to_line.items()
+        if line not in set(pruned_lines)
+    }
+    report = _finish_report(report, collector, total_to_line, timed_out, clock)
+    _archive_if_needed(
+        report, capture=capture, config_text=config_text, returncode=returncode,
+        archive_root=archive_root, archive_level=archive_level,
+        archive_limit=archive_limit,
+    )
+    return report
+
+
+def _fatal_reason(fatal_lines: list[str]) -> str:
+    """Короткая причина падения для лога и meta.json."""
+    for line in fatal_lines:
+        match = _FATAL_LINE_RE.search(line)
+        if match:
+            return match.group("msg").strip()[:200]
+    return " ".join(fatal_lines)[:200] if fatal_lines else "без объяснений"
+
+
+async def _run_once(
+    *,
+    config_path: Path,
+    singbox_path: Path,
+    collector: BatchCollector,
+    capture: AnomalyCapture,
+    clock: BatchClock,
+) -> tuple[bool, int | None]:
+    """Один запуск sing-box на уже записанном конфиге.
+
+    Возвращает (timed_out, returncode). Всё, что процесс успел напечатать,
+    уже разобрано: строки идут и в коллектор (вердикты), и в capture (улики).
+
+    Здесь же живёт защита от отмены: она обязана прибрать процесс СИНХРОННО,
+    потому что во время отмены event loop может быть в состоянии отмены, и
+    любой await рискует снова бросить CancelledError, не дойдя до конца.
+    """
     finished = asyncio.Event()
-    #: Текст конфига — та самая улика. Держим в памяти до исхода батча.
-    config_text = json.dumps(config, ensure_ascii=False, indent=2)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -307,26 +467,9 @@ async def run_batch(
             cwd=str(config_path.parents[2]),
         )
     except Exception as exc:  # noqa: BLE001
-        report.outcome = BatchOutcome.SPAWN_ERROR
-        report.error = f"{type(exc).__name__}: {exc}"
-        report.retry_lines = [built.tag_to_line[t] for t in built.tag_to_line]
-        LOGGER.error("Батч %d: sing-box не запустился: %s", index, exc)
-        _archive_if_needed(
-            report, capture=capture, config_text=config_text, returncode=None,
-            archive_root=archive_root, archive_level=archive_level,
-            archive_limit=archive_limit,
-        )
-        _unlink(config_path)
-        return report
+        raise SpawnError(f"{type(exc).__name__}: {exc}") from exc
 
     async def pump() -> None:
-        """Читает вывод sing-box построчно и сразу разбирает каждую строку.
-
-        Каждая строка дополнительно уходит в capture: коллектор распознаёт
-        только вердикты, а причина падения чаще всего лежит в том, что он
-        распознать не умеет. В памяти это стоит копейки, на диск уйдёт лишь
-        при аномалии.
-        """
         assert proc.stdout is not None
         while True:
             try:
@@ -351,10 +494,6 @@ async def run_batch(
     watcher = asyncio.create_task(watch_exit())
     timed_out = False
 
-    # Дальше живут ДВА await-участка: сам запуск батча (ожидание finished) и его
-    # штатная уборка. Отмена задачи может прийти в любой из них, поэтому оба
-    # закрыты одним обработчиком: он глушит sing-box СИНХРОННО и пробрасывает
-    # CancelledError дальше ровно один раз.
     try:
         try:
             await asyncio.wait_for(finished.wait(), timeout=clock.timeout)
@@ -367,46 +506,22 @@ async def run_batch(
         with contextlib.suppress(Exception):
             await asyncio.wait_for(finished.wait(), timeout=3)
     except asyncio.CancelledError:
-        # Сюда попадает отмена батча: grace-таймаут Supervisor.stop_all, Ctrl+C
-        # или внешний task.cancel(). Штатный путь сюда не доходит.
-        #
-        # Именно этот блок и был источником мусора в конце вывода: отмена
-        # пролетала мимо _terminate, sing-box оставался висеть вместе с
-        # открытыми каналами, и при закрытии цикла событий интерпретатор
-        # печатал «Event loop is closed» и «I/O operation on closed pipe».
-        #
-        # Здесь НИ ОДНОГО await: во время отмены loop может быть в состоянии
-        # отмены, и любой await внутри уборки рискует снова бросить
-        # CancelledError, не дойдя до конца. Только синхронные вызовы ОС.
         _cancel_tasks(reader, watcher)
         _kill_sync(proc)
-        _unlink(config_path)
         raise
 
     # Штатный путь: дочитываем помощников. gather с return_exceptions=True
     # возвращает их отмену как результат, поэтому обычный CancelledError
-    # (отменённые нами задачи) наружу не выпускает — в отличие от голого
-    # contextlib.suppress, который глотал бы и настоящую отмену этого батча.
+    # (отменённые нами задачи) наружу не выпускает.
     _cancel_tasks(reader, watcher)
     try:
         await asyncio.gather(reader, watcher, return_exceptions=True)
     except asyncio.CancelledError:
-        # Отмена пришла ровно на уборке: процесс уже убит, но конфиг и
-        # помощников всё равно нужно прибрать — иначе вернёмся в тот же мусор.
         _cancel_tasks(reader, watcher)
         _kill_sync(proc)
-        _unlink(config_path)
         raise
-    _unlink(config_path)
 
-    returncode = proc.returncode
-    report = _finish_report(report, collector, built.tag_to_line, timed_out, clock)
-    _archive_if_needed(
-        report, capture=capture, config_text=config_text, returncode=returncode,
-        archive_root=archive_root, archive_level=archive_level,
-        archive_limit=archive_limit,
-    )
-    return report
+    return timed_out, proc.returncode
 
 
 def _finish_report(report: BatchReport, collector: BatchCollector,
