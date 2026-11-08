@@ -197,14 +197,13 @@
       "tag": "alldeploy",
       "type": "block",
       "tags": [
-        "github",
+        "global",
         "openrouter",
         "gemini-chat",
         "openai",
         "youtube",
         "telegram",
-        "microsoft",
-        "global"
+        "microsoft"
       ],
       "blocks": [
         {
@@ -300,7 +299,7 @@
         "rule_set": [
           "geosite-github"
         ],
-        "outbound": "github"
+        "outbound": "direct"
       },
       {
         "ip_is_private": true,
@@ -343,6 +342,10 @@
           "geosite-microsoft"
         ],
         "outbound": "microsoft"
+      },
+      {
+        "clash_mode": "Direct",
+        "outbound": "direct"
       }
     ],
     "rule_set": [

@@ -2,6 +2,18 @@ from utils import tool
 import re
 from urllib.parse import urlparse, parse_qs, unquote
 
+# Публичный ключ REALITY: 32 байта в base64url = 43 знака (44 с паддингом).
+# Мусор вроде pbk=enabled ломал sing-box целиком, убивая весь батч:
+# FATAL create service: initialize outbound[N]: invalid public_key
+_PBK_RE = re.compile(r'^[A-Za-z0-9_-]{43}=?$')
+
+
+def is_valid_pbk(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    return bool(_PBK_RE.match(value.strip()))
+
+
 def parse(data):
     info = data[:]
     server_info = urlparse(info)
@@ -70,7 +82,7 @@ def parse(data):
 
         # REALITY: Включаем ТОЛЬКО при наличии валидного публичного ключа (pbk)
         pbk = netquery.get('pbk')
-        if pbk and isinstance(pbk, str) and pbk.strip() and pbk.strip().lower() != 'none':
+        if is_valid_pbk(pbk):
             node['tls']['reality'] = {
                 'enabled': True,
                 'public_key': pbk.strip(),

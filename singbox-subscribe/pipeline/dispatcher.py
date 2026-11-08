@@ -90,9 +90,16 @@ class BatchDispatcher:
         max_attempts: int = 2,
         max_retries: int = 3,
         sink=None,
+        archive_root: Path | None = None,
+        archive_level: str = "off",
+        archive_limit: int = 0,
     ) -> None:
         self.db = db
         self.sink = sink
+        #: Куда складывать конфиг и вывод аномальных батчей. None — не хранить.
+        self.archive_root = Path(archive_root) if archive_root else None
+        self.archive_level = str(archive_level or "off").lower()
+        self.archive_limit = max(0, int(archive_limit or 0))
         self.batch_size = max(1, batch_size)
         self.slots = max(1, slots)
         self.timeout = timeout
@@ -191,6 +198,9 @@ class BatchDispatcher:
                 config_dir=self.config_dir,
                 tag_prefix=tag_prefix,
                 urltest=self.urltest,
+                archive_root=self.archive_root,
+                archive_level=self.archive_level,
+                archive_limit=self.archive_limit,
             )
             report.attempts = attempt
             # Сбой запуска (порт занят, битый бинарник) лечится повтором с
@@ -361,6 +371,13 @@ def make_dispatcher(
     """Собирает диспетчер с настройками по умолчанию из конфигурации."""
     from config.settings import get_settings
 
+    settings = get_settings()
+    # Архив аномалий лежит рядом с обычными логами: logs/singbox/<id>/.
+    # Лимит 0 или уровень off выключают его целиком.
+    archive_root = Path(settings.log.dir_path)
+    archive_level = str(settings.singbox.keep_failed_batches or "off").lower()
+    archive_limit = int(settings.singbox.keep_failed_batches_limit or 0)
+
     return BatchDispatcher(
         db,
         batch_size=batch_size or get_settings().pipeline.batch_size,
@@ -374,6 +391,9 @@ def make_dispatcher(
         config_dir=Path(get_settings().paths.sing_box_output_dir),
         urltest=urltest or get_settings().urltest.url,
         sink=sink,
+        archive_root=archive_root,
+        archive_level=archive_level,
+        archive_limit=archive_limit,
     )
 
 

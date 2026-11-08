@@ -365,6 +365,22 @@ _SCHEMA: tuple = (
     Field("singbox", "path", "binary", ROOT / "sing-box",
           "Путь к sing-box: можно указать папку поставки (бинарник найдётся сам)"
           " или файл напрямую", legacy=("SING_BOX_PATH",)),
+    # Архив аномальных батчей. Обычный прогон следов не оставляет: конфиг
+    # удаляется, а вывод процесса живёт только в памяти. Когда батч кончается
+    # ничем («no_results», 0.1 с, ни одной строки), разбираться не по чему —
+    # поэтому подозрительные батчи целиком кладутся в logs/singbox/<id>/.
+    Field("singbox", "keep_failed_batches", "str", "error",
+          "Какие батчи сохранять в logs/singbox: конфиг, вывод и meta.json."
+          " error — только сбои (no_results, config_error, spawn_error);"
+          " warning — плюс подозрительные partial; info — все подряд;"
+          " off — не сохранять ничего",
+          values="off, error, warning, info",
+          legacy=("SINGBOX_KEEP_FAILED_BATCHES", "KEEP_FAILED_BATCHES")),
+    Field("singbox", "keep_failed_batches_limit", "int", 200,
+          "Сколько архивов батчей хранить; старые удаляются. 0 — выключить"
+          " архивацию целиком",
+          unit="папок",
+          legacy=("SINGBOX_KEEP_FAILED_BATCHES_LIMIT", "KEEP_FAILED_BATCHES_LIMIT")),
 
     # ------------------------- url_probe: жив ли сервер (решающий чекер)
     Field("singbox.checkers.url_probe", "url", "str", "https://cp.cloudflare.com/gen_204", "URL проверки доступности: лёгкий 204-ответ", legacy=("URLTEST_URL",)),

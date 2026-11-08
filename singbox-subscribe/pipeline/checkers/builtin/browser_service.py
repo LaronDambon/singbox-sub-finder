@@ -134,7 +134,7 @@ class BrowserServiceChecker(Checker):
             # сессии увидит ту же страницу, что и обычный HTTP-запрос.
             LOGGER.warning(
                 "Browser service: профиль %s не найден, чекер выключен "
-                "(нужен python browser_login.py %s)",
+                "(нужен python browser.py login %s из папки singbox-subscribe)",
                 profile, self.service,
             )
             self.enabled = False

@@ -32,6 +32,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from pipeline.anomaly import AnomalyCapture, save_anomaly
 from pipeline.batch import BatchClock, BatchOutcome, BatchReport
 from pipeline.collector import BatchCollector
 from pipeline.logging_setup import get_logger
@@ -224,9 +225,18 @@ async def run_batch(
     config_dir: Path,
     tag_prefix: str,
     urltest: str = "",
+    archive_root: Path | None = None,
+    archive_level: str = "off",
+    archive_limit: int = 0,
 ) -> BatchReport:
-    """Запускает один батч sing-box и собирает результаты на лету."""
+    """Запускает один батч sing-box и собирает результаты на лету.
+
+    archive_root/archive_level/archive_limit — куда и при каком пороге
+    складывать конфиг и вывод при аномальном исходе. При archive_level="off"
+    (или лимите 0) вывод всё равно читается, но никуда не пишется.
+    """
     report = BatchReport(index=index, size=len(lines), tag_prefix=tag_prefix)
+    capture = AnomalyCapture(batch_index=index, size=len(lines))
 
     try:
         built = build_batch_config(lines, tag_prefix=tag_prefix, template_path=template_path)
@@ -238,6 +248,11 @@ async def run_batch(
         report.unparsable = []
         report.retry_lines = list(lines)
         LOGGER.warning("Батч %d: конфиг не собрался: %s", index, exc)
+        _archive_if_needed(
+            report, capture=capture, config_text=None, returncode=None,
+            archive_root=archive_root, archive_level=archive_level,
+            archive_limit=archive_limit,
+        )
         return report
     except Exception as exc:  # noqa: BLE001
         report.outcome = BatchOutcome.CONFIG_ERROR
@@ -245,6 +260,11 @@ async def run_batch(
         report.unparsable = []
         report.retry_lines = list(lines)
         LOGGER.warning("Батч %d: ошибка сборки конфига: %s", index, exc)
+        _archive_if_needed(
+            report, capture=capture, config_text=None, returncode=None,
+            archive_root=archive_root, archive_level=archive_level,
+            archive_limit=archive_limit,
+        )
         return report
 
     report.tag_to_line = dict(built.tag_to_line)
@@ -267,10 +287,17 @@ async def run_batch(
         report.outcome = BatchOutcome.CONFIG_ERROR
         report.error = f"не удалось записать конфиг: {exc}"
         report.retry_lines = [built.tag_to_line[t] for t in built.tag_to_line]
+        _archive_if_needed(
+            report, capture=capture, config_text=config_text, returncode=None,
+            archive_root=archive_root, archive_level=archive_level,
+            archive_limit=archive_limit,
+        )
         return report
 
     collector = BatchCollector(expected=len(built.tag_to_line), name=f"батч {index}")
     finished = asyncio.Event()
+    #: Текст конфига — та самая улика. Держим в памяти до исхода батча.
+    config_text = json.dumps(config, ensure_ascii=False, indent=2)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -284,11 +311,22 @@ async def run_batch(
         report.error = f"{type(exc).__name__}: {exc}"
         report.retry_lines = [built.tag_to_line[t] for t in built.tag_to_line]
         LOGGER.error("Батч %d: sing-box не запустился: %s", index, exc)
+        _archive_if_needed(
+            report, capture=capture, config_text=config_text, returncode=None,
+            archive_root=archive_root, archive_level=archive_level,
+            archive_limit=archive_limit,
+        )
         _unlink(config_path)
         return report
 
     async def pump() -> None:
-        """Читает вывод sing-box построчно и сразу разбирает каждую строку."""
+        """Читает вывод sing-box построчно и сразу разбирает каждую строку.
+
+        Каждая строка дополнительно уходит в capture: коллектор распознаёт
+        только вердикты, а причина падения чаще всего лежит в том, что он
+        распознать не умеет. В памяти это стоит копейки, на диск уйдёт лишь
+        при аномалии.
+        """
         assert proc.stdout is not None
         while True:
             try:
@@ -297,7 +335,9 @@ async def run_batch(
                 return
             if not raw:
                 return
-            collector.feed(raw.decode("utf-8", "replace"))
+            text = raw.decode("utf-8", "replace")
+            capture.feed(text)
+            collector.feed(text)
             if collector.complete:
                 # Все серверы батча отчитались — можно закрывать процесс.
                 finished.set()
@@ -359,7 +399,14 @@ async def run_batch(
         raise
     _unlink(config_path)
 
-    return _finish_report(report, collector, built.tag_to_line, timed_out, clock)
+    returncode = proc.returncode
+    report = _finish_report(report, collector, built.tag_to_line, timed_out, clock)
+    _archive_if_needed(
+        report, capture=capture, config_text=config_text, returncode=returncode,
+        archive_root=archive_root, archive_level=archive_level,
+        archive_limit=archive_limit,
+    )
+    return report
 
 
 def _finish_report(report: BatchReport, collector: BatchCollector,
@@ -395,6 +442,33 @@ def _finish_report(report: BatchReport, collector: BatchCollector,
     if report.error:
         LOGGER.warning("Батч %d: %s", report.index, report.error)
     return report
+
+
+def _archive_if_needed(report: BatchReport, *, capture: AnomalyCapture,
+                       config_text: str | None, returncode: int | None,
+                       archive_root: Path | None, archive_level: str,
+                       archive_limit: int) -> None:
+    """Складывает конфиг и вывод батча в архив, если исход того заслужил.
+
+    Идентификатор печатается рядом с предупреждением: без него из общего лога
+    непонятно, куда идти за подробностями.
+    """
+    if archive_root is None:
+        return
+    ident = save_anomaly(
+        root=archive_root,
+        capture=capture,
+        config_text=config_text,
+        report=report,
+        returncode=returncode,
+        threshold=archive_level,
+        limit=archive_limit,
+    )
+    if ident:
+        LOGGER.warning(
+            "Батч %d: сохранён в logs/%s/%s (конфиг, вывод, meta.json)",
+            report.index, "singbox", ident,
+        )
 
 
 def _unlink(path: Path) -> None:

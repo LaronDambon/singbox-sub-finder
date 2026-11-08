@@ -88,7 +88,8 @@ def export_session(service: str, password: str, out_path: Path | None = None,
     profile = paths.profile_dir(service)
     if not profile.exists():
         raise FileNotFoundError(
-            "Профиль %s не найден — сначала выполните: python browser_login.py %s"
+            "Профиль %s не найден — сначала выполните (из папки "
+            "singbox-subscribe): python browser.py login %s"
             % (profile, service)
         )
 
@@ -205,7 +206,7 @@ def main(argv=None) -> int:
         print("Ошибка: %s" % exc)
         return 1
     print()
-    print("Проверьте: python browser_check.py %s --show" % args.service)
+    print("Проверьте: python browser.py check %s --show" % args.service)
     return 0 if n else 1
 
 

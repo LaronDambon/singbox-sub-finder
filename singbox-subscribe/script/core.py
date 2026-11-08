@@ -958,6 +958,36 @@ def _drop_empty_groups(outbounds) -> list:
     return result
 
 
+#: Разделы конфига, на которые может ссылаться правило маршрута.
+#: outbounds — обычные исходящие; endpoints — wireguard/tailscale и прочие
+#: точки выхода, которые sing-box 1.11+ вынес в отдельный блок. Правило
+#: с outbound wg-home одинаково законно и для того, и для другого.
+_ROUTE_TARGET_SECTIONS = ("outbounds", "endpoints")
+
+
+def _route_target_tags(config, outbounds) -> set:
+    """Все теги, на которые может законно ссылаться правило маршрута.
+
+    Именно «все», а не только outbounds: см. объяснение в _drop_dangling_rules.
+    Раздел outbounds берём из аргумента — вызывающий уже почистил его от
+    пустых групп, и ориентироваться на config["outbounds"] было бы неверно.
+    """
+    known = {
+        str(o.get("tag")) for o in outbounds
+        if isinstance(o, dict) and o.get("tag")
+    }
+    for section in _ROUTE_TARGET_SECTIONS:
+        if section == "outbounds":
+            continue  # уже собран из аргумента
+        items = config.get(section)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict) and item.get("tag"):
+                known.add(str(item["tag"]))
+    return known
+
+
 def _drop_dangling_rules(config, outbounds) -> list:
     """Убирает правила маршрута, ведущие в НЕСУЩЕСТВУЮЩУЮ группу.
 
@@ -973,11 +1003,15 @@ def _drop_dangling_rules(config, outbounds) -> list:
     Правило с НЕСКОЛЬКИМИ outbound (список) чистится поэлементно: из него
     выбрасываются только пропавшие имена. Если не осталось ни одного,
     правило удаляется целиком.
+
+    ВАЖНО про endpoints. Маршрут может вести не только в outbound, но и в
+    endpoint — например wireguard-туннель wg-home из блока endpoints.
+    Раньше «существующими» считались только outbounds, поэтому правило
+    ip_cidr 10.32.64.0/24 -> wg-home удалялось как ссылка в никуда:
+    рабочая маршрутизация до домашней сети пропадала, хотя endpoint был
+    на месте. Теперь теги собираются из ОБОИХ разделов.
     """
-    known = {
-        str(o.get("tag")) for o in outbounds
-        if isinstance(o, dict) and o.get("tag")
-    }
+    known = _route_target_tags(config, outbounds)
     route = config.get("route") or {}
     rules = route.get("rules")
     if not isinstance(rules, list):

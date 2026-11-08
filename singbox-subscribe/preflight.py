@@ -541,6 +541,28 @@ def check_github_deploy(settings) -> Check:
                  "включён, репозиторий %s, токен %s" % (repo, _mask(token)))
 
 
+def _dir_owner_hint(path) -> str:
+    """Чей это каталог — одной строкой. Пусто, если выяснить не удалось.
+
+    Нужно ровно затем, чтобы «Permission denied» не заставлял гадать: почти
+    всегда каталог принадлежит root после запуска через sudo, и человеку
+    достаточно увидеть это словом, а не догадываться по коду ошибки.
+    """
+    try:
+        import pwd  # только POSIX: на Windows модуля нет
+    except ImportError:
+        return ""
+    try:
+        stat = path.stat()
+        owner = pwd.getpwuid(stat.st_uid).pw_name
+        current = pwd.getpwuid(os.getuid()).pw_name
+    except Exception:  # noqa: BLE001 — подсказка не стоит падения проверки
+        return ""
+    if owner == current:
+        return ""
+    return " Каталог принадлежит пользователю %s, а вы — %s." % (owner, current)
+
+
 def check_local_deploy(settings) -> Check:
     """Локальный деплой: можно ли записать файл туда, куда указано.
 
@@ -573,11 +595,21 @@ def check_local_deploy(settings) -> Check:
         probe.write_text("", encoding="utf-8")
         probe.unlink()
     except Exception as exc:  # noqa: BLE001
+        owner = _dir_owner_hint(target)
         return Check(
             "local_deploy", "Локальный деплой", FAIL,
             "нет доступа на запись: %s" % exc,
-            fix="Дайте права на запись в каталог:\n  %s\n"
-                "или укажите другой deploy.local_path." % target,
+            fix="Каталог существует, но принадлежит не тому пользователю, "
+                "от которого вы запускаете программу.%s\n\n"
+                "Самый частый случай: репозиторий когда-то клонировали или "
+                "запускали через sudo — тогда каталоги принадлежат root, а "
+                "обычный пользователь писать в них не может. Убедиться:\n"
+                "  ls -ld %s\n\n"
+                "Вернуть себе владение (Linux/macOS):\n"
+                "  sudo chown -R $USER:$USER %s\n\n"
+                "Если это не подходит — укажите другой каталог:\n"
+                "  deploy:\n    local_path: /путь/куда/есть/доступ"
+                % (owner, target, target.parent),
             disable="в config.yaml: deploy.local: false",
         )
     return Check("local_deploy", "Локальный деплой", OK, "пишет в %s" % target)
@@ -810,8 +842,10 @@ def check_browser_service(settings) -> Check:
             "browser_service", "Браузерная проверка", FAIL,
             "включена, но профиля %s нет — вход не выполнялся" % service,
             fix="Выполните вход ОДИН раз (откроется окно браузера, "
-                "войдите в %s вручную):\n"
-                "  python browser_login.py %s\n\n"
+                "войдите в %s вручную). Команда запускается ИЗ ПАПКИ "
+                "singbox-subscribe:\n"
+                "  cd singbox-subscribe\n"
+                "  python browser.py login %s\n\n"
                 "Профиль сохранится здесь: %s\n"
                 "Папка лежит ВНЕ репозитория, cookies в git не попадут."
                 % (service, service, profile),
@@ -826,9 +860,11 @@ def check_browser_service(settings) -> Check:
             "browser_service", "Браузерная проверка", FAIL,
             "профиль %s есть, но cookies входа в нём нет" % service,
             fix="Профиль создан, но вход не завершён. Повторите и войдите "
-                "до конца:\n  python browser_login.py %s\n\n"
+                "до конца (из папки singbox-subscribe):\n"
+                "  python browser.py login %s\n\n"
                 "Убедиться вручную, что доступ есть:\n"
-                "  python browser_check.py %s" % (service, service),
+                "  python browser.py check %s --proxy 127.0.0.1:ПОРТ"
+                % (service, service),
             disable="уберите browser_service из "
                     "singbox.enabled_checkers в config.yaml",
         )
