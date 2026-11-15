@@ -381,13 +381,16 @@ class CheckStage:
                 # прошлых прогонов останутся на сервере навсегда.
                 reset = bool(self._pass) and line not in written
                 if not (outcome.country or outcome.capabilities or has_speed
-                        or has_pings or reset):
+                        or has_pings or reset or outcome.extra_tags):
                     continue
                 row = {
                     "key": _key_of(line),
                     "country": outcome.country or "",
                     "capabilities": outcome.capabilities or "",
                     "pass": self._pass if reset else "",
+                    # Теги-описания (ISP, город, dc/res): пишутся отдельным
+                    # видом, к профилю сервисов отношения не имеют.
+                    "geo_tags": outcome.extra_tags or "",
                 }
                 if has_speed:
                     row["speed_mbps"] = speed_mbps

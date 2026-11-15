@@ -210,14 +210,8 @@
           "tag": "alldeploy-reserved",
           "type": "urltest",
           "outbounds": [
-            "{all}"
-          ],
-          "filter": [
             {
-              "action": "include",
-              "keywords": [
-                "alldeploy-reserve"
-              ]
+              "sql": "SELECT s.line FROM servers s JOIN server_tags t ON t.key = s.key WHERE t.tag = 'alldeploy' AND t.passed = 1 AND s.available = 1 AND s.excluded = 0 ORDER BY t.ping_ms IS NULL, t.ping_ms LIMIT 21 OFFSET 5"
             }
           ],
           "url": "alldeploy",
@@ -228,16 +222,10 @@
           "tag": "alldeploy",
           "type": "urltest",
           "outbounds": [
-            "{all}",
-            "alldeploy-reserved"
-          ],
-          "filter": [
             {
-              "action": "include",
-              "keywords": [
-                "alldeploy-best"
-              ]
-            }
+              "sql": "SELECT s.line FROM servers s JOIN server_tags t ON t.key = s.key WHERE t.tag = 'alldeploy' AND t.passed = 1 AND s.available = 1 AND s.excluded = 0 ORDER BY t.ping_ms IS NULL, t.ping_ms LIMIT 5"
+            },
+            "alldeploy-reserved"
           ],
           "url": "alldeploy",
           "interval": "2m",

@@ -40,6 +40,7 @@
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -64,16 +65,13 @@ KEY = "alldeploy"
 ALL = "all"
 
 #: Порядок подстановок: длинные плейсхолдеры первыми, иначе "alldeploy"
-#: съест начало "alldeploy-reserve" и "alldeploy-best".
+#: съест начало "alldeploy-reserved".
 #:
-#: Суффиксы РАЗНЫЕ, и это не опечатка:
-#:   * "<метка>-best"     — метка в базе и имя группы;
-#:   * "<метка>-reserve"  — метка в базе (best_tags.reserve_suffix);
-#:   * "<метка>-reserved" — имя ГРУППЫ резерва.
-#: Группа называется иначе намеренно: фильтр резерва ищет метку базы
-#: "<метка>-reserve", и если бы группа звалась так же, поиск шёл бы
-#: подстрокой и в резерв попадало бы лишнее. Проверяется тестом
-#: test_service_template.
+#: "alldeploy-best" и "alldeploy-reserve" оставлены ради шаблонов, которые
+#: их ещё используют, но тегов -best/-reserve в базе больше НЕТ: уровень
+#: сервера задаётся сортировкой по задержке до цели в SQL-запросе, а не
+#: меткой. Живая подстановка одна — "alldeploy-reserved" (имя группы
+#: резерва).
 _SUBSTITUTIONS = (
     (PLACEHOLDER_RESERVED, "-reserved"),
     (PLACEHOLDER_RESERVE, "-reserve"),
@@ -241,6 +239,151 @@ def _expand_block(block: dict, tag: str, url: str) -> dict:
     return out
 
 
+def _tag_of(value: Any) -> str:
+    """Тег узла из значения, вернувшегося из SQL.
+
+    Запрос возвращает ссылку (line). Тег строится ТЕМ ЖЕ способом, что и
+    при сборке конфига: "<флаг> <протокол> <хэш key>" (core.tag_for_node).
+    Иначе имена в группах не совпали бы с тегами узлов.
+    """
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if "://" in s:
+        try:
+            from script import core as _core
+            from script.downloader import normalize_proxy_key
+
+            _core.init_parsers()
+            nodes = _core.get_nodes(s)
+            if nodes and isinstance(nodes[0], dict):
+                return _core.tag_for_node(nodes[0], normalize_proxy_key(s))
+        except Exception:  # noqa: BLE001
+            pass
+        _, sep, tail = s.partition("#")
+        if sep and tail.strip():
+            return tail.strip()
+    return s
+
+
+def _run_sql(db_path: str | Path | None, spec: str) -> list[str]:
+    """Выполняет SQL-запрос на чтение и возвращает строки результата."""
+    if db_path is None:
+        raise RuntimeError(
+            "В шаблоне есть блок sql, но база не задана: некуда выполнять запрос"
+        )
+    from script.select import run_sql
+
+    return run_sql(db_path, spec)
+
+
+def _sql_block(block: dict, db_path: str | Path | None = None,
+               tag: str | None = None) -> list[str] | None:
+    """Выполняет SQL-блок из шаблона и возвращает список имён.
+
+    Блок filter заменяется на sql — одна строка с SQL-командой:
+
+        "sql": "SELECT tag FROM servers WHERE available = 1"
+
+    Плейсхолдер alldeploy внутри запроса заменяется меткой сервиса (tag),
+    ровно так же, как он заменяется в filter. Если sql нет — None.
+
+    Ничего не разбирается и не оптимизируется: запрос выполняется как
+    написан, строки результата идут в filter как ключевые слова.
+    """
+    if not isinstance(block, dict):
+        return None
+    spec = block.get("sql")
+    if spec is None:
+        return None
+    if db_path is None:
+        raise RuntimeError(
+            "В шаблоне есть блок sql, но база не задана: некуда выполнять запрос"
+        )
+    if isinstance(spec, str) and tag:
+        spec = _substitute(spec, tag)
+    from script.select import run_sql
+
+    return run_sql(db_path, spec)
+
+
+def _sql_lines(db_path: str | Path | None, sql: str) -> list[str]:
+    """Выполняет SQL и возвращает СЫРЫЕ строки (line) без преобразования."""
+    if db_path is None:
+        raise RuntimeError("В шаблоне есть sql, но база не задана")
+    from script.select import _connect
+
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(str(sql).strip()).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for row in rows:
+        keys = row.keys()
+        value = row["line"] if "line" in keys else (row[0] if row else None)
+        if value:
+            out.append(str(value))
+    return out
+
+
+def _apply_sql_block(block: dict, db_path: str | Path | None = None,
+                     tag: str | None = None) -> dict:
+    """Подставляет результат SQL вместо sql-элемента в outbounds.
+
+    В шаблоне вместо списка серверов стоит объект с ключом sql:
+
+        "outbounds": [
+            {"sql": "SELECT line FROM servers WHERE ..."}
+        ]
+
+    Скрипт выполняет запрос и ставит на место этого объекта имена, которые
+    вернула база. Остальные элементы списка (например, ссылка на соседнюю
+    группу) остаются как есть. Плейсхолдер alldeploy в тексте запроса
+    заменяется меткой сервиса, поэтому один запрос работает для всех групп.
+    """
+    if not isinstance(block, dict):
+        return block, []
+
+    # sql на уровне блока: заменяет весь список outbounds.
+    spec = block.get("sql")
+    if isinstance(spec, str):
+        if tag:
+            spec = _substitute(spec, tag)
+        lines = _sql_lines(db_path, spec)
+        out = {k: v for k, v in block.items() if k not in ("sql", "filter")}
+        out["outbounds"] = [_tag_of(n) for n in lines]
+        return out, lines
+
+    items = block.get("outbounds")
+    if not isinstance(items, list):
+        return block, []
+
+    replaced = False
+    expanded: list[Any] = []
+    collected: list[str] = []
+    for item in items:
+        query = None
+        if isinstance(item, dict) and isinstance(item.get("sql"), str):
+            query = item["sql"]
+        if query is None:
+            expanded.append(item)
+            continue
+        if tag:
+            query = _substitute(query, tag)
+        lines = _sql_lines(db_path, query)
+        collected.extend(lines)
+        expanded.extend(_tag_of(n) for n in lines)
+        replaced = True
+
+    if not replaced:
+        return block, []
+    out = {k: v for k, v in block.items() if k != "sql"}
+    out["outbounds"] = expanded
+    out.pop("filter", None)
+    return out, collected
+
+
 def _outbound_tags(rule: dict) -> list[str]:
     out = rule.get("outbound")
     if isinstance(out, str):
@@ -262,9 +405,54 @@ def _set_outbound(rule: dict, value: str) -> None:
 # Развёртывание
 # --------------------------------------------------------------------------
 
+_NODE_TYPES = ("selector", "urltest", "direct", "block", "dns")
+
+
+def _prune_unreferenced_nodes(config: dict) -> list[str]:
+    """Удаляет узлы-прокси, на которые никто не ссылается.
+
+    Группы и служебные outbounds остаются всегда: клиент должен видеть,
+    что группа собралась пустой. Возвращает теги удалённых узлов.
+    """
+    outbounds = config.get("outbounds") or []
+    referenced: set[str] = set()
+
+    route = config.get("route") or {}
+    for rule in route.get("rules") or []:
+        if isinstance(rule, dict):
+            referenced.update(_outbound_tags(rule))
+    final = route.get("final")
+    if isinstance(final, str):
+        referenced.add(final)
+    for ob in outbounds:
+        if isinstance(ob, dict) and ob.get("type") in ("selector", "urltest"):
+            for t in ob.get("outbounds") or []:
+                if isinstance(t, str):
+                    referenced.add(t)
+
+    kept: list[Any] = []
+    pruned: list[str] = []
+    for ob in outbounds:
+        if not isinstance(ob, dict):
+            kept.append(ob)
+            continue
+        tag = ob.get("tag")
+        otype = ob.get("type")
+        if otype in _NODE_TYPES or not tag:
+            kept.append(ob)
+            continue
+        if tag in referenced:
+            kept.append(ob)
+        else:
+            pruned.append(str(tag))
+    config["outbounds"] = kept
+    return pruned
+
+
 def expand_alldeploy(template: dict, targets: list[dict],
                      extra_tags: list[str] | None = None,
-                     fallback: str = "proxy") -> tuple[dict, dict]:
+                     fallback: str = "proxy",
+                     db_path: str | Path | None = None) -> tuple[dict, dict]:
     """Разворачивает служебный ключ alldeploy на метки сервисов.
 
     Возвращает (config, report).
@@ -284,6 +472,7 @@ def expand_alldeploy(template: dict, targets: list[dict],
     new_outbounds: list[Any] = []
     expanded: list[str] = []
     missing: list[str] = []
+    sql_lines: list[str] = []
 
     for ob in outbounds:
         if not _is_key(ob):
@@ -309,9 +498,14 @@ def expand_alldeploy(template: dict, targets: list[dict],
                 # остался бы плейсхолдером, и sing-box не поднялся бы.
                 missing.append(tag)
                 continue
+            # SQL-блок в шаблоне заменяет filter: запрос выполняется под
+            # каждую метку сервиса (alldeploy в тексте заменяется на неё),
+            # а возвращённые имена идут в filter как ключевые слова.
             for block in ob.get("blocks") or []:
                 if not isinstance(block, dict):
                     continue
+                block, lines = _apply_sql_block(block, db_path, tag)
+                sql_lines.extend(lines)
                 new_outbounds.append(_expand_block(block, tag, url))
             expanded.append(tag)
 
@@ -354,8 +548,15 @@ def expand_alldeploy(template: dict, targets: list[dict],
         repointed.append({"from": final, "to": fallback})
     config["route"] = route
 
+    # После замены sql-элементов в outbounds часть узлов могла остаться
+    # без ссылок: ни одно правило и ни одна группа на них не указывает.
+    pruned = _prune_unreferenced_nodes(config)
+
     return config, {
         "expanded": sorted(set(expanded)),
         "missing": sorted(set(missing)),
         "repointed": repointed,
+        "pruned": pruned,
+        # Строки, выбранные SQL: из них строятся узлы конфига.
+        "lines": list(dict.fromkeys(sql_lines)),
     }

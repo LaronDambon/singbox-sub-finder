@@ -18,8 +18,12 @@
                                          └──────────────┘
 
 Поиск и проверка идут ОДНОВРЕМЕННО: как только база пополнилась новыми
-серверами, воркеры уже берут их в работу. Ждут завершения оба, потом запускается
-экспорт.
+серверами, воркеры уже берут их в работу.
+
+Экспорт и деплой НЕ останавливают проверку. Пока очередь проверки не
+опустела, публикация идёт параллельно по таймеру (publisher_interval) и
+берёт то, что уже найдено. Проверка 200 тысяч серверов не должна
+обрываться на середине из-за того, что пришло время выложить конфиг.
 
 Использование:
 
@@ -35,6 +39,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -170,15 +175,41 @@ class Pipeline:
                     if not self.report.get("error"):
                         self.report["error"] = payload.get("error")
 
-            if check_task is not None:
-                await self._drain()
-                self.check_stage.request_stop()
-                self.report["check"] = await check_task
-            else:
-                self.check_stage.request_stop()
-                self.report["check"] = {"skipped": True}
+            # --- проверка + параллельная публикация --------------------------
+            #
+            # Публикация (и деплой внутри неё) идёт ОТДЕЛЬНОЙ задачей и не
+            # останавливает проверку. Раньше здесь стоял _drain() с часовым
+            # лимитом: на очереди в 200 тысяч серверов он истекал, проверка
+            # глушилась, и деплой уезжал с тем, что успели проверить.
+            # Теперь деплой берёт снимок базы и проверка продолжается.
+            publish_task: asyncio.Task | None = None
+            if export:
+                publish_task = asyncio.create_task(
+                    self._publish_loop(), name="pipeline.publish",
+                )
 
-            # --- экспорт ----------------------------------------------------
+            try:
+                if check_task is not None:
+                    drained = await self._drain()
+                    if not drained:
+                        LOGGER.warning(
+                            "Проверка остановлена по лимиту drain_timeout; "
+                            "непроверенные серверы останутся в очереди"
+                        )
+                    self.check_stage.request_stop()
+                    self.report["check"] = await check_task
+                else:
+                    self.check_stage.request_stop()
+                    self.report["check"] = {"skipped": True}
+            finally:
+                if publish_task is not None:
+                    publish_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await publish_task
+
+            # --- финальный экспорт -------------------------------------------
+            # Последний проход уже ПОСЛЕ проверки: в нём попадают результаты,
+            # которых не было ни в одной публикации по таймеру.
             if export:
                 self.report["export"] = await self.export_stage.run(self.db)
             else:
@@ -248,17 +279,70 @@ class Pipeline:
         LOGGER.info("В очередь добавлено серверов из пула базы: %d", added)
         return {"ok": True, "from_pool": added}
 
-    async def _drain(self, *, timeout: float = 3600.0) -> None:
-        """Ждёт, пока очередь опустеет (производители уже закончили)."""
-        deadline = time.monotonic() + timeout
-        idle = 0.0
-        while time.monotonic() < deadline:
+    async def _publish_loop(self) -> None:
+        """Публикует результаты по таймеру, НЕ останавливая проверку.
+
+        Пока очередь проверки не опустела, деплой и выгрузка идут отдельной
+        задачей: каждый проход берёт текущий снимок базы. Останавливается
+        только отменой задачи из run().
+        """
+        try:
+            interval = float(get_settings().services.publisher_interval or 1800)
+        except (TypeError, ValueError):
+            interval = 1800.0
+        interval = max(60.0, interval)
+        LOGGER.info("Публикация параллельно проверке: каждые %.0f с", interval)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                report = await self.export_stage.run(self.db)
+                self.report["publish"] = report
+                LOGGER.info(
+                    "Публикация по таймеру: whitelist %d, исключено %d, деплой %s",
+                    report.get("whitelist", 0), report.get("purged", 0),
+                    "выполнен" if report.get("deploy") else "нет",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — публикация не должна ронять проверку
+                LOGGER.exception("Публикация по таймеру не удалась — проверка продолжается")
+
+    async def _drain(self, *, timeout: float | None = None) -> bool:
+        """Ждёт, пока очередь опустеет (производители уже закончили).
+
+        Возвращает True, если очередь опустела, и False, если сработал
+        лимит ожидания.
+
+        По умолчанию лимита НЕТ: проверка двухсот тысяч серверов занимает
+        часы, и обрывать её по часам нельзя — именно из-за этого деплой
+        уезжал с половиной данных, а остальные серверы так и оставались
+        непроверенными. Лимит включается только явно через
+        pipeline.drain_timeout (секунды, 0 = без лимита).
+        """
+        limit = timeout
+        if limit is None:
+            try:
+                limit = float(self.ctx.setting("drain_timeout", 0) or 0)
+            except (TypeError, ValueError):
+                limit = 0.0
+        deadline = time.monotonic() + limit if limit and limit > 0 else None
+        last_log = time.monotonic()
+        while True:
             queue = await self.db.queue_stats()
             if queue.pending == 0 and queue.in_progress == 0:
-                return
-            idle = 0.0 if queue.pending else idle + 0.5
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            # Раз в 5 минут напоминаем, сколько осталось: очередь в 200 тысяч
+            # серверов идёт часами, и молчание в логе выглядит как зависание.
+            now = time.monotonic()
+            if now - last_log >= 300.0:
+                last_log = now
+                LOGGER.info(
+                    "Ожидание проверки: в очереди %d, в работе %d",
+                    queue.pending, queue.in_progress,
+                )
             await asyncio.sleep(0.5)
-        LOGGER.warning("Очередь не опустела за %.0fs — проверка прервана", timeout)
 
     def _log_summary(self) -> None:
         report = self.report or {}

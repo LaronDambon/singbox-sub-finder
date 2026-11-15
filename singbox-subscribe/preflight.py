@@ -451,261 +451,136 @@ def check_env_file() -> Check:
     return Check("env_file", "Файл .env (секреты)", OK, str(path))
 
 
-def check_deploy_mode(settings) -> Check:
-    """Выбран ли хоть один способ публикации, когда деплой включён.
+def _deploy_blocks(settings) -> list:
+    """Список блоков деплоя из config.yaml (пустой — деплой выключен)."""
+    raw = _read(settings, "deploy.blocks", None)
+    if isinstance(raw, list):
+        return [b for b in raw if isinstance(b, dict)]
+    return []
 
-    Самая частая ошибка настройки: deploy.enabled: true, а ни local, ни repo
-    не заданы. Деплой тогда молча ничего не делает — конвейер отрабатывает,
-    файла нет, и непонятно, почему. Проверка называет это прямо.
-    """
+
+def _block_token(block: dict, key: str = "token") -> str:
+    """Токен из блока: литерал или env:VAR."""
+    value = block.get(key)
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text.startswith("env:"):
+        rest = text[4:]
+        name, _, fallback = rest.partition(":")
+        import os as _os
+        return str(_os.environ.get(name) or fallback or "")
+    return text
+
+
+def check_deploy_mode(settings) -> Check:
+    """Выбран ли хоть один способ публикации, когда деплой включён."""
     if settings is None:
         return Check("deploy_mode", "Способ публикации", WARN, "конфиг не прочитан")
-    if not bool(_read(settings, "deploy.enabled", False)):
+    blocks = _deploy_blocks(settings)
+    if not blocks:
         return Check("deploy_mode", "Способ публикации", OK,
-                     "деплой выключен (deploy.enabled: false)")
-    local = bool(_read(settings, "deploy.local", False))
-    repo = str(_read(settings, "deploy.repo", "") or "").strip()
-    if not local and not repo:
-        return Check(
-            "deploy_mode", "Способ публикации", FAIL,
-            "деплой включён, но не выбран ни один способ",
-            fix="Выберите, куда публиковать собранный конфиг:\n"
-                "  deploy:\n"
-                "    enabled: true\n"
-                "    local: true              # писать файл на диск этой машины"
-                "  (токены не нужны)\n"
-                "    repo: owner/repo         # и/или пушить в GitHub\n\n"
-                "Можно включить оба сразу: конфиг соберётся один раз и уйдёт\n"
-                "и на диск, и в репозиторий.",
-            disable="в config.yaml: deploy.enabled: false",
-        )
-    what = []
-    if local:
-        what.append("локально в %s" % _read(settings, "deploy.local_path", ""))
-    if repo:
-        what.append("в GitHub %s" % repo)
-    return Check("deploy_mode", "Способ публикации", OK, " + ".join(what))
+                     "деплой выключен (deploy.blocks пуст)")
+    kinds = []
+    for b in blocks:
+        t = str(b.get("type") or "").strip().lower()
+        if t == "github":
+            kinds.append("github " + str(b.get("repo") or "?"))
+        elif t == "local":
+            kinds.append("local " + str(b.get("path") or "?"))
+        else:
+            kinds.append("неизвестный тип " + t)
+    return Check("deploy_mode", "Способ публикации", OK, "; ".join(kinds))
 
 
 def check_github_deploy(settings) -> Check:
-    """Деплой в GitHub: включён ли и есть ли токен на запись.
-
-    Проверка нужна потому, что провал деплоя НЕ роняет конвейер (см.
-    ExportStage._deploy: ошибки не поднимаются). Без этой проверки о
-    отсутствующем токене узнают по отсутствию файла в репозитории.
-    """
+    """Деплой в GitHub: есть ли токен на запись."""
     if settings is None:
-        return Check("github_deploy", "Деплой в GitHub", WARN, "конфиг не прочитан",
-                     fix="Сначала починьте config.yaml (см. выше).")
-    enabled = bool(_read(settings, "deploy.enabled", False))
-    token = _read(settings, "secrets.gh_deploy_token", "")
-    repo = str(_read(settings, "deploy.repo", "") or "").strip()
-    if not enabled:
-        return Check(
-            "github_deploy", "Деплой в GitHub", OK,
-            "выключен (deploy.enabled: false)",
-        )
-    if not repo:
-        # Пустой repo при выключенном локальном деплое — это ошибка
-        # (её называет check_deploy_mode), а при включённом — норма: значит
-        # публикуем только на диск, и токен не нужен вовсе.
-        if bool(_read(settings, "deploy.local", False)):
-            return Check(
-                "github_deploy", "Деплой в GitHub", OK,
-                "не используется (deploy.repo пуст, публикация локальная)",
-            )
-        return Check(
-            "github_deploy", "Деплой в GitHub", FAIL, "не указан репозиторий",
-            fix="Укажите, куда публиковать конфиг:\n"
-                "  deploy:\n    repo: пользователь/репозиторий\n\n"
-                "Либо перейдите на локальный деплой — он не требует ни\n"
-                "репозитория, ни токенов:\n"
-                "  deploy:\n    local: true",
-            disable="в config.yaml: deploy.enabled: false",
-        )
-    # Токен может лежать и в .env (обычный путь), и прийти значением из
-    # конфига/переопределения — поэтому проверяем оба места, а не только
-    # то, что успело доехать до Settings.
-    if not (_seen("GH_DEPLOY_TOKEN") or _seen_env_or_value(token)):
+        return Check("github_deploy", "Деплой в GitHub", WARN, "конфиг не прочитан")
+    blocks = [b for b in _deploy_blocks(settings) if str(b.get("type") or "").lower() == "github"]
+    if not blocks:
+        return Check("github_deploy", "Деплой в GitHub", OK, "github-блоков нет")
+    missing = []
+    for b in blocks:
+        token = _block_token(b, "token") or _block_token(b, "token_env")
+        if not token and not _seen("GH_DEPLOY_TOKEN"):
+            missing.append(str(b.get("name") or b.get("repo") or "?"))
+    if missing:
         return Check(
             "github_deploy", "Деплой в GitHub", FAIL,
-            "включён, но токена на запись нет",
-            fix="Создайте токен GitHub с правом Contents: read and write и "
-                "положите его в .env корня репозитория:\n"
-                "  GH_DEPLOY_TOKEN=ghp_...\n"
-                "Он нужен только для публикации конфига, читать репозитории "
-                "может отдельный GH_READ_TOKEN.",
-            disable="в config.yaml: deploy.enabled: false",
+            "нет токена на запись: " + ", ".join(missing),
+            fix="Положите токен в .env или укажите token: env:GH_DEPLOY_TOKEN",
+            disable="уберите github-блок из deploy",
         )
     return Check("github_deploy", "Деплой в GitHub", OK,
-                 "включён, репозиторий %s, токен %s" % (repo, _mask(token)))
-
-
-def _dir_owner_hint(path) -> str:
-    """Чей это каталог — одной строкой. Пусто, если выяснить не удалось.
-
-    Нужно ровно затем, чтобы «Permission denied» не заставлял гадать: почти
-    всегда каталог принадлежит root после запуска через sudo, и человеку
-    достаточно увидеть это словом, а не догадываться по коду ошибки.
-    """
-    try:
-        import pwd  # только POSIX: на Windows модуля нет
-    except ImportError:
-        return ""
-    try:
-        stat = path.stat()
-        owner = pwd.getpwuid(stat.st_uid).pw_name
-        current = pwd.getpwuid(os.getuid()).pw_name
-    except Exception:  # noqa: BLE001 — подсказка не стоит падения проверки
-        return ""
-    if owner == current:
-        return ""
-    return " Каталог принадлежит пользователю %s, а вы — %s." % (owner, current)
+                 "github-блоков %d, токен задан" % len(blocks))
 
 
 def check_local_deploy(settings) -> Check:
-    """Локальный деплой: можно ли записать файл туда, куда указано.
-
-    Локальному деплою НЕ нужны ни репозиторий, ни токены — только каталог с
-    правом записи. Проверяем каталог заранее: иначе конфиг молча не
-    появится, а причина выяснится по пустой папке.
-    """
+    """Локальный деплой: можно ли записать файл туда, куда указано."""
     if settings is None:
         return Check("local_deploy", "Локальный деплой", WARN, "конфиг не прочитан")
-    if not bool(_read(settings, "deploy.enabled", False)):
-        return Check("local_deploy", "Локальный деплой", OK,
-                     "деплой выключен (deploy.enabled: false)")
-    if not bool(_read(settings, "deploy.local", False)):
-        return Check("local_deploy", "Локальный деплой", OK,
-                     "выключен (deploy.local: false)")
-    raw = str(_read(settings, "deploy.local_path", "") or "")
-    if not raw:
-        return Check(
-            "local_deploy", "Локальный деплой", FAIL, "не задан каталог",
-            fix="Укажите, куда писать конфиг:\n"
-                "  deploy:\n    local_path: singbox-subscribe/output",
-        )
-    target = Path(raw)
-    if not target.is_absolute():
-        # В config.yaml пути пишутся относительно корня репозитория.
-        target = PROJECT_ROOT / target
-    try:
-        target.mkdir(parents=True, exist_ok=True)
-        probe = target / ".write_probe"
-        probe.write_text("", encoding="utf-8")
-        probe.unlink()
-    except Exception as exc:  # noqa: BLE001
-        owner = _dir_owner_hint(target)
-        return Check(
-            "local_deploy", "Локальный деплой", FAIL,
-            "нет доступа на запись: %s" % exc,
-            fix="Каталог существует, но принадлежит не тому пользователю, "
-                "от которого вы запускаете программу.%s\n\n"
-                "Самый частый случай: репозиторий когда-то клонировали или "
-                "запускали через sudo — тогда каталоги принадлежат root, а "
-                "обычный пользователь писать в них не может. Убедиться:\n"
-                "  ls -ld %s\n\n"
-                "Вернуть себе владение (Linux/macOS):\n"
-                "  sudo chown -R $USER:$USER %s\n\n"
-                "Если это не подходит — укажите другой каталог:\n"
-                "  deploy:\n    local_path: /путь/куда/есть/доступ"
-                % (owner, target, target.parent),
-            disable="в config.yaml: deploy.local: false",
-        )
-    return Check("local_deploy", "Локальный деплой", OK, "пишет в %s" % target)
+    blocks = [b for b in _deploy_blocks(settings) if str(b.get("type") or "").lower() == "local"]
+    if not blocks:
+        return Check("local_deploy", "Локальный деплой", OK, "local-блоков нет")
+    for b in blocks:
+        raw = str(b.get("path") or "")
+        if not raw:
+            return Check("local_deploy", "Локальный деплой", FAIL,
+                         "не задан каталог", fix="Укажите path: output")
+        target = Path(raw)
+        if not target.is_absolute():
+            target = PROJECT_ROOT / target
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            probe = target / ".write_probe"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+        except Exception as exc:  # noqa: BLE001
+            return Check("local_deploy", "Локальный деплой", FAIL,
+                         "нет доступа на запись: %s" % exc,
+                         fix="Укажите другой каталог в path: /путь/куда/есть/доступ")
+    return Check("local_deploy", "Локальный деплой", OK,
+                 "local-блоков %d, запись разрешена" % len(blocks))
 
 
 def check_ip_source(settings) -> Check:
-    """Источник IP нужен ТОЛЬКО если шаблон содержит плейсхолдер.
-
-    Подстановка идёт лишь при наличии плейсхолдера в шаблоне (см.
-    deploy_config._apply_server_ip): нет плейсхолдера — источник не читается
-    вовсе. Поэтому пустой ip_source сам по себе не ошибка, и требовать его
-    «на всякий случай» значило бы придираться к рабочей настройке.
-    """
+    """Источник IP нужен ТОЛЬКО если шаблон содержит плейсхолдер."""
     if settings is None:
         return Check("ip_source", "Источник IP для шаблона", WARN, "конфиг не прочитан")
-    if not bool(_read(settings, "deploy.enabled", False)):
-        return Check("ip_source", "Источник IP для шаблона", OK,
-                     "деплой выключен")
-    ph = str(_read(settings, "deploy.ip_placeholder", "") or "").strip()
-    if not ph:
-        return Check("ip_source", "Источник IP для шаблона", OK,
-                     "плейсхолдер не задан — подстановки нет")
-    # Какие шаблоны будут собираться.
-    templates = _configured_templates(settings)
-    used_in = []
-    try:
-        for name in templates:
-            path = PROJECT_ROOT / "config" / "templates" / name
-            if path.exists() and ph in path.read_text(encoding="utf-8", errors="replace"):
-                used_in.append(name)
-    except Exception:  # noqa: BLE001 — не смогли прочитать = считаем, что нет
-        pass
-    src = str(_read(settings, "deploy.ip_source", "") or "").strip()
-    if not used_in:
-        return Check(
-            "ip_source", "Источник IP для шаблона", OK,
-            "в шаблонах нет %s — источник не нужен" % ph,
-        )
-    if not src:
-        return Check(
-            "ip_source", "Источник IP для шаблона", FAIL,
-            "шаблон(ы) %s содержат %s, а источник не задан"
-            % (", ".join(used_in), ph),
-            fix="Плейсхолдер %s есть в шаблоне, значит адрес надо откуда-то\n"
-                "взять. Укажите файл или http(s)-ссылку:\n"
-                "  deploy:\n"
-                "    ip_source: /path/to/current_ip.txt\n\n"
-                "Источник — первая непустая строка файла или тело ответа."
-                % ph,
-            disable="уберите %s из шаблона (тогда адрес берётся как есть)" % ph,
-        )
-    # Источник задан — проверим, что он читается.
-    try:
-        if src.lower().startswith(("http://", "https://")):
-            info = "ссылка (проверяется в момент деплоя)"
-        else:
+    blocks = _deploy_blocks(settings)
+    if not blocks:
+        return Check("ip_source", "Источник IP для шаблона", OK, "деплой выключен")
+    for b in blocks:
+        ph = str(b.get("ip_placeholder") or "").strip()
+        if not ph:
+            continue
+        src = str(b.get("ip_source") or "").strip()
+        if not src:
+            return Check("ip_source", "Источник IP для шаблона", FAIL,
+                         "шаблон содержит %s, а источник не задан" % ph,
+                         fix="Укажите ip_source: /path/to/current_ip.txt")
+        if not src.lower().startswith(("http://", "https://")):
             p = Path(src)
             if not p.is_absolute():
                 p = PROJECT_ROOT / p
             if not p.exists():
-                return Check(
-                    "ip_source", "Источник IP для шаблона", FAIL,
-                    "файл не найден: %s" % p,
-                    fix="Проверьте deploy.ip_source в config.yaml: файла нет "
-                        "по указанному пути.",
-                )
-            first = ""
-            for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
-                if line.strip():
-                    first = line.strip()
-                    break
-            if not first:
-                return Check(
-                    "ip_source", "Источник IP для шаблона", FAIL,
-                    "файл пуст: %s" % p,
-                    fix="В файле должна быть первая непустая строка с адресом.",
-                )
-            info = "файл %s -> %s" % (p, first)
-    except Exception as exc:  # noqa: BLE001
-        return Check("ip_source", "Источник IP для шаблона", FAIL,
-                     "не удалось прочитать: %s" % exc)
-    return Check("ip_source", "Источник IP для шаблона", OK,
-                 "нужен для %s; %s" % (", ".join(used_in), info))
+                return Check("ip_source", "Источник IP для шаблона", FAIL,
+                             "файл не найден: %s" % p)
+    return Check("ip_source", "Источник IP для шаблона", OK, "источник задан")
 
 
 def _configured_templates(settings) -> list:
-    """Какие шаблоны будут собираться: deploy.templates, иначе deploy.template."""
-    raw = _read(settings, "deploy.templates", None)
-    if isinstance(raw, (list, tuple, set)):
-        items = [str(x).strip() for x in raw if str(x).strip()]
-    else:
-        items = [x for x in str(raw or "").replace(",", " ").split() if x]
+    """Какие шаблоны будут собираться: из блоков deploy."""
+    items: list = []
+    for b in _deploy_blocks(settings):
+        raw = b.get("templates")
+        if isinstance(raw, (list, tuple, set)):
+            items.extend(str(x).strip() for x in raw if str(x).strip())
+        elif raw:
+            items.append(str(raw).strip())
     if not items:
-        one = str(_read(settings, "deploy.template", "") or "").strip()
-        items = [one] if one else []
-    # "all" разворачиваем в реальные имена файлов.
+        return []
     if any(i.lower() == "all" for i in items):
         try:
             folder = PROJECT_ROOT / "config" / "templates"
@@ -714,7 +589,6 @@ def _configured_templates(settings) -> list:
         except Exception:  # noqa: BLE001
             pass
     return items
-
 
 def _seen_env_or_value(value) -> bool:
     """Секрет задан: либо прямо в конфиге, либо взят из окружения.

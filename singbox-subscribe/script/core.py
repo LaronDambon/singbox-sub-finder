@@ -757,6 +757,66 @@ def validate_config_groups(config, *, strict: bool = True) -> list:
     return sorted(empty)
 
 
+#: Флаг страны в начале имени узла: одна или несколько пар региональных
+#: индикаторов ("🇺🇸", "🇩🇪"), иногда с пробелом между ними.
+_RI_LO = chr(0x1F1E6)
+_RI_HI = chr(0x1F1FF)
+_FLAG_RE = re.compile("^([" + _RI_LO + "-" + _RI_HI + "]{2}"
+                      "(?:" + chr(92) + "s*[" + _RI_LO + "-" + _RI_HI + "]{2})*)")
+
+
+def _flag_of(name: str) -> str:
+    """Флаг страны из начала имени узла ('' если его нет)."""
+    m = _FLAG_RE.match(str(name or "").strip())
+    return m.group(1).strip() if m else ""
+
+
+#: Длина хвоста хэша в теге. 10 hex = 40 бит: для пула в десятки тысяч
+#: серверов вероятность совпадения у двух РАЗНЫХ ключей исчезающе мала.
+TAG_HASH_LEN = 10
+
+
+def tag_for_node(node: dict, key: str, index: int = 0) -> str:
+    """Тег узла: "<флаг> <протокол> <хэш key>".
+
+    Хэш считается от нормализованного ключа сервера (normalize_proxy_key):
+      * одна и та же ссылка -> один и тот же тег, дубли схлопываются сами;
+      * два разных сервера с одинаковым именем из подписки -> разные теги;
+      * между прогонами тег не меняется: клиент, выбравший сервер по имени,
+        остаётся на том же сервере.
+
+    index — номер узла внутри одной ссылки (shadowtls отдаёт два узла из
+    одной строки); он входит в хэш, иначе два узла получили бы один тег.
+    """
+    import hashlib
+
+    seed = str(key or "") if not index else f"{key}#{index}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:TAG_HASH_LEN]
+    country = _flag_of(node.get("tag") or "")
+    proto = str(node.get("type") or "node").strip()
+    return " ".join(part for part in (country, proto, digest) if part)
+
+
+def tag_node(node: dict, key: str, index: int = 0) -> dict:
+    """Копия узла с тегом "<флаг> <протокол> <хэш key>"."""
+    copy = dict(node)
+    copy["tag"] = tag_for_node(copy, key, index)
+    return copy
+
+
+def apply_stable_tags(items) -> list:
+    """Проставляет узлам хэш-теги и возвращает копии.
+
+    items — список (node, key). Исходные словари не меняются.
+    """
+    out = []
+    for node, key in items:
+        copy = dict(node)
+        copy["tag"] = tag_for_node(copy, key)
+        out.append(copy)
+    return out
+
+
 def _unique_node_tags(nodes):
     """Присваивает узлам уникальные теги.
 
@@ -839,6 +899,35 @@ def build_singbox_config_from_nodes(base_template, nodes):
         tag = node.get("tag", f"node_{index}")
         if not any(ob.get("tag") == tag for ob in outbounds):
             outbounds.append(node)
+
+    # Убираем узлы, на которые никто не ссылается. Парсер отдаёт ВСЕ живые
+    # серверы, но если ни одна группа (и ни одно правило маршрута) на узел
+    # не ссылается, он только раздувает конфиг: клиент его не увидит.
+    referenced = set()
+    for ob in outbounds:
+        if not isinstance(ob, dict):
+            continue
+        for item in ob.get("outbounds") or []:
+            if isinstance(item, str):
+                referenced.add(item)
+    route = config.get("route") or {}
+    for rule in route.get("rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        out = rule.get("outbound")
+        if isinstance(out, str):
+            referenced.add(out)
+        elif isinstance(out, list):
+            referenced.update(x for x in out if isinstance(x, str))
+    final = route.get("final")
+    if isinstance(final, str):
+        referenced.add(final)
+    outbounds = [
+        ob for ob in outbounds
+        if not (isinstance(ob, dict)
+                and ob.get("type") not in ("direct", "block", "selector", "urltest")
+                and ob.get("tag") not in referenced)
+    ]
 
     # Порядок обязателен.
     #

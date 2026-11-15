@@ -68,6 +68,9 @@ def default_settings() -> Settings:
         max_attempts=get_settings().pipeline.max_attempts,
         max_retries=get_settings().pipeline.max_retries,
         queue_persist=get_settings().pipeline.queue_persist,
+        # Сколько ждать опустошения очереди перед остановкой проверки.
+        # 0 — ждать сколько нужно: деплой не должен обрывать проверку.
+        drain_timeout=get_settings().pipeline.drain_timeout,
         # поиск
         discovery=get_settings().pipeline.discovery,
         discovery_concurrency=get_settings().pipeline.discovery_concurrency,
@@ -77,11 +80,6 @@ def default_settings() -> Settings:
         # sing-box
         singbox_path=Path(get_settings().paths.sing_box_path),
         global_tag=get_settings().reach.global_tag,
-        # Уровни отбора лучших/резервных: их читает стадия экспорта, которая
-        # пишет whitelist.txt. Без проброса ctx.setting("best_top") вернул бы
-        # тихий 0, и файл вышел бы без меток.
-        best_top=get_settings().core.best_top,
-        best_reserve=get_settings().core.best_reserve,
     )
 
 

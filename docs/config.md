@@ -82,7 +82,8 @@ singbox-subs-finder/
   config/templates/*.json            шаблоны конфигурации для деплоя
   config/reachability_targets.json   цели проверки reachability
   source/servers.db                  центральная база
-  source/whitelist.txt, merge.txt    выгрузки
+  source/merge.txt                   пул проверки
+  output/whitelist.txt               выгрузка живых серверов
   source/downloaded/                 скачанные подписки
   logs/                              логи
   output/                            результат локального деплоя
@@ -105,28 +106,57 @@ singbox-subs-finder/
 
 ## Деплой
 
-Собранный конфиг можно никуда не публиковать (`deploy.enabled: false` по
-умолчанию), писать в файл на этой машине или пушить в GitHub:
+`deploy` — **список независимых блоков**. У каждого свои параметры, и они
+друг от друга не зависят:
 
 ```yaml
 deploy:
-  enabled: true
-  local: true                # писать файл на диск — токены не нужны
-  local_path: output
+  - type: github
+    name: main
+    repo: ваш-логин/ваш-репозиторий
+    branch: main
+    path: configs/latest/config.json   # путь файла внутри репозитория
+    token: env:GH_DEPLOY_TOKEN         # литерал или env:ИМЯ / env:ИМЯ:запасное
+    templates: sbc-1.14.json           # файл, папка или список
+    commit_msg: "обновление конфига"
 
-  # и/или в GitHub:
-  repo: ваш-логин/ваш-репозиторий
-  template: sbc-1.14.json    # шаблон из config/templates
-  path: config.json          # путь файла внутри репозитория
+  - type: local
+    name: local
+    path: output                       # папка; имя файла = имя шаблона
+    templates: sbc-1.14.json
+
+  - type: whitelist
+    name: whitelist
+    path: output/whitelist.txt
+    only_available: true
+    min_stable: 0
+    limit: 0
+    tags: false
 ```
 
-Можно включить оба способа сразу: конфиг соберётся один раз и уйдёт и на диск,
-и в репозиторий. Мульти-режим (`templates: [all]`) собирает по файлу на каждый
-шаблон из `config/templates/`.
+**Нет блока — нет деплоя.** Отдельного `enabled` нет, как нет и полей
+`source`, `create_repo`, `private`: источник серверов задаётся SQL-запросом
+внутри шаблона (см. [Фильтры](filters.md)).
 
-Репозиторий и источник IP по умолчанию пусты — это данные конкретной установки,
-осмысленного умолчания у них нет. Когда деплой включён, а они не заполнены,
-`preflight` скажет об этом прямо.
+Параметры `templates`:
+
+| Значение | Что берётся |
+|---|---|
+| `sbc-1.14.json` | один файл из `config/templates` |
+| `folder` | все `*.json` из папки |
+| `[a.json, b.json]` | перечисленные файлы |
+| `all` | все шаблоны из `config/templates` |
+
+Токены в `token`/`read_token` можно писать литералом или брать из окружения:
+`env:GH_DEPLOY_TOKEN` или `env:GH_DEPLOY_TOKEN:запасное-значение`.
+
+Блок `whitelist` — не конфиг, а выгрузка: живые серверы из базы построчно.
+Правило простое: `available=1`, `excluded=0`, `stable >= min_stable`.
+`tags: true` дописывает к строкам метки `[openrouter]` и подобные.
+
+Репозиторий и токен по умолчанию пусты — это данные конкретной установки.
+Когда блок `github` есть, а они не заполнены, `preflight` скажет об этом
+прямо.
 
 Ручной запуск деплоя:
 

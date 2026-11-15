@@ -650,11 +650,9 @@ class Database:
     async def purge_dead(self, below: int | None = None) -> int:
         return await self._write(self._store.purge_dead, below)
 
-    async def export_whitelist(self, path: str | Path, *, global_tag: str = "Global",
-                               best_top: int = 0, best_reserve: int = 0) -> int:
+    async def export_whitelist(self, path: str | Path, *, global_tag: str = "Global") -> int:
         return await self._run(
             self._store.export_whitelist_to_file, Path(path), global_tag=global_tag,
-            best_top=best_top, best_reserve=best_reserve,
         )
 
     @property

@@ -16,6 +16,7 @@ from functools import lru_cache
 
 from script.server_store import ServerStore
 from script import core as core_mod
+from script.downloader import normalize_proxy_key
 from pipeline.logging_setup import get_logger, setup_logging
 import service_template as _service_template
 
@@ -396,12 +397,15 @@ def _targets_file() -> Path:
     return PROJECT_ROOT / "config" / "reachability_targets.json"
 
 
-def _expand_alldeploy(template_data: dict) -> dict:
-    """Разворачивает блок alldeploy на метки из reachability_targets.json."""
+def _expand_alldeploy(template_data: dict, db_path=None) -> dict:
+    """Разворачивает блок alldeploy на метки из reachability_targets.json.
+
+    SQL-блоки внутри шаблона читают базу только на чтение (db_path).
+    """
     targets_path = _targets_file()
     if not targets_path.exists():
         LOGGER.warning("Файл целей не найден (%s): блок alldeploy не развёрнут", targets_path)
-        return template_data
+        return template_data, {"expanded": [], "lines": []}
 
     targets = _service_template.load_targets(targets_path)
     browser_tag = str(get_settings().setting(
@@ -409,7 +413,7 @@ def _expand_alldeploy(template_data: dict) -> dict:
     extra = [browser_tag] if browser_tag else []
 
     expanded, report = _service_template.expand_alldeploy(
-        template_data, targets, extra_tags=extra)
+        template_data, targets, extra_tags=extra, db_path=db_path)
 
     LOGGER.info("alldeploy развёрнут на %d меток: %s",
                 len(report["expanded"]), ", ".join(report["expanded"]))
@@ -419,23 +423,38 @@ def _expand_alldeploy(template_data: dict) -> dict:
     for repointed in report.get("repointed") or []:
         LOGGER.info("Правило маршрута перенаправлено: %s -> %s",
                     repointed["from"], repointed["to"])
-    return expanded
+    if report.get("lines"):
+        LOGGER.info("SQL выбрал серверов: %d", len(report["lines"]))
+    return expanded, report
 
 
-def build_config_from_uris(uris, template):
+def build_config_from_uris(uris, template, db_path=None):
     template_data = _load_template_from_payload(template)
     if not hasattr(core_mod, "providers") or core_mod.providers is None:
         core_mod.providers = {"exclude_protocol": "", "subscribes": []}
     if hasattr(core_mod, "init_parsers"):
         core_mod.init_parsers()
 
+    # Плейсхолдерный блок "alldeploy" разворачивается ПЕРВЫМ: SQL внутри
+    # шаблона решает, какие серверы войдут в каждую группу, и возвращает их
+    # строки. Из этих строк ниже строятся узлы — иначе группы ссылались бы
+    # на имена, которых в конфиге нет.
+    sql_lines: list[str] = []
+    if _service_template.has_alldeploy(template_data):
+        template_data, report = _expand_alldeploy(template_data, db_path=db_path)
+        sql_lines = list(report.get("lines") or [])
+
     nodes = []
     skipped: list[tuple[str, str]] = []
+    seen_uris: set[str] = set()
 
-    for raw_uri in uris:
+    for raw_uri in list(uris) + sql_lines:
         if not raw_uri or not str(raw_uri).strip():
             continue
         uri = str(raw_uri).strip()
+        if uri in seen_uris:
+            continue
+        seen_uris.add(uri)
         try:
             parsed_nodes = core_mod.get_nodes(uri)
         except Exception as exc:  # noqa: BLE001
@@ -446,9 +465,12 @@ def build_config_from_uris(uris, template):
             continue
         if not parsed_nodes:
             continue
-        for node in parsed_nodes:
+        key = normalize_proxy_key(uri)
+        for index, node in enumerate(parsed_nodes):
             if isinstance(node, dict):
-                nodes.append(node)
+                # Тег — "<флаг> <протокол> <хэш key>": тот же, что вернул
+                # SQL, поэтому имена групп и узлы совпадают.
+                nodes.append(core_mod.tag_node(node, key, index))
 
     if skipped:
         LOGGER.warning(
@@ -461,12 +483,6 @@ def build_config_from_uris(uris, template):
             "outbounds": [],
             "warning": "No valid nodes found for the provided uris",
         }
-
-    # Плейсхолдерный блок "alldeploy" разворачивается на каждую метку из
-    # config/reachability_targets.json и из browser_service.tag. Обычный
-    # конфиг без такого блока проходит мимо без изменений.
-    if _service_template.has_alldeploy(template_data):
-        template_data = _expand_alldeploy(template_data)
 
     config = core_mod.build_singbox_config_from_nodes(template_data, nodes)
     # Не строго: веб-выдача лишь показывает предупреждение, а деплой
@@ -514,8 +530,6 @@ def api_whitelist():
         store = _get_store()
         lines = store.export_whitelist_lines(
             global_tag=get_settings().reach.global_tag,
-            best_top=get_settings().core.best_top,
-            best_reserve=get_settings().core.best_reserve,
         )
         if lines:
             return "\n".join(lines), 200, {"Content-Type": "text/plain; charset=utf-8"}

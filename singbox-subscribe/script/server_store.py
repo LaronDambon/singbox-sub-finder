@@ -42,7 +42,7 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 from config.settings import get_settings
 from utils.tool import set_country_in_name
@@ -95,6 +95,44 @@ CREATE TABLE IF NOT EXISTS servers (
 );
 CREATE INDEX IF NOT EXISTS idx_servers_stable ON servers(stable);
 CREATE INDEX IF NOT EXISTS idx_servers_excluded ON servers(excluded);
+
+-- Теги сервера: одна строка на пару (тег, сервер).
+-- Сюда сведены обе прежние колонки:
+--   capabilities  -> строка с passed = 1 (цель пройдена);
+--   service_pings -> строка с ping_ms (замер) и passed = 0.
+-- PRIMARY KEY (tag, key) — это и есть индекс по тегу: поиск
+-- "все серверы с тегом X" идёт по B-дереву, без сканирования таблицы.
+CREATE TABLE IF NOT EXISTS server_tags (
+    tag      TEXT    NOT NULL,
+    key      TEXT    NOT NULL,
+    ping_ms  INTEGER,
+    passed   INTEGER NOT NULL DEFAULT 0,
+    -- Что описывает тег:
+    --   'service' — цель/сервис пройдена (openrouter, youtube, ...);
+    --   'geo'     — свойство сервера (isp-megafon, city-..., dc, res).
+    -- Отбор сервисов смотрит только на 'service', поэтому ISP-теги не
+    -- могут случайно попасть в группу.
+    kind     TEXT    NOT NULL DEFAULT 'service',
+    PRIMARY KEY (tag, key)
+);
+-- Обратный поиск: "все теги сервера X" (экспорт whitelist).
+CREATE INDEX IF NOT EXISTS idx_server_tags_key ON server_tags(key);
+
+-- Справочник автономных систем, который РАСШИРЯЕТСЯ САМ.
+-- Каждая проверка ip_info приносит от ip-api.com флаги hosting/mobile для
+-- конкретного IP. Они копятся здесь голосами по номеру AS: набралось
+-- достаточно наблюдений — провайдер получает устойчивый kind (dc/res/mobile),
+-- и дальше все его серверы классифицируются без единого запроса.
+CREATE TABLE IF NOT EXISTS asn_info (
+    asn         TEXT PRIMARY KEY,
+    name        TEXT NOT NULL DEFAULT '',
+    kind        TEXT NOT NULL DEFAULT '',
+    source      TEXT NOT NULL DEFAULT '',
+    seen_dc     INTEGER NOT NULL DEFAULT 0,
+    seen_res    INTEGER NOT NULL DEFAULT 0,
+    seen_mobile INTEGER NOT NULL DEFAULT 0,
+    updated_at  TEXT NOT NULL DEFAULT ''
+);
 """
 
 UPSERT_RESULT_SQL = """
@@ -305,6 +343,8 @@ class ServerStore:
         self._maybe_migrate_shield()
         self._maybe_migrate_legacy()
         self._maybe_migrate_gemini_tags()
+        self._maybe_migrate_tags()
+        self._ensure_tag_kind_column()
 
     # ------------------------------------------------------------------ util
     def _connect(self) -> sqlite3.Connection:
@@ -489,6 +529,281 @@ class ServerStore:
             )
             return cur.rowcount or 0
 
+    # ------------------------------------------------------- теги сервера
+    @staticmethod
+    def _parse_pings(raw) -> dict[str, int]:
+        """service_pings (JSON-строка или словарь) -> {тег: мс}."""
+        if isinstance(raw, dict):
+            data = raw
+        elif isinstance(raw, str) and raw.strip():
+            try:
+                data = json.loads(raw)
+            except (TypeError, ValueError):
+                return {}
+        else:
+            return {}
+        out: dict[str, int] = {}
+        if not isinstance(data, dict):
+            return out
+        for name, value in data.items():
+            ms = _as_float(value)
+            if ms is not None and ms >= 0:
+                out[str(name).strip()] = int(round(ms))
+        return out
+
+    def _write_tags(
+        self,
+        conn: sqlite3.Connection,
+        key: str,
+        *,
+        passed: Iterable[str] = (),
+        pings: Mapping[str, int] | None = None,
+        reset: bool = False,
+        kind: str = "service",
+    ) -> None:
+        """Пишет теги сервера в server_tags.
+
+        reset=True — проход начинается заново: строки сервера удаляются,
+        дальше пишется только то, что пришло сейчас. Именно это заменяет
+        прежнюю «метку прохода»: текущий проход — то, что лежит в таблице.
+
+        reset=False — дописывание: теги других чекеров того же прохода
+        сохраняются, свои добавляются/обновляются.
+        """
+        if reset:
+            # Сбрасываем только свой вид: новый проход сервисов не должен
+            # стирать ISP/город, которые считаются отдельно и надолго.
+            conn.execute(
+                "DELETE FROM server_tags WHERE key = ? AND kind = ?", (key, kind),
+            )
+
+        merged: dict[str, dict] = {}
+        for tag in passed:
+            name = str(tag or "").strip()
+            if name:
+                merged.setdefault(name, {})["passed"] = 1
+        for tag, ms in (pings or {}).items():
+            name = str(tag or "").strip()
+            if name:
+                merged.setdefault(name, {})["ping_ms"] = int(ms)
+
+        for tag, values in merged.items():
+            conn.execute(
+                """
+                INSERT INTO server_tags (tag, key, ping_ms, passed, kind)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(tag, key) DO UPDATE SET
+                    ping_ms = COALESCE(excluded.ping_ms, server_tags.ping_ms),
+                    passed  = MAX(server_tags.passed, excluded.passed),
+                    kind    = excluded.kind
+                """,
+                (tag, key, values.get("ping_ms"), values.get("passed", 0), kind),
+            )
+
+    def tags_for_key(self, key: str) -> list[dict]:
+        """Все теги одного сервера: [{tag, ping_ms, passed}]."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT tag, ping_ms, passed, kind FROM server_tags "
+                "WHERE key = ? ORDER BY kind, tag",
+                (key,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def select_by_tag(
+        self,
+        tag: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        passed_only: bool = True,
+        only_available: bool = False,
+    ) -> list[str]:
+        """Строки серверов с тегом, отсортированные по задержке до цели.
+
+        Это замена best/reserve: «лучшие» — первые N строк, «резерв» —
+        следующие M (limit + offset). Сортировка по ping_ms: сервер без
+        замера уходит в конец.
+        """
+        query = (
+            "SELECT s.line FROM servers s "
+            "JOIN server_tags t ON t.key = s.key "
+            "WHERE t.tag = ? AND s.line != '' AND s.excluded = 0"
+        )
+        params: list[object] = [tag]
+        if passed_only:
+            query += " AND t.passed = 1"
+        if only_available:
+            query += " AND s.available = 1"
+        query += " ORDER BY t.ping_ms IS NULL, t.ping_ms ASC, s.stable DESC, s.key ASC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+            if offset:
+                query += " OFFSET ?"
+                params.append(int(offset))
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [str(r["line"]) for r in rows]
+
+    def _ensure_tag_kind_column(self) -> None:
+        """Добавляет колонку kind в старую server_tags (без неё база старая)."""
+        with self._connect() as conn:
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(server_tags)")}
+            if "kind" not in cols:
+                conn.execute(
+                    "ALTER TABLE server_tags ADD COLUMN kind TEXT NOT NULL DEFAULT 'service'"
+                )
+
+    def _maybe_migrate_tags(self) -> None:
+        """Переносит capabilities + service_pings в server_tags (один раз).
+
+        Пока таблица пуста, а старые колонки — нет, раскладываем их по
+        строкам. Повторный запуск ничего не делает: теги уже на месте.
+        """
+        with self._connect() as conn:
+            if conn.execute("SELECT 1 FROM server_tags LIMIT 1").fetchone():
+                return
+            rows = conn.execute(
+                "SELECT key, capabilities, service_pings FROM servers "
+                "WHERE capabilities != '' OR service_pings != ''"
+            ).fetchall()
+            for row in rows:
+                self._write_tags(
+                    conn,
+                    row["key"],
+                    passed=_split_tags(row["capabilities"] or ""),
+                    pings=self._parse_pings(row["service_pings"] or ""),
+                    reset=True,
+                )
+
+    # ------------------------------------------------- справочник ASN
+    def asn_known(self) -> dict[str, dict]:
+        """Все известные ASN: {номер: {name, kind, source}}."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT asn, name, kind, source FROM asn_info"
+            ).fetchall()
+        return {
+            str(r["asn"]): {
+                "name": r["name"] or "",
+                "kind": r["kind"] or "",
+                "source": r["source"] or "",
+            }
+            for r in rows
+        }
+
+    def asn_kind(self, asn: str) -> str:
+        """Устойчивый kind провайдера ('dc'/'res'/'mobile') или ''."""
+        key = str(asn or "").strip()
+        if not key:
+            return ""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT kind FROM asn_info WHERE asn = ?", (key,)
+            ).fetchone()
+        return (row["kind"] if row else "") or ""
+
+    def asn_set(self, asn: str, *, name: str = "", kind: str = "",
+                source: str = "peeringdb") -> None:
+        """Записывает готовый вердикт по ASN (из внешнего справочника)."""
+        key = str(asn or "").strip()
+        if not key:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO asn_info (asn, name, kind, source, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(asn) DO UPDATE SET
+                    name = CASE WHEN excluded.name <> '' THEN excluded.name
+                                ELSE asn_info.name END,
+                    kind = CASE WHEN excluded.kind <> '' THEN excluded.kind
+                                ELSE asn_info.kind END,
+                    source = CASE WHEN excluded.kind <> '' THEN excluded.source
+                                  ELSE asn_info.source END,
+                    updated_at = excluded.updated_at
+                """,
+                (key, str(name or ""), str(kind or ""), str(source or ""), _now()),
+            )
+
+    def asn_observe(self, rows: Sequence[dict],
+                    *, min_votes: int = 3, ratio: float = 0.8) -> int:
+        """Копит наблюдения по ASN и выводит kind, когда их достаточно.
+
+        row: {asn, name, hosting: bool, mobile: bool, known: bool}.
+        known=False (ipinfo/ip.sb) — источник про hosting не знает, голос не
+        засчитывается: иначе "не знаю" превратилось бы в "домашний".
+
+        Возвращает число ASN, у которых вердикт поменялся.
+        """
+        if not rows:
+            return 0
+        min_votes = max(1, int(min_votes))
+        ratio = min(0.99, max(0.5, float(ratio)))
+        changed = 0
+        now = _now()
+        with self._connect() as conn:
+            for row in rows:
+                asn = str(row.get("asn") or "").strip()
+                if not asn.isdigit():
+                    continue
+                name = str(row.get("name") or "").strip()
+                hosting = bool(row.get("hosting"))
+                mobile = bool(row.get("mobile"))
+                known = bool(row.get("known"))
+                if not known:
+                    # Источник не умеет про hosting — только имя запомним.
+                    if name:
+                        conn.execute(
+                            "UPDATE asn_info SET name = ? WHERE asn = ? AND name = ''",
+                            (name, asn),
+                        )
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO asn_info
+                        (asn, name, seen_dc, seen_res, seen_mobile, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(asn) DO UPDATE SET
+                        name = CASE WHEN excluded.name <> '' THEN excluded.name
+                                    ELSE asn_info.name END,
+                        seen_dc = asn_info.seen_dc + excluded.seen_dc,
+                        seen_res = asn_info.seen_res + excluded.seen_res,
+                        seen_mobile = asn_info.seen_mobile + excluded.seen_mobile,
+                        updated_at = excluded.updated_at
+                    """,
+                    (asn, name, 1 if hosting else 0, 0 if hosting else 1,
+                     1 if mobile else 0, now),
+                )
+                state = conn.execute(
+                    "SELECT kind, seen_dc, seen_res, seen_mobile FROM asn_info "
+                    "WHERE asn = ?", (asn,),
+                ).fetchone()
+                if state is None:
+                    continue
+                total = (state["seen_dc"] or 0) + (state["seen_res"] or 0)
+                if total < min_votes:
+                    continue
+                dc_share = (state["seen_dc"] or 0) / total
+                mobile_share = (state["seen_mobile"] or 0) / total
+                if mobile_share >= ratio:
+                    kind = "mobile"
+                elif dc_share >= ratio:
+                    kind = "dc"
+                elif (1.0 - dc_share) >= ratio:
+                    kind = "res"
+                else:
+                    continue
+                if kind == (state["kind"] or ""):
+                    continue
+                conn.execute(
+                    "UPDATE asn_info SET kind = ?, source = 'learned' WHERE asn = ?",
+                    (kind, asn),
+                )
+                changed += 1
+        return changed
+
     def record_capabilities(self, rows: Sequence[dict]) -> int:
         """Обновляет только профиль достижимости для ключей.
 
@@ -508,6 +823,13 @@ class ServerStore:
                     WHERE key = ?
                     """,
                     (caps, now, now, row["key"]),
+                )
+                # Профиль перезаписывается целиком — то же и в тегах.
+                self._write_tags(
+                    conn, row["key"],
+                    passed=_split_tags(caps),
+                    pings=self._parse_pings(row.get("service_pings") or ""),
+                    reset=True,
                 )
                 updated += cur.rowcount
         return updated
@@ -760,6 +1082,21 @@ class ServerStore:
                      reset, pass_mark,
                      speed[0], speed[1], speed[2], pings, now, row["key"]),
                 )
+                # Теги: сброс прохода затирает строки сервера, дописывание
+                # сохраняет теги других чекеров того же прохода.
+                self._write_tags(
+                    conn, row["key"],
+                    passed=names,
+                    pings=self._parse_pings(row.get("service_pings") or ""),
+                    reset=reset,
+                )
+                # Теги-описания (ISP, город, dc/res). Прохода не знают и не
+                # сбрасываются: провайдер сервера не меняется от проверки.
+                geo = _split_tags(row.get("geo_tags") or "")
+                if geo:
+                    self._write_tags(
+                        conn, row["key"], passed=geo, reset=False, kind="geo",
+                    )
                 updated += cursor.rowcount or 0
         return updated
 
@@ -1025,19 +1362,17 @@ class ServerStore:
                             global_tag: str = "Global",
                             only_available: bool = False,
                             server_filter=None,
-                            best_top: int = 0,
-                            best_reserve: int = 0) -> list[str]:
+                            limit: int | None = None) -> list[str]:
         """Строки серверов по фильтру с добавленными capability-тэгами.
 
-        ВАЖНО: capability-профиль ХРАНИТСЯ в БД, тэги [name] добавляются
-        только здесь, на этапе экспорта для генерации итогового конфига.
-        Сервер, у которого профиль полностью состоит из global_tag (достиг
-        всех целей), получает ровно один тэг [Global].
+        ВАЖНО: профиль ХРАНИТСЯ в БД (таблица server_tags), тэги [name]
+        добавляются только здесь, на этапе выгрузки строк для генерации
+        итогового конфига. Сервер, у которого профиль полностью состоит из
+        global_tag (достиг всех целей), получает ровно один тэг [Global].
 
-        best_top / best_reserve — сколько ЛУЧШИХ и РЕЗЕРВНЫХ отметить в
-        каждой группе (см. script/best_tags.py). Отбор идёт по задержке до
-        цели этой группы из колонки service_pings и делается ПОСЛЕ всех
-        фильтров ниже.
+        Уровней «лучших» и «резервных» здесь нет: они задаются сортировкой
+        по задержке до цели на стороне SQL-запроса в шаблоне (см.
+        select_by_tag).
         """
         query = ("SELECT line, key, stable, ping_ms, capabilities, country, "
                 "speed_mbps, speed_down, speed_up, service_pings "
@@ -1052,6 +1387,9 @@ class ServerStore:
             query += " AND stable < ?"
             params.append(max_stable)
         query += " ORDER BY stable DESC, ping_ms IS NULL, ping_ms ASC, key ASC"
+        if limit:
+            query += " LIMIT ?"
+            params.append(int(limit))
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         if server_filter is not None:
@@ -1066,28 +1404,17 @@ class ServerStore:
                     "protocol": "",
                 })
             ]
-        # Метки «best»: в группе одного профиля лучшие получают
-        # дополнительный тег. Считается ПОСЛЕ фильтра, иначе фильтр по
-        # профилю вырезал бы часть группы и «лучшим» оказался бы не тот.
-        best_by_key: dict[str, str] = {}
-        if best_top or best_reserve:
-            from script.best_tags import BestRules, add_best_tags
-
-            # Теги скорости не ранжируются: там «лучший» — это и есть весь
-            # смысл тега, а из двух одинаковых задержек выберется случайный.
-            skip = tuple(sorted({
-                s.strip()
-                for r in rows
-                for s in (r["capabilities"] or "").split(",")
-                if s.strip().startswith("speed-")
-            }))
-            marked = add_best_tags(
-                [dict(r) for r in rows],
-                rules=BestRules(top=best_top, reserve=best_reserve),
-                skip_profiles=skip,
-            )
-            for rec in marked:
-                best_by_key[rec["key"]] = rec.get("capabilities") or ""
+        # Теги серверов читаются из server_tags ОДНИМ запросом. Метки
+        # «best»/«reserve» больше не ставятся: уровень сервера в группе
+        # задаётся не тегом, а сортировкой по задержке до цели
+        # (см. select_by_tag: лучшие — первые N, резерв — следующие M).
+        tags_by_key: dict[str, list[str]] = {}
+        with self._connect() as conn:
+            for trow in conn.execute(
+                "SELECT key, tag FROM server_tags "
+                "WHERE passed = 1 AND kind = 'service' ORDER BY tag"
+            ):
+                tags_by_key.setdefault(trow["key"], []).append(trow["tag"])
 
         out = []
         for row in rows:
@@ -1095,13 +1422,9 @@ class ServerStore:
             # определяется ПОСЛЕ записи строки в базу, так что в самой строке
             # её может не быть, и фильтр по странам такую строку не находит.
             base = set_country_in_name(row["line"], row["country"] or "")
-            caps = best_by_key.get(row["key"]) or row["capabilities"] or ""
-            # Если в профиле уже есть Global-метка храним её как global_tag;
-            # иначе — обычный профиль целей.
-            if caps:
-                # Сервер, прошедший все проверки, помечен в БД ровно global_tag.
-                suffix = self._capability_tags(caps, global_tag)
-                # Не добавляем Global повторно, если он уже в строке.
+            tags = tags_by_key.get(row["key"]) or _split_tags(row["capabilities"] or "")
+            if tags:
+                suffix = self._capability_tags(",".join(tags), global_tag)
                 if suffix and f"[{global_tag}]" not in base:
                     base = base + suffix
             out.append(base)
@@ -1131,24 +1454,16 @@ class ServerStore:
         max_stable: int | None = None,
         global_tag: str = "Global",
         only_available: bool = False,
-        best_top: int = 0,
-        best_reserve: int = 0,
     ) -> int:
         """Экспорт строк С capability-тэгами ([name] / [Global]) в файл.
 
         Это «whitelist для генерации»: тэги добавляются только здесь, на этапе
         выгрузки строк, чтобы итоговый sing-box конфиг мог фильтровать outbound'ы
         по достижимости целей. Профиль при этом остаётся в БД, а не в merge-пуле.
-
-        best_top / best_reserve пробрасываются дальше ОБЯЗАТЕЛЬНО: файловая
-        выгрузка — это ровно тот путь, которым пишется whitelist.txt. Пока
-        параметры сюда не доходили, в файле не было ни одной метки, хотя
-        отбор работал: у него просто не спрашивали.
         """
         lines = self.export_tagged_lines(
             min_stable=min_stable, max_stable=max_stable,
             global_tag=global_tag, only_available=only_available,
-            best_top=best_top, best_reserve=best_reserve,
         )
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -1156,8 +1471,10 @@ class ServerStore:
         return len(lines)
 
     def export_whitelist_lines(self, *, global_tag: str = "Global",
-                               server_filter=None, best_top: int = 0,
-                               best_reserve: int = 0) -> list[str]:
+                               server_filter=None,
+                               only_available: bool = True,
+                               min_stable: int | None = None,
+                               limit: int | None = None) -> list[str]:
         """Whitelist-строки: серверы, ПИНГОВАВШИЕСЯ в последней проверке.
 
         Критерий нового принципа: available=1 (последняя проверка успешна) —
@@ -1171,22 +1488,16 @@ class ServerStore:
         не быть вовсе.
         """
         return self.export_tagged_lines(
-            only_available=True, global_tag=global_tag,
-            server_filter=server_filter, best_top=best_top,
-            best_reserve=best_reserve,
+            only_available=only_available, global_tag=global_tag,
+            server_filter=server_filter,
+            min_stable=(min_stable - 1 if min_stable else None),
+            limit=limit,
         )
 
-    def export_whitelist_to_file(self, path: str | Path, *, global_tag: str = "Global",
-                                 best_top: int = 0, best_reserve: int = 0) -> int:
-        """Whitelist = available=1 (последняя проверка успешна), в файл.
-
-        best_top / best_reserve — уровни лучших и резервных (script/best_tags).
-        Без них whitelist.txt выходил без меток, и функция best выглядела
-        нерабочей: отбор считался, но в файл не попадал.
-        """
+    def export_whitelist_to_file(self, path: str | Path, *, global_tag: str = "Global") -> int:
+        """Whitelist = available=1 (последняя проверка успешна), в файл."""
         return self.export_tagged_to_file(
             path, only_available=True, global_tag=global_tag,
-            best_top=best_top, best_reserve=best_reserve,
         )
 
     # --------------------------------------------------- удаление из проверки

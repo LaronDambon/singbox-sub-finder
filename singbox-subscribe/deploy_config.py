@@ -1,56 +1,42 @@
 # -*- coding: utf-8 -*-
-"""Деплой собранного sing-box конфига в (private) GitHub-репозиторий.
+"""Деплой собранных sing-box конфигов.
 
-Что делает:
-  1. Берёт список подтверждённых серверов из центральной базы (whitelist: stable > порога).
-  2. Собирает итоговый конфиг из выбранного шаблона (config/templates/*.json).
-  3. Пушит собранный JSON в GitHub-репозиторий через REST API (без локального git).
-  4. Печатает https-ссылку на скачивание файла из приватного репозитория
-     для приложений с автоматическим обновлением конфига.
+Модуль переписан на СПИСОК блоков. Каждый блок — независимый способ
+публикации; нет блока — нет деплоя.
 
-«Закрытый» доступ и разделение ключей:
-  * репозиторий приватный — файл виден только обладателю токена с доступом к нему;
-  * у скрипта ДВА РАЗНЫХ ключа (токена), они не должны совпадать:
+    deploy:
+      - type: github
+        name: main
+        repo: "owner/repo"
+        token: env:GH_DEPLOY_TOKEN
+        read_token: env:GH_READ_TOKEN
+        templates: sbc-1.14.json
+        path: configs/latest/config.json
+      - type: github
+        name: second
+        repo: "owner/other"
+        token: "ghp_..."
+        templates: [config/templates/sbc-1.14.json, other.json]
+      - type: local
+        name: local
+        path: output
+        templates: config/templates
 
-       GH_DEPLOY_TOKEN — ключ ДЕПЛОЯ (rightы: Contents write). Только для пуша.
-                         НИКОГДА не выдаётся наружу.
-       GH_READ_TOKEN   — ключ СКАЧИВАНИЯ (rightы: Contents read, read-only).
-                         Именно он вшивается в итоговую ссылку и раздаётся тем,
-                         кто должен только читать конфиг. Даже при утечке этот
-                         ключ не даёт права на запись/деплой.
+Ключи блока:
+  type        github | local
+  name        имя блока (для логов)
+  repo        owner/repo (github)
+  branch      ветка (github; по умолчанию default_branch)
+  token       деплой-токен write; литерал или env:VAR
+  read_token  read-only токен для ссылки; литерал или env:VAR
+  templates   папка | файл | список файлов | "all"
+  path        github: путь файла в репозитории; local: папка/файл
+  ip_source   источник текущего IP (файл или http(s))
+  ip_placeholder  имя плейсхолдера в шаблоне
+  commit_msg  сообщение коммита
 
-Итоговая ссылка на скачивание (raw-файл из приватного репо, токен в ссылке):
-  https://<READ_TOKEN>:x-oauth-basic@raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>
-  GitHub больше НЕ принимает токен в query (?access_token= -> 400), поэтому
-  read-токен вшивается в URL как basic-auth: URL-only клиенты получают сырой конфиг.
-
-Использование:
-    GH_DEPLOY_TOKEN=ghp_write GH_READ_TOKEN=ghp_read python deploy_config.py --template sbc-1.14.json
-    python deploy_config.py --template sbc-1.14.json --source file --file source/merge.txt --path configs/latest/config.json
-    --list-templates — показывает доступные шаблоны.
-
-Мульти-деплой (несколько конфигов за один запуск, по выбранным шаблонам):
-    python deploy_config.py --templates sbc-1.14.json sing-box-config-1.13.14-ru.json
-    python deploy_config.py --templates all          # все шаблоны из config/templates
-    python deploy_config.py --select                 # интерактивный выбор из списка
-    Итоговый файл в репозитории называется ИМЕНЕМ ШАБЛОНА: из --path берётся только
-    каталог (--path configs/latest/config.json + шаблон sbc-1.14.json ->
-    configs/latest/sbc-1.14.json). Список шаблонов можно задать и через env
-    deploy.templates: [a.json, b.json] в config.yaml. Сбой одного шаблона не прерывает остальные
-    (--stop-on-error — прерывает).
-
-Замена текущего IP сервера в шаблоне (плейсхолдер):
-    В шаблоне вместо жёсткого адреса пишется уникальная переменная:
-        "address": "{{SERVER_IP}}"
-    На этапе деплоя она замещается актуальным IP из источника:
-        --ip-source /home/ray/ubuntu_server_ip/current_ip.txt   (или deploy.ip_source в config.yaml)
-    Источник — путь к локальному файлу (берётся первая непустая строка) либо
-    http(s)-ссылка (тело ответа). Имя переменной настраивается env
-    deploy.ip_placeholder (по умолчанию {{SERVER_IP}}). Если плейсхолдера в
-    шаблоне нет, IP не запрашивается и шаблон собирается как есть.
-
-Ключи читаются из переменных окружения GH_DEPLOY_TOKEN и GH_READ_TOKEN
-(или параметров --token / --read-token). Токены не сохраняются в файлах проекта.
+Токены можно писать литералом или через env:VAR (или env:VAR:fallback).
+Если токен не задан — блок пропускается, а не падает.
 """
 
 import argparse
@@ -62,27 +48,17 @@ from pathlib import Path, PurePosixPath
 
 import requests
 
-# ROOT — папка пакета (исполняемый код); PROJECT_ROOT — корень репозитория,
-# где лежат РАБОЧИЕ файлы: config/templates (шаблоны деплоя), source/, logs/.
-# Разделение намеренное: пакет можно обновлять, не задевая файлы пользователя.
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
 sys.path.insert(0, str(ROOT))
 
-# Локальные секреты/настройки из .env в корне репозитория:
-# GH_DEPLOY_TOKEN, GH_READ_TOKEN, DEPLOY_IP_SOURCE и т.д. override=False —
-# переменные системного окружения имеют приоритет.
 try:
     from dotenv import load_dotenv
-    load_dotenv(ROOT.parent / ".env", override=False)
-except Exception:  # noqa: BLE001 — пакет dotenv необязателен для CLI
+    load_dotenv(PROJECT_ROOT / ".env", override=False)
+except Exception:  # noqa: BLE001
     pass
 
-DEFAULT_REPO = "LaronDambon/sing-box-config"
 DEFAULT_PATH = "config.json"
-# Шаблоны — файлы пользователя, поэтому ищем в корне репозитория. Старые
-# места оставлены последними: у кого-то шаблон мог остаться рядом с пакетом,
-# и найти его там дешевле, чем объяснять, почему «шаблон не найден».
 TEMPLATE_DIRS = [
     PROJECT_ROOT / "config" / "templates",
     ROOT / "config" / "templates",
@@ -91,194 +67,97 @@ TEMPLATE_DIRS = [
 ]
 
 
-# --------------------------------------------------------------------------- настройки/секреты
+# --------------------------------------------------------------------------- настройки
 def _setting(path: str, default: str = "") -> str:
-    """Настройка деплоя из config.yaml (env для этого больше не читается).
-
-    Токены остаются в .env и берутся через _get_token: это секреты. Всё
-    остальное (репозиторий, путь, шаблон, источник IP) живёт в конфиге,
-    иначе значение из устаревшего .env молча перебивало бы файл.
-    """
     from config.settings import get_settings
-
     value = get_settings().setting(path, default)
     return str(value if value is not None else default)
 
-def _get_token(args) -> str:
-    """ДЕПЛОЙ-токен (write). Из --token, либо env GH_DEPLOY_TOKEN / GH_TOKEN."""
-    if getattr(args, "token", None):
-        return args.token
-    for key in ("GH_DEPLOY_TOKEN", "GH_TOKEN"):
-        val = (os.getenv(key) or "").strip()
-        if val:
-            return val
-    return ""
+
+def _env_value(value, default: str = "") -> str:
+    """Значение из блока: литерал, env:VAR или env:VAR:fallback."""
+    if value is None:
+        return default
+    s = str(value).strip()
+    if s.startswith("env:"):
+        rest = s[4:]
+        name, _, fallback = rest.partition(":")
+        v = os.getenv(name)
+        if v is None or v == "":
+            v = fallback
+        return str(v or "")
+    return s
 
 
-def _get_read_token(args) -> str:
-    """READ-токен для скачивания. Из --read-token, либо env GH_READ_TOKEN.
-
-    Отдельный ключ с read-only правами: он вшивается в ссылку на скачивание
-    и раздаётся наружу. Его утечка НЕ даёт прав записи/деплоя.
-    """
-    if getattr(args, "read_token", None):
-        return args.read_token
-    val = (os.getenv("GH_READ_TOKEN") or "").strip()
-    return val
-
-
-# --------------------------------------------------------------------------- сбор URI
-def _server_filter_from(template_dict):
-    """Достаёт server_filter из шаблона (None, если его нет).
-
-    Ключ лежит в самом шаблоне рядом с outbounds, поэтому условия отбора
-    хранятся вместе с конфигом, а не в отдельном файле настроек.
-    """
-    if not isinstance(template_dict, dict):
-        return None
-    return template_dict.get("server_filter")
+def _deploy_blocks() -> list[dict]:
+    """Блоки деплоя из config.yaml. Пустой список — деплой выключен."""
+    try:
+        from config.settings import get_settings
+        raw = get_settings().deploy.blocks
+    except Exception:  # noqa: BLE001
+        return []
+    if isinstance(raw, list):
+        return [b for b in raw if isinstance(b, dict)]
+    return []
 
 
-def _apply_server_filter(uris: list[str], template_dict) -> list[str]:
-    """Отбирает URI по server_filter из шаблона.
-
-    Фильтр применяется к ЗАПИСЯМ базы (страна, профиль целей, задержка),
-    поэтому строки сначала сопоставляются с базой по ключу. Строки, которых
-    в базе нет, при заданном фильтре отбрасываются: иначе условие
-    «исключить Россию» молча пропускало бы всё, о чём база не знает.
-    """
-    spec = _server_filter_from(template_dict)
-    if not spec:
-        return uris
-    from script.node_filters import build_filter
-
-    flt = build_filter(spec)
-    if flt.is_empty:
-        return uris
-    from config.settings import get_settings
-    from script.downloader import normalize_proxy_key
-    from script.server_store import ServerStore
-
-    store = ServerStore(get_settings().paths.servers_db_file)
-    records = store.server_records_by_key(uris)
-    kept = []
-    for uri in uris:
-        rec = records.get(normalize_proxy_key(uri))
-        if rec is not None and flt.matches(rec):
-            kept.append(uri)
-    print(
-        f"Фильтр шаблона ({flt.describe()}): {len(uris)} -> {len(kept)} серверов",
-        file=sys.stderr,
-    )
-    if not kept:
-        raise RuntimeError(
-            "Фильтр server_filter отсёк все серверы. "
-            f"Условие: {flt.describe()}. Скорее всего неверно указана страна "
-            "или тег в capabilities."
-        )
-    return kept
-
-
-def _load_source_uris(args) -> list[str]:
-    """Возвращает список server-URI для сборки в зависимости от --source."""
-    src = (args.source or "whitelist").lower()
-    if src in ("file", "file:"):
-        path = Path(args.file or args.source.split(":", 1)[1] if ":" in args.source else "")
-        if not path.exists():
-            raise FileNotFoundError(f"Файл с URI не найден: {path}")
-        lines = [ln.strip() for ln in path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
-        return lines
-
-    # Источник по умолчанию — whitelist центральной базы: серверы,
-    # пинговавшиеся в последней проверке (available=1).
-    from config.settings import get_settings
-    from script.server_store import ServerStore
-
-    store = ServerStore(get_settings().paths.servers_db_file)
-    # export_whitelist_lines добавляет capability-тэги ([name] / [Global]) к строкам
-    # на этапе экспорта для генерации итогового конфига.
-    lines = store.export_whitelist_lines(
-        global_tag=get_settings().reach.global_tag,
-        best_top=get_settings().core.best_top,
-        best_reserve=get_settings().core.best_reserve,
-    )
-    if not lines:
-        raise RuntimeError(
-            "В whitelist базы нет серверов (ни один не пинговался в последней проверке). Нечего собирать."
-        )
-    return lines
-
-
-# --------------------------------------------------------------------------- шаблон
+# --------------------------------------------------------------------------- шаблоны
 def _resolve_template_named(tpl: str):
-    """Возвращает (имя_файла_шаблона, dict шаблона).
-
-    Имя берётся из найденного файла шаблона — оно же становится именем итогового
-    файла в репозитории при мульти-деплое. Для raw-JSON имени нет (None).
-    """
+    """(имя_файла_шаблона, dict шаблона)."""
     tpl = (tpl or "").strip()
     if not tpl:
-        raise ValueError("Укажите --template <имя.json | путь | raw-JSON>")
-
-    # 1) если это валидный JSON объект
+        raise ValueError("Укажите шаблон: имя.json, путь или raw-JSON")
     if tpl.startswith("{"):
         return None, json.loads(tpl)
-
-    # 2) имя файла внутри известных папок шаблонов
     for folder in TEMPLATE_DIRS:
         if not folder.exists():
             continue
-        # ищем по точному имени или по подстроке
         for file in sorted(folder.glob("*.json")):
             if file.name == tpl or tpl in file.name:
                 return file.name, json.loads(file.read_text(encoding="utf-8"))
-
-    # 3) путь к файлу
     p = Path(tpl)
     if p.exists():
         return p.name, json.loads(p.read_text(encoding="utf-8"))
-
     raise FileNotFoundError(
-        f"Шаблон не найден: {tpl}. Доступные в config/templates: "
-        + ", ".join(f.name for f in TEMPLATE_DIRS if f.exists() for f in sorted(f.glob('*.json')))
+        f"Шаблон не найден: {tpl}. Доступные: "
+        + ", ".join(f.name for folder in TEMPLATE_DIRS if folder.exists()
+                    for f in sorted(folder.glob("*.json")))
     )
 
 
-def _resolve_template(args):
-    """Возвращает dict шаблона (по имени из config/templates, пути или raw-JSON)."""
-    return _resolve_template_named(args.template)[1]
+def _list_templates() -> list[str]:
+    out = []
+    for folder in TEMPLATE_DIRS:
+        if folder.exists():
+            out += [f.name for f in sorted(folder.glob("*.json"))]
+    return out
 
 
-def _configured_templates() -> list[str]:
-    """Список шаблонов из config.yaml (deploy.templates) — имена или all.
-
-    Значение приходит и списком (так его пишет config.yaml: templates: [all]),
-    и строкой через запятую (старая форма .env). Строку дополнительно чистим
-    от квадратных скобок и кавычек — так её когда-то писали руками.
-    """
-    raw = _setting("deploy.templates", "")
-    if isinstance(raw, (list, tuple, set)):
-        items = [str(t).strip() for t in raw]
+def _resolve_templates(templates) -> list[str]:
+    """Разворачивает templates: строка/список/папка/файл/all -> имена."""
+    if templates is None:
+        return []
+    if isinstance(templates, str):
+        items = [templates]
     else:
-        raw = str(raw or "").strip().strip("[]'\"")
-        items = raw.replace(",", " ").split()
-    return [t for t in items if t]
-
-
-def _expand_template_list(templates) -> list[str]:
-    """Разворачивает список шаблонов: 'all' -> все доступные, с дедупликацией.
-
-    Порядок сохраняется, пустые и дубликаты отбрасываются.
-    """
+        items = list(templates)
     expanded: list[str] = []
-    for t in templates or []:
-        s = (t or "").strip()
+    for item in items:
+        s = str(item or "").strip()
         if not s:
             continue
         if s.lower() == "all":
             expanded += _list_templates()
-        else:
-            expanded.append(s)
+            continue
+        p = Path(s)
+        if p.is_dir():
+            expanded += [f.name for f in sorted(p.glob("*.json"))]
+            continue
+        if p.is_file():
+            expanded.append(str(p))
+            continue
+        # имя шаблона из config/templates
+        expanded.append(s)
     out: list[str] = []
     seen: set[str] = set()
     for t in expanded:
@@ -288,59 +167,18 @@ def _expand_template_list(templates) -> list[str]:
     return out
 
 
-def _multi_failure_summary(results: list[dict], failed: int) -> str:
-    """Причины, по которым не выложились шаблоны, одной строкой.
-
-    Раньше в error уходило только число: "не задеплоено шаблонов: 7".
-    На сервере, где нет доступа к серверу, это сообщение бесполезно —
-    причины лежали в results, но до лога не доходили никуда.
-
-    Одинаковые причины группируются: обычно сбой один и общий для всех
-    шаблонов (недоступен IP-файл, неверный токен), и семь одинаковых
-    строк в логе только шумят.
-    """
-    groups: dict[str, list[str]] = {}
-    for r in results:
-        if r.get("ok"):
-            continue
-        reason = str(r.get("error") or "причина не указана")
-        groups.setdefault(reason, []).append(str(r.get("template") or "?"))
-
-    head = f"не задеплоено шаблонов: {failed} из {len(results)}"
-    if not groups:
-        return head
-    parts = [f"{name}: {', '.join(sorted(set(names)))}"
-             for name, names in sorted(groups.items(), key=lambda kv: -len(kv[1]))]
-    return head + " | " + "; ".join(parts)
-
-
 def _multi_path_for(base_path: str, template_name: str) -> str:
-    """Путь итогового файла при мульти-деплое: каталог из base_path + ИМЯ ШАБЛОНА.
-
-    configs/latest/config.json + sbc-1.14.json -> configs/latest/sbc-1.14.json
-    config.json (без каталога) + sbc-1.14.json -> sbc-1.14.json
-    """
     p = PurePosixPath((base_path or DEFAULT_PATH).replace("\\", "/"))
     if str(p.parent) == ".":
         return template_name
     return str(p.parent / template_name)
 
 
-# --------------------------------------------------------------------------- текущий IP сервера
+# --------------------------------------------------------------------------- IP
 def _resolve_server_ip(source: str) -> str:
-    """Текущий IP сервера из локального файла или по http(s)-ссылке.
-
-    source — значение DEPLOY_IP_SOURCE / --ip-source:
-      * путь к файлу — берётся первая непустая строка
-        (например /home/ray/ubuntu_server_ip/current_ip.txt);
-      * http(s)-URL — тело ответа (первая непустая строка).
-    """
     s = (source or "").strip()
     if not s:
-        raise RuntimeError(
-            "Источник IP не задан: укажите --ip-source или deploy.ip_source "
-            "(путь к файлу или http(s)-ссылка)."
-        )
+        raise RuntimeError("Источник IP не задан (ip_source)")
     if s.lower().startswith(("http://", "https://")):
         r = requests.get(s, timeout=15)
         if r.status_code != 200:
@@ -359,24 +197,14 @@ def _resolve_server_ip(source: str) -> str:
 
 
 def _apply_server_ip(template_dict, source=None, placeholder=None):
-    """Замещает плейсхолдер текущего IP во всех строковых значениях шаблона.
-
-    В шаблоне вместо реального адреса пишется уникальная переменная
-    (по умолчанию {{SERVER_IP}}, см. deploy.ip_placeholder), например:
-        "address": "{{SERVER_IP}}"
-    На этапе деплоя она замещается актуальным IP из deploy.ip_source / --ip-source.
-    Если плейсхолдера в шаблоне нет — шаблон возвращается без изменений и
-    источник IP не запрашивается вовсе.
-    """
-    ph = placeholder if placeholder is not None else _setting("deploy.ip_placeholder", "{{SERVER_IP}}")
+    ph = placeholder if placeholder is not None else "{{SERVER_IP}}"
     ph = (ph or "").strip()
     if not ph:
         return template_dict
     raw = json.dumps(template_dict, ensure_ascii=False)
     if ph not in raw:
         return template_dict
-
-    ip = _resolve_server_ip(source if source else _setting("deploy.ip_source", ""))
+    ip = _resolve_server_ip(source or "")
 
     def _walk(value):
         if isinstance(value, str):
@@ -393,60 +221,82 @@ def _apply_server_ip(template_dict, source=None, placeholder=None):
     return replaced
 
 
-def _list_templates() -> list[str]:
-    out = []
-    for folder in TEMPLATE_DIRS:
-        if folder.exists():
-            out += [f.name for f in sorted(folder.glob("*.json"))]
-    return out
+# --------------------------------------------------------------------------- URI
+def _apply_server_filter(uris: list[str], template_dict) -> list[str]:
+    """Старый server_filter из шаблона (fallback; SQL-блок его заменяет)."""
+    if not isinstance(template_dict, dict):
+        return uris
+    spec = template_dict.get("server_filter")
+    if not spec:
+        return uris
+    from script.node_filters import build_filter
+
+    flt = build_filter(spec)
+    if flt.is_empty:
+        return uris
+    from config.settings import get_settings
+    from script.downloader import normalize_proxy_key
+    from script.server_store import ServerStore
+
+    store = ServerStore(get_settings().paths.servers_db_file)
+    records = store.server_records_by_key(uris)
+    kept = []
+    for uri in uris:
+        rec = records.get(normalize_proxy_key(uri))
+        if rec is not None and flt.matches(rec):
+            kept.append(uri)
+    if not kept:
+        raise RuntimeError(
+            "Фильтр server_filter отсёк все серверы. "
+            f"Условие: {flt.describe()}."
+        )
+    return kept
 
 
-def _config_templates() -> list[str]:
-    """Список шаблонов из deploy.templates в config.yaml.
+def _load_source_uris(block: dict | None = None) -> list[str]:
+    """URI серверов из базы (whitelist) или из файла, если задан file."""
+    block = block or {}
+    file_path = block.get("file") or block.get("source_file")
+    if file_path:
+        p = Path(str(file_path))
+        if not p.exists():
+            raise FileNotFoundError(f"Файл с URI не найден: {p}")
+        return [ln.strip() for ln in p.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+    from config.settings import get_settings
+    from script.server_store import ServerStore
 
-    Пустой список означает одиночный деплой по deploy.template: так
-    собирается ровно один конфиг, и это поведение по умолчанию.
-    """
-    try:
-        from config.settings import get_settings
-    except Exception:  # noqa: BLE001 — настройки недоступны, идём одиночным путём
-        return []
-    raw = get_settings().deploy.templates
-    if not raw:
-        return []
-    if isinstance(raw, str):
-        raw = [raw]
-    return [str(t) for t in raw if str(t).strip()]
+    store = ServerStore(get_settings().paths.servers_db_file)
+    lines = store.export_whitelist_lines(
+        global_tag=get_settings().reach.global_tag,
+    )
+    if not lines:
+        raise RuntimeError("В whitelist базы нет серверов. Нечего собирать.")
+    return lines
 
 
 # --------------------------------------------------------------------------- сборка
-def _build_config(uris, template_dict) -> dict:
+def _build_config(uris, template_dict, db_path=None) -> dict:
     from gensub_api import build_config_from_uris
 
-    config = build_config_from_uris(uris, template_dict)
+    config = build_config_from_uris(uris, template_dict, db_path=db_path)
     outbounds = config.get("outbounds") or []
     real = [o for o in outbounds if isinstance(o, dict) and o.get("type") not in ("selector", "urltest", "direct", "block", "dns")]
     if not real:
         raise RuntimeError("После сборки не осталось реальных outbound-узлов (пустой конфиг).")
-    # Проверка «реальные outbound есть» недостаточна: конфиг с живыми
-    # прокси внутри, но с пустой группой в route.final молча не выпускает
-    # наружу ничего. Раньше такой конфиг спокойно уезжал в репозиторий.
     from script.core import validate_config_groups
 
     validate_config_groups(config, strict=True)
     return config
 
 
-# --------------------------------------------------------------------------- GitHub REST
+# --------------------------------------------------------------------------- GitHub
 GITHUB_API = "https://api.github.com"
 
 
 class GitHubDeploy:
     def __init__(self, token: str):
         if not token:
-            raise RuntimeError(
-                "Токен GitHub не задан. Передайте --token или установите GH_DEPLOY_TOKEN / GH_TOKEN."
-            )
+            raise RuntimeError("Токен GitHub не задан.")
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {token}",
@@ -455,25 +305,11 @@ class GitHubDeploy:
             "User-Agent": "singbox-subs-deploy",
         })
 
-    def ensure_repo(self, repo, private: bool):
-        """Создаёт private-репозиторий, если его ещё нет (owner/repo)."""
-        owner, name = repo.split("/", 1)
-        r = self.session.get(f"{GITHUB_API}/repos/{owner}/{name}")
-        if r.status_code == 200:
-            return r.json()["default_branch"]
-        if r.status_code != 404:
-            r.raise_for_status()
-        # создать приватный репозиторий
-        cr = self.session.post(f"{GITHUB_API}/user/repos", json={"name": name, "private": private})
-        if cr.status_code not in (200, 201):
-            raise RuntimeError(f"Не удалось создать репозиторий {repo}: {cr.status_code} {cr.text}")
-        return cr.json()["default_branch"]
-
     def _default_branch(self, repo):
         owner, name = repo.split("/", 1)
         r = self.session.get(f"{GITHUB_API}/repos/{owner}/{name}")
         if r.status_code != 200:
-            raise RuntimeError(f"Не удаётся получить информацию о репозитории {repo}: {r.status_code} {r.text}")
+            raise RuntimeError(f"Не удаётся получить репозиторий {repo}: {r.status_code} {r.text}")
         return r.json()["default_branch"]
 
     def _existing_sha(self, repo, path):
@@ -482,64 +318,45 @@ class GitHubDeploy:
         if r.status_code == 200:
             return r.json().get("sha")
         if r.status_code == 404:
-            return None  # файла ещё нет — создаём
+            return None
         r.raise_for_status()
 
     def is_empty_repo(self, repo) -> bool:
-        """True, если в репозитории ещё нет ни одной ветки (репо пустой)."""
         owner, name = repo.split("/", 1)
         r = self.session.get(f"{GITHUB_API}/repos/{owner}/{name}/branches")
         if r.status_code != 200:
             r.raise_for_status()
         return len(r.json()) == 0
 
-    def init_first_commit(self, repo, branch: str, path: str, content: str, message: str) -> str:
-        """Инициализирует пустой репозиторий первым коммитом через Git Data API
-        (blob -> tree -> commit -> refs/heads/<branch>).
-
-        Contents API не может создать первый файл в совершенно пустом репо, поэтому
-        дерево и коммит строим вручную. Возвращает sha коммита.
-        """
+    def init_first_commit(self, repo, branch, path, content, message):
         owner, name = repo.split("/", 1)
-
         blob = self.session.post(
             f"{GITHUB_API}/repos/{owner}/{name}/git/blobs",
             json={"content": base64.b64encode(content.encode("utf-8")).decode("ascii"), "encoding": "base64"},
         )
         if blob.status_code not in (200, 201):
             raise RuntimeError(f"Не удалось создать blob: {blob.status_code} {blob.text}")
-        blob_sha = blob.json()["sha"]
-
         tree = self.session.post(
             f"{GITHUB_API}/repos/{owner}/{name}/git/trees",
-            json={"tree": [{"path": path, "mode": "100644", "type": "blob", "sha": blob_sha}]},
+            json={"tree": [{"path": path, "mode": "100644", "type": "blob", "sha": blob.json()["sha"]}]},
         )
         if tree.status_code not in (200, 201):
             raise RuntimeError(f"Не удалось создать дерево: {tree.status_code} {tree.text}")
-        tree_sha = tree.json()["sha"]
-
         commit = self.session.post(
             f"{GITHUB_API}/repos/{owner}/{name}/git/commits",
-            json={"message": message, "tree": tree_sha},
+            json={"message": message, "tree": tree.json()["sha"]},
         )
         if commit.status_code not in (200, 201):
             raise RuntimeError(f"Не удалось создать коммит: {commit.status_code} {commit.text}")
-        commit_sha = commit.json()["sha"]
-
         ref = self.session.post(
             f"{GITHUB_API}/repos/{owner}/{name}/git/refs",
-            json={"ref": f"refs/heads/{branch}", "sha": commit_sha},
+            json={"ref": f"refs/heads/{branch}", "sha": commit.json()["sha"]},
         )
         if ref.status_code not in (200, 201):
             raise RuntimeError(f"Не удалось создать ветку {branch}: {ref.status_code} {ref.text}")
-        return commit_sha
+        return commit.json()["sha"]
 
-    def push_file(self, repo, path, content: str, branch: str, message: str) -> str:
-        """Создаёт или обновляет файл по API. Возвращает sha закоммиченного файла.
-
-        Если репозиторий пустой (нет веток), файл кладём через первичную
-        инициализацию Git Data API, потому что Contents PUT в пустой репо даёт 404.
-        """
+    def push_file(self, repo, path, content, branch, message):
         owner, name = repo.split("/", 1)
         sha = self._existing_sha(repo, path)
         payload = {
@@ -549,38 +366,19 @@ class GitHubDeploy:
         }
         if sha:
             payload["sha"] = sha
-        url = f"{GITHUB_API}/repos/{owner}/{name}/contents/{path}"
-        r = self.session.put(url, json=payload)
+        r = self.session.put(f"{GITHUB_API}/repos/{owner}/{name}/contents/{path}", json=payload)
         if r.status_code in (200, 201):
-            data = r.json()
-            commit_sha = (data.get("commit") or {}).get("sha")
-            return commit_sha or ""
-        # 404 при попытке записать в пустой репо: инициализируем первым коммитом.
+            return (r.json().get("commit") or {}).get("sha") or ""
         if r.status_code == 404 and self.is_empty_repo(repo):
-            print(f"[Deploy] Репозиторий {repo} пуст — создаём первый коммит (ветка {branch}).")
             return self.init_first_commit(repo, branch, path, content, message)
         raise RuntimeError(f"Не удалось записать {path}: {r.status_code} {r.text}")
 
 
 def _build_download_url(token, repo, branch, path) -> str:
-    """Ссылка на скачивание raw-файла из приватного репозитория (токен в ссылке).
-
-    GitHub больше НЕ принимает токен в query (?access_token= -> 400
-    "Must specify access token via Authorization header"), поэтому токен
-    вшивается в URL raw.githubusercontent.com как basic-auth:
-      https://<TOKEN>:x-oauth-basic@raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>
-    Проверено на private-репо: отдаёт сырой файл без заголовков. Наружу идёт
-    только read-only GH_READ_TOKEN (Contents read), деплой-токен не вшивается.
-    """
     return f"https://{token}:x-oauth-basic@raw.githubusercontent.com/{repo}/{branch}/{path}"
 
 
 def _verify_url(url, token=""):
-    """Проверяет, что по итоговой ссылке файл реально отдаётся (GET).
-
-    Заголовок Authorization добавляется только если передан token: ссылка для
-    URL-only клиентов проверяется ровно в том виде, в каком раздаётся.
-    """
     try:
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         r = requests.get(url, timeout=15, headers=headers)
@@ -591,347 +389,240 @@ def _verify_url(url, token=""):
         return False, str(exc)
 
 
-class _AutoArgs:
-    """Заглушка параметров для программного вызова (_get_token/_resolve_template/_load_source_uris)."""
-    token = ""
-    read_token = ""
-    template = "sbc-1.14.json"
-    source = "whitelist"
-    file = None
-
-
-def deploy(
-    *,
-    token=None,
-    read_token=None,
-    repo=None,
-    branch=None,
-    path=None,
-    template=None,
-    source=None,
-    file=None,
-    create_repo=False,
-    commit_msg="deploy: updated sing-box config",
-    silent=False,
-    uris=None,
-    ip_source=None,
-):
-    """Программный деплой собранного конфига в GitHub-репозиторий.
-
-    Два разных ключа:
-      token      — ДЕПЛОЙ-ключ (write), только для пуша, наружу не выдаётся;
-      read_token — READ-ключ (read-only), вшивается в ссылку на скачивание.
-
-    Параметры по умолчанию берутся из переменных окружения (.env или
-    системное окружение) напрямую через os.getenv — токены намеренно НЕ
-    являются полями Settings: этот объект печатают целиком при отладке, и
-    секрет в нём утекал бы в лог.
-      GH_DEPLOY_TOKEN, GH_READ_TOKEN. Авто-деплой после цикла проверки:
-        from deploy_config import deploy
-        deploy(silent=True)
-    Возвращает dict: {ok, url, commit_sha, bytes, repo, branch, path, error, url_uses_write_token}.
-    uris — уже загруженный список URI (внутренний параметр deploy_multi); None — загрузить самому.
-    ip_source — источник текущего IP для плейсхолдера (None — deploy.ip_source).
-    """
-    args_auto = _AutoArgs()
-    tok = token or _get_token(args_auto)
-    read_tok = read_token or _get_read_token(args_auto)
-    repo = (repo or _setting("deploy.repo", DEFAULT_REPO)).strip("/")
+# --------------------------------------------------------------------------- блоки
+def _github_block(block: dict, *, silent=False) -> dict:
+    name = str(block.get("name") or "github")
+    token = _env_value(block.get("token")) or _env_value(block.get("token_env")) or os.getenv("GH_DEPLOY_TOKEN", "")
+    read_token = _env_value(block.get("read_token")) or _env_value(block.get("read_token_env")) or os.getenv("GH_READ_TOKEN", "")
+    repo = _env_value(block.get("repo")).strip("/")
     if repo.endswith(".git"):
         repo = repo[:-4]
-    path = path or _setting("deploy.path", DEFAULT_PATH)
-    template = template or _setting("deploy.template", "sbc-1.14.json")
-    source = (source or "whitelist").lower()
+    branch = _env_value(block.get("branch"))
+    path = _env_value(block.get("path"), "config.json")
+    commit_msg = _env_value(block.get("commit_msg"), "deploy: updated sing-box config")
+    ip_source = _env_value(block.get("ip_source"))
+    ip_placeholder = _env_value(block.get("ip_placeholder"), "{{SERVER_IP}}")
+    templates = _resolve_templates(block.get("templates"))
 
-    a = _AutoArgs()
-    a.template = template
-    a.source = source
-    a.file = file
-
-    if not tok:
-        if not silent:
-            print("Деплой пропущен: деплой-токен GitHub не задан (GH_DEPLOY_TOKEN/GH_TOKEN)", file=sys.stderr)
-        return {"ok": False, "url": None, "commit_sha": None, "bytes": 0,
-                "repo": repo, "branch": branch, "path": path, "error": "deploy token missing",
-                "url_uses_write_token": False}
+    if not token:
+        return {"ok": False, "name": name, "error": "deploy token missing", "results": []}
+    if not repo:
+        return {"ok": False, "name": name, "error": "repo missing", "results": []}
+    if not templates:
+        return {"ok": False, "name": name, "error": "templates missing", "results": []}
 
     try:
-        gh = GitHubDeploy(tok)
-        template_dict = _apply_server_ip(_resolve_template(a), ip_source)
-        if uris is None:
-            uris = _load_source_uris(a)
-        uris = _apply_server_filter(uris, template_dict)
-        config = _build_config(uris, template_dict)
-        payload = json.dumps(config, ensure_ascii=False, indent=2)
-
-        if branch:
-            use_branch = branch
-        elif create_repo:
-            use_branch = gh.ensure_repo(repo, private=True)
-        else:
-            use_branch = gh._default_branch(repo)
-
-        commit = gh.push_file(repo, path, payload, use_branch, commit_msg)
-
-        # Разделение ключей: в ссылку на скачивание идёт READ-токен (read-only).
-        # Если read-токена нет — предупреждаем, что ссылка содержит write-токен.
-        if read_tok:
-            url = _build_download_url(read_tok, repo, use_branch, path)
-            ok, info = _verify_url(url)
-            url_uses_write = False
-        else:
-            url = _build_download_url(tok, repo, use_branch, path)
-            ok, info = _verify_url(url)
-            url_uses_write = True
-            if not silent:
-                print("ВНИМАНИЕ: GH_READ_TOKEN не задан — в ссылке лежит ДЕПЛОЙ-токен "
-                      "(write). Эту ссылку НЕЛЬЗЯ раздавать наружу.", file=sys.stderr)
-
-        if not silent:
-            print("Деплой: " + repo + "/" + path + " (ветка " + use_branch + ", commit " + commit + ")")
-            print("Ссылка: " + url)
-            print("Проверка: " + ("OK, " + str(info) + " байт" if ok else "сбой: " + str(info)))
-        return {"ok": ok, "url": url, "commit_sha": commit, "bytes": len(payload),
-                "repo": repo, "branch": use_branch, "path": path, "error": None,
-                "url_uses_write_token": url_uses_write}
+        gh = GitHubDeploy(token)
+        use_branch = branch or gh._default_branch(repo)
+        uris = _load_source_uris(block)
     except Exception as exc:  # noqa: BLE001
-        if not silent:
-            print("Ошибка деплоя: " + str(exc), file=sys.stderr)
-        return {"ok": False, "url": None, "commit_sha": None, "bytes": 0,
-                "repo": repo, "branch": branch, "path": path, "error": str(exc),
-                "url_uses_write_token": False}
+        return {"ok": False, "name": name, "error": str(exc), "results": []}
 
-
-def deploy_multi(
-    *,
-    templates=None,
-    repo=None,
-    branch=None,
-    path=None,
-    source=None,
-    file=None,
-    token=None,
-    read_token=None,
-    create_repo=False,
-    commit_msg=None,
-    silent=False,
-    stop_on_error=False,
-    ip_source=None,
-):
-    """Мульти-деплой: собирает и пушит конфиг для КАЖДОГО шаблона из списка.
-
-    Итоговое имя файла в репозитории = имя файла шаблона (_multi_path_for):
-    каталог берётся из path (deploy.path/--path), имя файла всегда от шаблона.
-    URI-источник загружается один раз и переиспользуется для всех шаблонов;
-    ветка репозитория определяется один раз. Сбой одного шаблона не останавливает
-    остальные (stop_on_error=True — прерывает после первой ошибки).
-
-    templates — имена шаблонов или 'all'; None -> deploy.templates
-    (имена через запятую или пробел).
-    Возвращает dict: {ok, deployed, failed, repo, branch, error, results: [...]}.
-    """
-    repo = (repo or _setting("deploy.repo", DEFAULT_REPO)).strip("/")
-    if repo.endswith(".git"):
-        repo = repo[:-4]
-    base_path = path or _setting("deploy.path", DEFAULT_PATH)
-
-    tpl_list = _expand_template_list(templates if templates else _configured_templates())
-    if not tpl_list:
-        if not silent:
-            print("Мульти-деплой: список шаблонов пуст — укажите --templates имя.json [...] | all | "
-                  "--select или deploy.templates", file=sys.stderr)
-        return {"ok": False, "deployed": 0, "failed": 0, "repo": repo, "branch": branch,
-                "error": "template list is empty", "results": []}
-
-    a = _AutoArgs()
-    a.source = (source or "whitelist").lower()
-    a.file = file
-    tok = token or _get_token(a)
-    read_tok = read_token or _get_read_token(a)
-
-    results: list[dict] = []
-    use_branch = branch
-    try:
-        gh = GitHubDeploy(tok)  # бросит RuntimeError, если токена нет
-        uris = _load_source_uris(a)
-        if branch:
-            use_branch = branch
-        elif create_repo:
-            use_branch = gh.ensure_repo(repo, private=True)
-        else:
-            use_branch = gh._default_branch(repo)
-    except Exception as exc:  # noqa: BLE001
-        if not silent:
-            print("Ошибка мульти-деплоя: " + str(exc), file=sys.stderr)
-        return {"ok": False, "deployed": 0, "failed": len(tpl_list), "repo": repo,
-                "branch": branch, "error": str(exc), "results": []}
-
-    for tpl in tpl_list:
+    results = []
+    for tpl in templates:
         try:
-            tpl_name, _tpl_dict = _resolve_template_named(tpl)
+            tpl_name, tpl_dict = _resolve_template_named(tpl)
             if tpl_name is None:
-                raise ValueError(
-                    f"Шаблон '{tpl[:40]}…' — raw-JSON: в мульти-деплое нельзя определить "
-                    "имя итогового файла. Используйте именованные шаблоны из config/templates."
-                )
-            file_path = _multi_path_for(base_path, tpl_name)
-            res = deploy(
-                token=tok, read_token=read_tok, repo=repo, branch=use_branch,
-                path=file_path, template=tpl, source=a.source, file=a.file,
-                create_repo=False, commit_msg=commit_msg or f"deploy: updated {tpl_name}",
-                silent=True, uris=uris, ip_source=ip_source,
-            )
+                raise ValueError("raw-JSON шаблон: нельзя определить имя файла")
+            tpl_dict = _apply_server_ip(tpl_dict, ip_source, ip_placeholder)
+            tpl_dict = _apply_server_filter(tpl_dict, tpl_dict) if False else tpl_dict
+            uris_f = _apply_server_filter(uris, tpl_dict)
+            file_path = _multi_path_for(path, tpl_name)
+            config = _build_config(uris_f, tpl_dict, db_path=_setting("paths.servers_db_file", ""))
+            payload = json.dumps(config, ensure_ascii=False, indent=2)
+            commit = gh.push_file(repo, file_path, payload, use_branch, commit_msg or f"deploy: {tpl_name}")
+            if read_token:
+                url = _build_download_url(read_token, repo, use_branch, file_path)
+                ok, info = _verify_url(url)
+                url_uses_write = False
+            else:
+                url = _build_download_url(token, repo, use_branch, file_path)
+                ok, info = _verify_url(url)
+                url_uses_write = True
+            results.append({
+                "ok": ok, "name": name, "template": tpl_name, "path": file_path,
+                "url": url, "commit_sha": commit, "bytes": len(payload),
+                "error": None, "url_uses_write_token": url_uses_write,
+            })
         except Exception as exc:  # noqa: BLE001
-            res = {"ok": False, "url": None, "commit_sha": None, "bytes": 0,
-                   "repo": repo, "branch": use_branch, "path": None, "error": str(exc),
-                   "url_uses_write_token": False}
-        res["template"] = tpl_name or tpl
-        results.append(res)
-        if not res.get("ok") and stop_on_error:
-            break
+            results.append({"ok": False, "name": name, "template": tpl, "path": None,
+                            "error": str(exc), "url_uses_write_token": False})
 
     deployed = sum(1 for r in results if r.get("ok"))
-    failed = len(results) - deployed
-    ok = failed == 0 and deployed > 0
-    if not silent:
-        print(f"Мульти-деплой: {deployed}/{len(results)} успешно — repo {repo}, ветка {use_branch}")
-        for r in results:
-            mark = "OK  " if r.get("ok") else "FAIL"
-            tail = "URL OK" if r.get("ok") else ("сбой: " + str(r.get("error")))
-            print(f"  [{mark}] {r.get('template')} -> {r.get('path')} ({tail})")
-            if r.get("url"):
-                print("      " + r["url"])
-        if any(r.get("url_uses_write_token") for r in results):
-            print("ВНИМАНИЕ: GH_READ_TOKEN не задан — ссылки содержат ДЕПЛОЙ-токен (write). "
-                  "НЕ раздавайте их наружу.", file=sys.stderr)
-    return {"ok": ok, "deployed": deployed, "failed": failed, "repo": repo,
-            "branch": use_branch,
-            "error": None if ok else _multi_failure_summary(results, failed),
-            "results": results}
+    ok = deployed == len(results) and deployed > 0
+    return {"ok": ok, "name": name, "repo": repo, "branch": use_branch,
+            "deployed": deployed, "failed": len(results) - deployed, "results": results}
 
 
-# --------------------------------------------------------------------------- локальный деплой
-def local_deploy(
-    *,
-    path=None,
-    template=None,
-    source=None,
-    file=None,
-    uris=None,
-    ip_source=None,
-):
-    """Собирает конфиг и пишет его НА ДИСК этой машины.
+def _local_block(block: dict, *, silent=False) -> dict:
+    name = str(block.get("name") or "local")
+    base = _env_value(block.get("path"), "output")
+    ip_source = _env_value(block.get("ip_source"))
+    ip_placeholder = _env_value(block.get("ip_placeholder"), "{{SERVER_IP}}")
+    templates = _resolve_templates(block.get("templates"))
+    if not templates:
+        return {"ok": False, "name": name, "error": "templates missing", "results": []}
 
-    Тот же конфиг, что уходит в GitHub: шаблон, отбор серверов, проверка
-    групп и подстановка IP — всё берётся из одних функций. Иначе «локальный»
-    и «удалённый» конфиги разошлись бы ровно там, где должны совпадать, и
-    расхождение всплыло бы уже у клиента.
-
-    Зачем нужен: не у каждого есть репозиторий и токен, а собранный конфиг
-    нужен всем — его читает sing-box. Локальный деплой работает вообще без
-    секретов: это просто файл рядом.
-
-    Возвращает dict той же формы, что deploy(): {ok, path, bytes, error}.
-    """
-    args_auto = _AutoArgs()
-    a = _AutoArgs()
-    a.template = template or _setting("deploy.template", "sbc-1.14.json")
-    a.source = (source or "whitelist").lower()
-    a.file = file
-
-    target = Path(path) if path else Path(str(_setting("deploy.local_path", "")) or ROOT / "output")
-    # deploy.local_path — это ПАПКА (в мульти-режиме в неё кладутся файлы
-    # по имени шаблона). Одиночный деплой пишет туда файл с именем из
-    # deploy.path, иначе конфиг молча ложился бы поверх каталога и падал
-    # с IsADirectoryError.
-    if target.suffix.lower() != ".json":
-        name = Path(str(_setting("deploy.path", "config.json"))).name or "config.json"
-        target = target / name
     try:
-        template_dict = _apply_server_ip(_resolve_template(a), ip_source)
-        if uris is None:
-            uris = _load_source_uris(a)
-        uris = _apply_server_filter(uris, template_dict)
-        config = _build_config(uris, template_dict)
-        payload = json.dumps(config, ensure_ascii=False, indent=2)
-
-        # Каталог создаём сами: без этого первый же запуск падал бы на
-        # отсутствующей папке, а она ещё и в .gitignore — то есть её заведомо
-        # нет у нового пользователя.
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(payload, encoding="utf-8")
-        return {"ok": True, "path": str(target), "bytes": len(payload.encode("utf-8")),
-                "error": None}
+        uris = _load_source_uris(block)
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "path": str(target), "bytes": 0, "error": str(exc)}
+        return {"ok": False, "name": name, "error": str(exc), "results": []}
 
+    target = Path(base)
+    if target.suffix.lower() != ".json":
+        target.mkdir(parents=True, exist_ok=True)
 
-def local_deploy_multi(
-    *,
-    templates=None,
-    path=None,
-    source=None,
-    file=None,
-    ip_source=None,
-    stop_on_error=False,
-):
-    """Локальный деплой для КАЖДОГО шаблона из списка.
-
-    Раскладка повторяет GitHub-версию (_multi_path_for): из deploy.path берётся
-    каталог, а имя файла задаёт шаблон. Так один и тот же deploy.templates
-    даёт одинаковый набор файлов и локально, и в репозитории — переключение
-    между способами публикации не меняет результат.
-    """
-    tpl_list = _expand_template_list(templates if templates else _configured_templates())
-    base_dir = path or _setting("deploy.local_path", "") or str(ROOT / "output")
-    if not tpl_list:
-        return {"ok": False, "deployed": 0, "failed": 0, "dir": str(base_dir),
-                "error": "template list is empty", "results": []}
-
-    results: list[dict] = []
-    for tpl in tpl_list:
-        tpl_name = None
+    results = []
+    for tpl in templates:
         try:
-            tpl_name, _ = _resolve_template_named(tpl)
+            tpl_name, tpl_dict = _resolve_template_named(tpl)
             if tpl_name is None:
-                raise ValueError(
-                    f"Шаблон '{tpl[:40]}…' — raw-JSON: в мульти-режиме нельзя "
-                    "определить имя итогового файла. Используйте именованные "
-                    "шаблоны из config/templates."
-                )
-            res = local_deploy(
-                path=Path(base_dir) / tpl_name, template=tpl,
-                source=source, file=file, ip_source=ip_source,
-            )
+                raise ValueError("raw-JSON шаблон: нельзя определить имя файла")
+            tpl_dict = _apply_server_ip(tpl_dict, ip_source, ip_placeholder)
+            uris_f = _apply_server_filter(uris, tpl_dict)
+            config = _build_config(uris_f, tpl_dict, db_path=_setting("paths.servers_db_file", ""))
+            payload = json.dumps(config, ensure_ascii=False, indent=2)
+            out = target / tpl_name if target.suffix.lower() != ".json" else target
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(payload, encoding="utf-8")
+            results.append({"ok": True, "name": name, "template": tpl_name,
+                            "path": str(out), "bytes": len(payload.encode("utf-8")), "error": None})
         except Exception as exc:  # noqa: BLE001
-            res = {"ok": False, "path": None, "bytes": 0, "error": str(exc)}
-        res["template"] = tpl_name or tpl
+            results.append({"ok": False, "name": name, "template": tpl,
+                            "path": None, "error": str(exc)})
+
+    deployed = sum(1 for r in results if r.get("ok"))
+    ok = deployed == len(results) and deployed > 0
+    return {"ok": ok, "name": name, "deployed": deployed, "failed": len(results) - deployed,
+            "dir": str(target), "results": results}
+
+
+def _whitelist_block(block: dict, *, silent=False) -> dict:
+    """Экспорт живых серверов из базы в файл-список (whitelist).
+
+    Параметры блока:
+      path            куда писать (файл; каталог -> whitelist.txt)
+      only_available  брать только пинговавшиеся в последней проверке (да)
+      min_stable      нижний порог stable (включительно, по умолчанию 0)
+      limit           максимум строк (0 = без ограничения)
+      tags            дописывать к строкам метки [tag] из server_tags
+
+    Правило простое: сервер жив (available=1), не исключён (excluded=0),
+    stable не ниже порога. Никакого отбора по сервисам здесь нет.
+    """
+    name = str(block.get("name") or "whitelist")
+    raw_path = _env_value(block.get("path"), "output/whitelist.txt")
+    target = Path(raw_path)
+    if target.suffix.lower() not in (".txt", ".list", ""):
+        target = target / "whitelist.txt"
+    elif target.is_dir() or target.suffix == "":
+        target = target / "whitelist.txt"
+
+    only_available = block.get("only_available", True)
+    if isinstance(only_available, str):
+        only_available = only_available.strip().lower() not in ("0", "false", "no", "off")
+    try:
+        min_stable = int(block.get("min_stable", 0) or 0)
+    except (TypeError, ValueError):
+        min_stable = 0
+    try:
+        limit = int(block.get("limit", 0) or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    with_tags = bool(block.get("tags", False))
+
+    try:
+        from config.settings import get_settings
+        from script.server_store import ServerStore
+
+        store = ServerStore(get_settings().paths.servers_db_file)
+        if with_tags:
+            lines = store.export_whitelist_lines(
+                global_tag=get_settings().reach.global_tag,
+                only_available=bool(only_available),
+                min_stable=min_stable,
+                limit=limit or None,
+            )
+        else:
+            lines = store.export_lines(
+                only_available=bool(only_available),
+                min_stable=min_stable - 1 if min_stable else None,
+                limit=limit or None,
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(lines), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "name": name, "path": str(target), "error": str(exc)}
+
+    return {
+        "ok": True, "name": name, "path": str(target), "bytes": target.stat().st_size,
+        "lines": len(lines), "error": None,
+        "results": [{"ok": True, "name": name, "template": "whitelist",
+                     "path": str(target), "error": None}],
+    }
+
+
+def run_deploy(blocks=None, *, silent=False, stop_on_error=False) -> dict:
+    """Выполняет все блоки деплоя. Возвращает сводку."""
+    blocks = _deploy_blocks() if blocks is None else blocks
+    if not blocks:
+        return {"ok": False, "deployed": 0, "failed": 0, "results": [], "error": "deploy blocks empty"}
+    results: list[dict] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        btype = str(block.get("type") or "").strip().lower()
+        if btype == "github":
+            res = _github_block(block, silent=silent)
+        elif btype == "local":
+            res = _local_block(block, silent=silent)
+        elif btype == "whitelist":
+            res = _whitelist_block(block, silent=silent)
+        else:
+            res = {"ok": False, "name": str(block.get("name") or "?"), "error": f"unknown deploy type: {btype}"}
         results.append(res)
+        if not silent:
+            print(f"Деплой [{res.get('name')}]: " + ("OK" if res.get("ok") else "FAIL: " + str(res.get("error"))))
         if not res.get("ok") and stop_on_error:
             break
-
     deployed = sum(1 for r in results if r.get("ok"))
     failed = len(results) - deployed
     return {"ok": failed == 0 and deployed > 0, "deployed": deployed, "failed": failed,
-            "dir": str(base_dir), "error": None if not failed else _multi_failure_summary(results, failed),
-            "results": results}
+            "results": results, "error": None if failed == 0 else "some blocks failed"}
+
+
+# --------------------------------------------------------------------------- совместимость
+def deploy(**kwargs):
+    """Совместимость: один github-блок."""
+    block = {"type": "github", "name": kwargs.get("name", "github")}
+    block.update({k: v for k, v in kwargs.items() if v is not None})
+    return _github_block(block)
+
+
+def local_deploy(**kwargs):
+    block = {"type": "local", "name": kwargs.get("name", "local")}
+    block.update({k: v for k, v in kwargs.items() if v is not None})
+    return _local_block(block)
+
+
+def deploy_multi(**kwargs):
+    return _github_block(kwargs)
+
+
+def local_deploy_multi(**kwargs):
+    return _local_block(kwargs)
 
 
 def _select_templates_interactive() -> list[str]:
-    """Интерактивный выбор шаблонов из списка для мульти-деплоя.
-
-    Понимает: номера через пробел/запятую, диапазоны (2-5), 'all'.
-    """
     tpl_list = _list_templates()
     if not tpl_list:
-        print("Шаблоны не найдены. Положите *.json в " + str(TEMPLATE_DIRS[0]), file=sys.stderr)
+        print("Шаблоны не найдены.", file=sys.stderr)
         return []
     print("Доступные шаблоны:")
     for i, name in enumerate(tpl_list, 1):
         print(f"  {i:>2}. {name}")
-    print("Выберите номера для мульти-деплоя (например: 1 3-5; 'all' — все):")
     try:
-        raw = input("> ").strip()
+        raw = input("Выберите номера (например: 1 3-5; all): ").strip()
     except (EOFError, KeyboardInterrupt):
         return []
     picked: set[int] = set()
@@ -943,161 +634,50 @@ def _select_templates_interactive() -> list[str]:
                 lo, hi = token.split("-", 1)
                 picked.update(range(int(lo), int(hi) + 1))
             except ValueError:
-                print(f"  ? пропускаю диапазон: {token}", file=sys.stderr)
+                pass
         elif token.isdigit():
             n = int(token)
             if 1 <= n <= len(tpl_list):
                 picked.add(n)
-            else:
-                print(f"  ? нет шаблона №{n}", file=sys.stderr)
-        else:
-            print(f"  ? не понял: {token}", file=sys.stderr)
     return [tpl_list[n - 1] for n in sorted(picked)]
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(
-        prog="deploy_config.py",
-        description="Собрать конфиг по шаблону и задеплоить в private GitHub-репозиторий.",
-    )
-    parser.add_argument("--template", help="Имя шаблона из config/templates (или путь / raw-JSON)")
-    parser.add_argument("--repo", default=_setting("deploy.repo", DEFAULT_REPO), help="owner/repo (default: " + DEFAULT_REPO + ")")
-    parser.add_argument("--branch", default=None, help="Ветка (по умолчанию default_branch репозитория)")
-    parser.add_argument("--path", default=DEFAULT_PATH,
-                        help="Путь файла внутри репозитория (default: config.json); в мульти-режиме используется только каталог из него")
-    parser.add_argument("--token", default="", help="ДЕПЛОЙ-токен write (иначе GH_DEPLOY_TOKEN/GH_TOKEN)")
-    parser.add_argument("--read-token", default="", help="READ-токен read-only для скачивания (иначе GH_READ_TOKEN)")
-    # По умолчанию — из настройки DEPLOY_CREATE_REPO. Раньше флаг всегда
-    # был False и настройку никто не читал: она стояла в .env, выглядела
-    # рабочей, а выгрузка репозиторий не создавала.
-    from config.settings import get_settings
-
-    parser.add_argument(
-        "--create", action="store_true",
-        default=get_settings().deploy.create_repo,
-        help="Создать репозиторий, если его нет (по умолчанию DEPLOY_CREATE_REPO)",
-    )
-    parser.add_argument("--private", action="store_true", default=True, help="Создавать репо приватным (по умолчанию да)")
-    parser.add_argument("--source", default="whitelist", help="whitelist|file:<путь>")
-    parser.add_argument("--file", default=None, help="Путь к файлу URI при --source file")
-    parser.add_argument("--commit-msg", default=None,
-                        help="Сообщение коммита (по умолчанию: 'deploy: updated <имя шаблона>' для мульти-деплоя)")
-    parser.add_argument("--list-templates", action="store_true", help="Показать доступные шаблоны и выйти")
-    parser.add_argument(
-        "--templates", nargs="+", metavar="TPL",
-        help="Мульти-деплой: несколько шаблонов через пробел ('all' — все из config/templates). "
-             "Итоговый файл называется именем шаблона, каталог берётся из --path",
-    )
-    parser.add_argument(
-        "--select", action="store_true",
-        help="Интерактивно выбрать шаблоны из списка и сделать мульти-деплой",
-    )
-    parser.add_argument(
-        "--stop-on-error", action="store_true",
-        help="Мульти-деплой: прерваться после первой ошибки (по умолчанию — продолжать остальные)",
-    )
-    parser.add_argument(
-        "--local", action="store_true",
-        help="Локальный деплой: писать конфиг в файл на этой машине, без "
-             "GitHub и токенов (по умолчанию deploy.local)",
-    )
-    parser.add_argument(
-        "--local-path", default=None,
-        help="Куда писать при --local (по умолчанию deploy.local_path)",
-    )
-    parser.add_argument(
-        "--ip-source", default=None,
-        help="Источник текущего IP для плейсхолдера в шаблоне: путь к файлу или http(s)-ссылка "
-             "(по умолчанию deploy.ip_source, например /home/ray/ubuntu_server_ip/current_ip.txt)",
-    )
+    parser = argparse.ArgumentParser(prog="deploy_config.py", description="Собрать и задеплоить конфиги.")
+    parser.add_argument("--list-templates", action="store_true", help="Показать шаблоны")
+    parser.add_argument("--select", action="store_true", help="Интерактивный выбор шаблонов")
+    parser.add_argument("--templates", nargs="+", help="Шаблоны для локального деплоя")
+    parser.add_argument("--local", action="store_true", help="Локальный деплой")
+    parser.add_argument("--local-path", default="output", help="Папка локального деплоя")
+    parser.add_argument("--token", default="", help="Деплой-токен")
+    parser.add_argument("--read-token", default="", help="Read-токен")
+    parser.add_argument("--repo", default="", help="owner/repo")
+    parser.add_argument("--branch", default="", help="Ветка")
+    parser.add_argument("--path", default="config.json", help="Путь файла")
+    parser.add_argument("--ip-source", default="", help="Источник IP")
+    parser.add_argument("--commit-msg", default="", help="Сообщение коммита")
     args = parser.parse_args(argv)
 
     if args.list_templates:
-        print("Доступные шаблоны:")
         for t in _list_templates():
-            print("  " + t)
+            print(t)
         return 0
-
     if args.select:
         chosen = _select_templates_interactive()
         if not chosen:
-            print("Шаблоны не выбраны — выход.", file=sys.stderr)
             return 1
         args.templates = chosen
-
-    # Локальный деплой: ни репозитория, ни токенов не требуется. Режим
-    # включён, если позвали с --local ИЛИ так стоит deploy.local, а GitHub
-    # при этом не просили явно (--repo). Порядок важен: явный --repo всегда
-    # означает «публикуй в GitHub».
-    from config.settings import get_settings as _gs
-
-    _deploy = _gs().deploy
-    want_local = bool(args.local or (_deploy.local and not args.repo))
-    local_dir = args.local_path or _deploy.local_path
-
-    if want_local:
-        multi_templates = args.templates or _config_templates()
-        if multi_templates:
-            res = local_deploy_multi(
-                templates=multi_templates,
-                path=local_dir,
-                source=args.source,
-                file=args.file,
-                ip_source=args.ip_source,
-                stop_on_error=args.stop_on_error,
-            )
-        else:
-            res = local_deploy(
-                path=local_dir,
-                template=args.template,
-                source=args.source,
-                file=args.file,
-                ip_source=args.ip_source,
-            )
-        if not res.get("ok"):
-            return 1
-        target = res.get("dir") or res.get("path")
-        print("Локальный деплой: %s" % target)
-        return 0
-
-    # Мульти-деплой: --templates / --select / deploy.templates.
-    multi_templates = args.templates or _config_templates()
-    if multi_templates:
-        res = deploy_multi(
-            templates=multi_templates,
-            repo=args.repo,
-            branch=args.branch,
-            path=args.path,
-            source=args.source,
-            file=args.file,
-            token=args.token,
-            read_token=args.read_token,
-            create_repo=args.create,
-            commit_msg=args.commit_msg,
-            silent=False,
-            stop_on_error=args.stop_on_error,
-            ip_source=args.ip_source,
-        )
+    if args.local:
+        block = {"type": "local", "name": "local", "path": args.local_path,
+                 "templates": args.templates or "all", "ip_source": args.ip_source}
+        res = _local_block(block)
         return 0 if res.get("ok") else 1
-
-    # Два ключа: token (write) для пуша, read_token (read-only) для ссылки на скачивание.
-    res = deploy(
-        token=args.token,
-        read_token=args.read_token,
-        repo=args.repo,
-        branch=args.branch,
-        path=args.path,
-        template=args.template,
-        source=args.source,
-        file=args.file,
-        create_repo=args.create,
-        commit_msg=args.commit_msg,
-        silent=False,
-        ip_source=args.ip_source,
-    )
-    if not res.get("ok"):
-        return 1
-    return 0
+    block = {"type": "github", "name": "github", "repo": args.repo, "branch": args.branch,
+             "path": args.path, "token": args.token, "read_token": args.read_token,
+             "templates": args.templates or "all", "commit_msg": args.commit_msg,
+             "ip_source": args.ip_source}
+    res = _github_block(block)
+    return 0 if res.get("ok") else 1
 
 
 if __name__ == "__main__":

@@ -345,8 +345,6 @@ _SCHEMA: tuple = (
     Field("core", "purge_stable_below", "int", 0, "Нижний порог stable: серверы ниже этого значения не импортируются в проверку", legacy=("PURGE_STABLE_BELOW",)),
     Field("core", "new_server_stable", "int", 5, "stable нового сервера до первого удачного пинга: сколько неудач он переживёт", legacy=("NEW_SERVER_STABLE",)),
     Field("core", "shield_cycles", "int", 96, "«Щит»: после удачного пинга stable поднимается не ниже этого значения", legacy=("SHIELD_CYCLES",)),
-    Field("core", "best_top", "int", 3, "Сколько лучших в каждой группе получают тег [<группа>-best]", legacy=("BEST_TOP",)),
-    Field("core", "best_reserve", "int", 3, "Сколько следующих за лучшими получают тег [<группа>-reserve]", legacy=("BEST_RESERVE",)),
 
     # --------------- SINGBOX: ядро проверки, общее для всех инструментов
     # Умолчание — минимум, который реально нужен: жив ли сервер, куда он
@@ -413,6 +411,15 @@ _SCHEMA: tuple = (
     Field("singbox.checkers.country", "concurrency", "int", 8, "Сколько прокси проверять параллельно", legacy=("COUNTRY_CHECK_CONCURRENCY",)),
     Field("singbox.checkers.country", "timeout", "float", 10.0, "Таймаут чтения одного geo-запроса (пробуется до 3 эндпоинтов)", unit="сек", legacy=("COUNTRY_CHECK_TIMEOUT",)),
 
+    # ------------------- ip_info: ISP, город и признак датацентра (dc/res)
+    Field("singbox.checkers.ip_info", "enabled", "bool", True, "Определять ISP, город и признак датацентра для отбора чистых IP", legacy=("IP_INFO_ENABLED",)),
+    Field("singbox.checkers.ip_info", "concurrency", "int", 8, "Сколько прокси проверять параллельно", legacy=("IP_INFO_CONCURRENCY",)),
+    Field("singbox.checkers.ip_info", "timeout", "float", 10.0, "Таймаут чтения одного запроса о провайдере", unit="сек", legacy=("IP_INFO_TIMEOUT",)),
+    Field("singbox.checkers.ip_info", "extra_hosting_asns", "str", "", "Свои номера AS хостингов через запятую (добавляются к встроенному списку)", legacy=("IP_INFO_EXTRA_HOSTING_ASNS",)),
+    Field("singbox.checkers.ip_info", "learn_min_votes", "int", 3, "Сколько наблюдений по ASN нужно, чтобы вывести вердикт dc/res/mobile", legacy=("IP_INFO_LEARN_MIN_VOTES",)),
+    Field("singbox.checkers.ip_info", "learn_ratio", "float", 0.8, "Какая доля наблюдений должна совпасть для вердикта (0.5-0.99)", legacy=("IP_INFO_LEARN_RATIO",)),
+    Field("singbox.checkers.ip_info", "peeringdb", "bool", True, "Спрашивать PeeringDB про незнакомый ASN (имя и признак Cable/DSL/ISP)", legacy=("IP_INFO_PEERINGDB",)),
+
     # ---------------------------- speed: замер скорости и доступ к сайту
     Field("singbox.checkers.speed", "enabled", "bool", True, "Мерить скорость и проверять доступ к целевому сайту", legacy=("SPEED_ENABLED",)),
     Field("singbox.checkers.speed", "site_url", "str", "https://gemini.google.com/", "Сайт для проверки доступа (Gemini режет дата-центровые и VPN-адреса)", legacy=("SPEED_SITE_URL",)),
@@ -448,6 +455,7 @@ _SCHEMA: tuple = (
     Field("pipeline", "enrich_timeout", "float", 180.0, "Таймаут чекеров-ДОПОЛНЕНИЙ (страна, достижимость, браузер)", unit="сек", legacy=("PIPELINE_ENRICH_TIMEOUT",)),
     Field("pipeline", "queue_persist", "bool", True, "Возвращать незавершённые записи очереди в работу при старте", legacy=("PIPELINE_QUEUE_PERSIST",)),
     Field("pipeline", "export_lists", "bool", True, "Экспортировать whitelist.txt после цикла", legacy=("PIPELINE_EXPORT_LISTS",)),
+    Field("pipeline", "drain_timeout", "float", 0.0, "Сколько ждать опустошения очереди перед остановкой проверки (0 — ждать сколько нужно)", unit="сек", legacy=("PIPELINE_DRAIN_TIMEOUT",)),
     Field("pipeline", "write_merge", "bool", True, "Записывать merge.txt (файл пула проверки) после наполнения очереди", legacy=("PIPELINE_WRITE_MERGE",)),
     Field("pipeline", "custom_checkers_dir", "path", ROOT / "pipeline" / "checkers" / "custom", "Папка с ПОЛЬЗОВАТЕЛЬСКИМИ проверяющими алгоритмами", legacy=("PIPELINE_CUSTOM_CHECKERS_DIR",)),
 
@@ -489,22 +497,10 @@ _SCHEMA: tuple = (
     Field("web", "host", "str", "0.0.0.0", "Адрес, на котором слушает API", legacy=("FLASK_HOST",)),
     Field("web", "port", "int", 8000, "Порт API", legacy=("FLASK_PORT",)),
 
-    # ---------------- DEPLOY: публикация собранного конфига (локально и/или в GitHub)
-    Field("deploy", "enabled", "bool", False, "Публиковать собранный конфиг после каждого цикла", legacy=("DEPLOY_ENABLED",)),
-    Field("deploy", "local", "bool", False, "Локальный деплой: писать собранный конфиг в файл на этой машине (токены не нужны)", legacy=("DEPLOY_LOCAL",)),
-    Field("deploy", "local_path", "path", PROJECT_ROOT / "output", "Папка локального деплоя (в мульти-режиме в неё кладутся файлы по имени шаблона)", legacy=("DEPLOY_LOCAL_PATH",)),
-    # repo и ip_source намеренно ПУСТЫЕ: это данные конкретной установки.
-    # Раньше здесь стоял чужой репозиторий и путь вида
-    # /home/ray/ubuntu_server_ip/current_ip.txt — у нового пользователя они
-    # выглядели как рабочие настройки и вели в никуда. Пустое значение видно
-    # в preflight как «не задано» и требует осознанного заполнения.
-    Field("deploy", "repo", "str", "", "Репозиторий owner/repo для GitHub-деплоя (пусто = GitHub-деплой не настроен)", legacy=("GH_DEPLOY_REPO",)),
-    Field("deploy", "template", "str", "sbc-1.14.json", "Шаблон сборки из config/templates (одиночный режим)", legacy=("DEPLOY_TEMPLATE",)),
-    Field("deploy", "templates", "list", [], "Мульти-деплой: имена шаблонов или all (все из config/templates)", legacy=("DEPLOY_TEMPLATES",)),
-    Field("deploy", "path", "str", "config.json", "Путь файла внутри репозитория (в мульти-режиме — только каталог)", legacy=("DEPLOY_PATH",)),
-    Field("deploy", "create_repo", "bool", False, "Создавать репозиторий автоматически, если его нет", legacy=("DEPLOY_CREATE_REPO",)),
-    Field("deploy", "ip_source", "str", "", "Источник текущего IP для плейсхолдера: файл или http(s)-ссылка (нужен, только если шаблон содержит плейсхолдер)", legacy=("DEPLOY_IP_SOURCE",)),
-    Field("deploy", "ip_placeholder", "str", "{{SERVER_IP}}", "Имя плейсхолдера в шаблоне, замещаемого актуальным IP", legacy=("DEPLOY_IP_PLACEHOLDER",)),
+    # ---------------- DEPLOY: список блоков публикации (github / local)
+    # deploy — это СПИСОК блоков, а не набор полей. Нет блока — нет деплоя.
+    # Каждый блок: type, repo, token, templates, path, ... См. config.yaml.
+    Field("deploy", "blocks", "list", [], "Список блоков публикации: github (репозиторий) и local (файл на диске)"),
 
     # ------------------------ SERVICES: режим `python -m pipeline serve`
     Field("services", "discovery", "bool", True, "Служба поиска новых серверов", legacy=("SERVICE_DISCOVERY",)),
@@ -879,6 +875,12 @@ def build_config(
         flat = flatten(raw)
         unknown: list[str] = []
         for path, value in flat.items():
+            # deploy — список блоков, а не группа. flatten() отдаёт его
+            # листом "deploy"; кладём в поле deploy.blocks.
+            if path == "deploy" and isinstance(value, list):
+                values["deploy.blocks"] = value
+                sources["deploy.blocks"] = origin
+                continue
             field = BY_PATH.get(path) or BY_LEGACY.get(path) or BY_SHORT.get(path)
             if field is None:
                 unknown.append(path)

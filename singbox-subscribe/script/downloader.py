@@ -545,10 +545,6 @@ def build_merge_from_urls(
     exported = store.export_whitelist_to_file(
         get_settings().paths.whitelist_file,
         global_tag=get_settings().reach.global_tag,
-        # Уровни лучших и резервных. Без них файл выходил без меток -best,
-        # хотя отбор считался: функция best выглядела нерабочей именно здесь.
-        best_top=get_settings().core.best_top,
-        best_reserve=get_settings().core.best_reserve,
     )
     logger.info(
         "Экспорт whitelist.txt из базы: %d серверов, пинговавшихся в последней проверке",

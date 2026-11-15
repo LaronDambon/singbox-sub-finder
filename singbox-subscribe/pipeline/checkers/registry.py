@@ -150,6 +150,7 @@ def _parse_selection(selection: str | Sequence[str] | None) -> list[str] | None:
 #: отработал, тот и поставил метку, а второй увидит свежий вердикт в кэше.
 _ENRICH_ORDER = {
     "country": 10,
+    "ip_info": 15,
     "reachability": 20,
     "service_access": 30,
     "api_service": 35,

@@ -161,49 +161,39 @@ def _cmd_logs(args) -> int:
     return 0
 
 
-#: Настройки, которые зависят от машины и НЕ имеют осмысленного умолчания.
-#: Пустыми они безвредны (деплой выключен — ничего не читается), но как
-#: только пользователь включает деплой, их надо заполнить. Список нужен,
-#: чтобы сказать это в момент инициализации, а не по пустой папке потом.
-_DEPLOY_TODO = (
-    ("deploy.repo",
-     "owner/repo для публикации в GitHub (пусто = только локальный деплой)"),
-    ("deploy.ip_source",
-     "файл или http(s)-ссылка с текущим IP — нужен, только если шаблон "
-     "содержит {{SERVER_IP}}"),
-)
-
-
 def _deploy_hint(settings) -> None:
     """Что осталось заполнить, если деплой включён.
 
-    Печатается ПОСЛЕ создания файла: до этого момента показывать нечего,
-    значений ещё нет. Молчим, когда деплой выключен, — тогда эти поля не
-    читаются вовсе, и напоминание было бы шумом.
+    deploy — список блоков; пустой список означает «деплой выключен».
     """
-    if not bool(_read(settings, "deploy.enabled", False)):
+    blocks = _read(settings, "deploy.blocks", None) or []
+    if not isinstance(blocks, list) or not blocks:
         print()
-        print("  деплой выключен (deploy.enabled: false) — публиковать некуда.")
+        print("  деплой выключен (deploy.blocks пуст) — публиковать некуда.")
         print("  Чтобы собирать конфиг в файл на этой машине (токены не нужны):")
         print("    deploy:")
-        print("      enabled: true")
-        print("      local: true")
+        print("      - type: local")
+        print("        path: output")
         return
-
-    empty = [(path, why) for path, why in _DEPLOY_TODO
-             if not _has_value(_read(settings, path))]
-    if empty:
+    problems = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        t = str(b.get("type") or "").lower()
+        name = str(b.get("name") or t)
+        if t == "github":
+            if not str(b.get("repo") or "").strip():
+                problems.append(f"{name}: не задан repo")
+        elif t == "local":
+            if not str(b.get("path") or "").strip():
+                problems.append(f"{name}: не задан path")
+        else:
+            problems.append(f"{name}: неизвестный тип {t}")
+    if problems:
         print()
         print("  деплой включён, но не всё заполнено:")
-        for path, why in empty:
-            print(f"    {path:<18} — {why}")
-    local = bool(_read(settings, "deploy.local", False))
-    repo = str(_read(settings, "deploy.repo", "") or "").strip()
-    if not local and not repo:
-        print()
-        print("  ВНИМАНИЕ: ни deploy.local, ни deploy.repo не заданы —")
-        print("  сборка пройдёт, но конфиг никуда не попадёт.")
-        print("  Проще всего начать с локального деплоя: deploy.local: true")
+        for p in problems:
+            print(f"    {p}")
     print()
     print("  Подробный отчёт о готовности: python -m preflight")
 

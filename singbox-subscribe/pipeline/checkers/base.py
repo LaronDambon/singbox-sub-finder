@@ -60,6 +60,10 @@ class CheckOutcome:
     capabilities: str | None = None
     detail: str | None = None
     data: dict[str, Any] = field(default_factory=dict)
+    #: Теги-ОПИСАНИЯ сервера (провайдер, город, датацентр), через запятую.
+    #: Пишутся в server_tags с kind="geo" и НЕ участвуют в отборе сервисов:
+    #: профиль сервисов живёт в capabilities (kind="service").
+    extra_tags: str = ""
     #: Способ записи тегов в базу:
     #:
     #:   * "join"  — дописать к тому, что уже есть;
@@ -116,6 +120,15 @@ class CheckResult:
                 current.country = outcome.country
             if outcome.capabilities:
                 current.capabilities = outcome.capabilities
+            if outcome.extra_tags:
+                # Теги-описания складываются: ISP от одного источника и город
+                # от другого должны оба остаться.
+                merged = [
+                    t.strip()
+                    for t in (current.extra_tags + "," + outcome.extra_tags).split(",")
+                    if t.strip()
+                ]
+                current.extra_tags = ",".join(dict.fromkeys(merged))
             # Сброс сильнее дописывания: если один чекер по этой строке
             # объявил сброс, профиль обязан быть переписан, а не склеен.
             # Метка прохода едет вместе со сбросом: по ней база понимает,
