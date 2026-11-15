@@ -95,7 +95,7 @@
       "name": "telegram",
       "tag": "telegram",
       "url": "https://api.telegram.org",
-      "max_ping_ms": 3000,
+      "max_ping_ms": 4000,
       "timeout_ms": 6000,
       "expected_statuses": [200, 401, 403, 429],
       "headers": {

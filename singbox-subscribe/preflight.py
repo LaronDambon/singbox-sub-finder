@@ -516,6 +516,28 @@ def check_github_deploy(settings) -> Check:
                  "github-блоков %d, токен задан" % len(blocks))
 
 
+def _dir_owner_hint(path) -> str:
+    """Чей это каталог — одной строкой. Пусто, если выяснить не удалось.
+
+    Нужно ровно затем, чтобы «Permission denied» не заставлял гадать: почти
+    всегда каталог принадлежит root после запуска через sudo, и человеку
+    достаточно увидеть это словом, а не догадываться по коду ошибки.
+    """
+    try:
+        import pwd  # только POSIX: на Windows модуля нет
+    except ImportError:
+        return ""
+    try:
+        stat = path.stat()
+        owner = pwd.getpwuid(stat.st_uid).pw_name
+        current = pwd.getpwuid(os.getuid()).pw_name
+    except Exception:  # noqa: BLE001 — подсказка не стоит падения проверки
+        return ""
+    if owner == current:
+        return ""
+    return " Каталог принадлежит пользователю %s, а вы — %s." % (owner, current)
+
+
 def check_local_deploy(settings) -> Check:
     """Локальный деплой: можно ли записать файл туда, куда указано."""
     if settings is None:
@@ -537,9 +559,22 @@ def check_local_deploy(settings) -> Check:
             probe.write_text("", encoding="utf-8")
             probe.unlink()
         except Exception as exc:  # noqa: BLE001
-            return Check("local_deploy", "Локальный деплой", FAIL,
-                         "нет доступа на запись: %s" % exc,
-                         fix="Укажите другой каталог в path: /путь/куда/есть/доступ")
+            owner = _dir_owner_hint(target)
+            return Check(
+                "local_deploy", "Локальный деплой", FAIL,
+                "нет доступа на запись: %s" % exc,
+                fix="Каталог существует, но принадлежит не тому пользователю, "
+                    "от которого вы запускаете программу.%s\n\n"
+                    "Самый частый случай: репозиторий когда-то клонировали или "
+                    "запускали через sudo — тогда каталоги принадлежат root, а "
+                    "обычный пользователь писать в них не может. Убедиться:\n"
+                    "  ls -ld %s\n\n"
+                    "Вернуть себе владение (Linux/macOS):\n"
+                    "  sudo chown -R $USER:$USER %s\n\n"
+                    "Если это не подходит — укажите другой каталог в блоке:\n"
+                    "  - type: local\n    path: /путь/куда/есть/доступ"
+                    % (owner, target, target.parent),
+            )
     return Check("local_deploy", "Локальный деплой", OK,
                  "local-блоков %d, запись разрешена" % len(blocks))
 

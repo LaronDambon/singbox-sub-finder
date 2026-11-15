@@ -25,7 +25,7 @@ core:
   purge_stable_below: 0
   # stable нового сервера до первого удачного пинга: сколько неудач он
   # переживёт
-  new_server_stable: 5
+  new_server_stable: 3
   # «Щит»: после удачного пинга stable поднимается не ниже этого значения
   shield_cycles: 96
 
@@ -38,17 +38,18 @@ singbox:
   # [url_probe, country, reachability, api_service, browser_service,
   # service_access, speed, all, none]
   enabled_checkers:
+  - country
   - url_probe
   - ip_info
   - reachability
   - api_service
-  - browser_service
-  check_workers: 4
+  #- browser_service
+  check_workers: 12
   # Базовый порт mixed-inbound sing-box: каждый батч берёт свой свободный
   port: 7891
   # Путь к sing-box: можно указать папку поставки (бинарник найдётся сам) или
   # файл напрямую
-  path: singbox-subscribe/sing-box/sing-box.exe
+  path: singbox-subscribe/sing-box
   # Какие батчи сохранять в logs/singbox: конфиг, вывод sing-box и meta.json.
   # Обычный прогон следов не оставляет — конфиг удаляется, а вывод живёт только
   # в памяти. Когда батч кончается ничем («no_results», 0.1 с, ни одной
@@ -67,17 +68,18 @@ singbox:
   checkers:
     url_probe:
       # URL проверки доступности: лёгкий 204-ответ
-      url: https://cp.cloudflare.com/gen_204
+      #url: https://cp.cloudflare.com/gen_204
+      url: https://www.gstatic.com/generate_204
       # Сколько серверов уходит в один запуск sing-box
-      batch_size: 75
+      batch_size: 50
       # Запас времени сверх расчётного дедлайна батча
       # (сек)
-      timeout: 20.0
+      timeout: 10.0
       # Нижняя граница дедлайна батча (время на запуск sing-box)
       # (сек)
-      batch_startup: 5.0
+      batch_startup: 10.0
       # Сколько раз повторять батч при сбое ЗАПУСКА sing-box
-      max_attempts: 2
+      max_attempts: 1
       # Сколько раз сервер возвращается в очередь, если вердикта не было
       max_retries: 2
 
@@ -327,16 +329,19 @@ deploy:
     name: main
     repo: "LaronDambon/sing-box-config"
     branch: main
-    path: configs/latest/config.json
+    path: configs/latest
     token: env:GH_DEPLOY_TOKEN
     read_token: env:GH_READ_TOKEN
-    # Шаблон: папка, файл или список файлов. Имя итогового файла — имя шаблона.
-    templates: sbc-1.14.json
+    # Шаблон: папка, файл, список файлов или all. Имя итогового файла — имя шаблона.
+    templates: all
+    # Источник текущего IP для плейсхолдера в шаблоне
+    ip_source: /home/ray/ubuntu_server_ip/current_ip.txt
+    ip_placeholder: "{{SERVER_IP}}"
     commit_msg: "deploy: updated config"
   - type: local
     name: local
     path: output
-    templates: sbc-1.14.json
+    templates: all
   # Отдельный экспорт живых серверов из базы (whitelist).
   # Нет блока — нет файла. Правило: available=1, excluded=0, stable >= min_stable.
   - type: whitelist

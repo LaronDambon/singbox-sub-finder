@@ -197,13 +197,12 @@
       "tag": "alldeploy",
       "type": "block",
       "tags": [
-        "global",
-        "openrouter",
-        "gemini-chat",
+        "gemini-api",
         "openai",
         "youtube",
         "telegram",
-        "microsoft"
+        "microsoft",
+        "global"
       ],
       "blocks": [
         {
@@ -304,7 +303,7 @@
           "geosite-google",
           "geoip-google"
         ],
-        "outbound": "gemini-chat"
+        "outbound": "gemini-api"
       },
       {
         "rule_set": [

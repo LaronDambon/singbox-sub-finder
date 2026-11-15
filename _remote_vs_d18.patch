@@ -1,0 +1,724 @@
+diff --git a/config.yaml b/config.yaml
+index 3ccfd39..8ccb690 100644
+--- a/config.yaml
++++ b/config.yaml
+@@ -25,11 +25,11 @@ core:
+   purge_stable_below: 0
+   # stable нового сервера до первого удачного пинга: сколько неудач он
+   # переживёт
+-  new_server_stable: 5
++  new_server_stable: 3
+   # «Щит»: после удачного пинга stable поднимается не ниже этого значения
+   shield_cycles: 96
+   # Сколько лучших в каждой группе получают тег [<группа>-best]
+-  best_top: 4
++  best_top: 3
+   # Сколько следующих за лучшими получают тег [<группа>-reserve]
+   best_reserve: 20
+ 
+@@ -42,16 +42,18 @@ singbox:
+   # [url_probe, country, reachability, api_service, browser_service,
+   # service_access, speed, all, none]
+   enabled_checkers:
++  - country
+   - url_probe
+   - reachability
+   - api_service
+-  - browser_service
+-  check_workers: 4
++  #- browser_service
++  check_workers: 12
+   # Базовый порт mixed-inbound sing-box: каждый батч берёт свой свободный
+   port: 7891
+   # Путь к sing-box: можно указать папку поставки (бинарник найдётся сам) или
+   # файл напрямую
+-  path: singbox-subscribe/sing-box/sing-box.exe
++  path: singbox-subscribe/sing-box
++
+   # Какие батчи сохранять в logs/singbox: конфиг, вывод sing-box и meta.json.
+   # Обычный прогон следов не оставляет — конфиг удаляется, а вывод живёт только
+   # в памяти. Когда батч кончается ничем («no_results», 0.1 с, ни одной
+@@ -70,17 +72,18 @@ singbox:
+   checkers:
+     url_probe:
+       # URL проверки доступности: лёгкий 204-ответ
+-      url: https://cp.cloudflare.com/gen_204
++      #url: https://cp.cloudflare.com/gen_204
++      url: https://www.gstatic.com/generate_204
+       # Сколько серверов уходит в один запуск sing-box
+-      batch_size: 75
++      batch_size: 50
+       # Запас времени сверх расчётного дедлайна батча
+       # (сек)
+-      timeout: 20.0
++      timeout: 10.0
+       # Нижняя граница дедлайна батча (время на запуск sing-box)
+       # (сек)
+-      batch_startup: 5.0
++      batch_startup: 10.0
+       # Сколько раз повторять батч при сбое ЗАПУСКА sing-box
+-      max_attempts: 2
++      max_attempts: 1
+       # Сколько раз сервер возвращается в очередь, если вердикта не было
+       max_retries: 2
+ 
+@@ -306,16 +309,16 @@ deploy:
+   # настроен)
+   repo: "LaronDambon/sing-box-config"
+   # Шаблон сборки из config/templates (одиночный режим)
+-  template: sbc-1.14.json
++  #template: sbc-1.14.json
+   # Мульти-деплой: имена шаблонов или all (все из config/templates)
+-  templates: []
++  templates: "all"
+   # Путь файла внутри репозитория (в мульти-режиме — только каталог)
+-  path: config.json
++  #path: config.json
+   # Создавать репозиторий автоматически, если его нет
+   create_repo: false
+   # Источник текущего IP для плейсхолдера: файл или http(s)-ссылка (нужен,
+   # только если шаблон содержит плейсхолдер)
+-  ip_source: ""
++  ip_source: "/home/ray/ubuntu_server_ip/current_ip.txt"
+   # Имя плейсхолдера в шаблоне, замещаемого актуальным IP
+   ip_placeholder: "{{SERVER_IP}}"
+ 
+diff --git a/config/reachability_targets.json b/config/reachability_targets.json
+index f40e865..d5acd4b 100644
+--- a/config/reachability_targets.json
++++ b/config/reachability_targets.json
+@@ -95,7 +95,7 @@
+       "name": "telegram",
+       "tag": "telegram",
+       "url": "https://api.telegram.org",
+-      "max_ping_ms": 3000,
++      "max_ping_ms": 4000,
+       "timeout_ms": 6000,
+       "expected_statuses": [200, 401, 403, 429],
+       "headers": {
+diff --git a/config/subs/urls copy.json b/config/subs/urls copy.json
+index 0008553..a8f0173 100644
+--- a/config/subs/urls copy.json	
++++ b/config/subs/urls copy.json	
+@@ -26,11 +26,8 @@
+     "29": "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt",
+     "30": "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/sub",
+     "31": "https://raw.githubusercontent.com/mfuu/v2ray/master/sub",
+-    "32": "https://raw.githubusercontent.com/Leon406/SubCrawler/main/sub/share/vless",
+-    "33": "https://raw.githubusercontent.com/Leon406/SubCrawler/main/sub/share/v2",
+-    "34": "https://raw.githubusercontent.com/Leon406/SubCrawler/main/sub/share/tr",
+-    "36": "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/Splitted-By-Protocol/vless.txt",
+-    "37": "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/Splitted-By-Protocol/trojan.txt",
++
++
+     "38": "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt",
+     "39": "https://raw.githubusercontent.com/ALIILAPRO/v2rayNG-Config/main/server.txt",
+     "40": "https://raw.githubusercontent.com/mheidari98/.proxy/main/all",
+diff --git a/config/subs/urls.json b/config/subs/urls.json
+index e685ea4..675b944 100644
+--- a/config/subs/urls.json
++++ b/config/subs/urls.json
+@@ -1,7 +1,21 @@
+ {
+-    "6": "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt",
+-    "22": "https://raw.githubusercontent.com/wuqb2i4f/xray-config-toolkit/main/output/base64/mix-uri",
++    "1": "https://github.com/sakha1370/OpenRay/raw/refs/heads/main/output/all_valid_proxies.txt",
++    "2": "https://raw.githubusercontent.com/sevcator/5ubscrpt10n/main/protocols/vl.txt",
++    "4": "https://raw.githubusercontent.com/acymz/AutoVPN/refs/heads/main/data/V2.txt",
++    "5": "https://raw.githubusercontent.com/miladtahanian/V2RayCFGDumper/refs/heads/main/sub.txt",
++    "8": "https://github.com/ShatakVPN/ConfigForge-V2Ray/raw/refs/heads/main/configs/vless.txt",
++    "14": "https://github.com/LalatinaHub/Mineral/raw/refs/heads/master/result/nodes",
++    "16": "https://raw.githubusercontent.com/Pawdroid/Free-servers/refs/heads/main/sub",
++    "21": "https://raw.githubusercontent.com/shabane/kamaji/master/hub/merged.txt",
+     "23": "https://github.com/igareck/vpn-configs-for-russia/raw/refs/heads/main/BLACK_VLESS_RUS.txt",
+-    "24": "https://github.com/Mr-Meshky/vify/raw/refs/heads/main/configs/vless.txt",
+-    "25": "https://raw.githubusercontent.com/V2RayRoot/V2RayConfig/refs/heads/main/Config/vless.txt"
++    "27": "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt",
++    "29": "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt",
++    "30": "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/sub",
++    "31": "https://raw.githubusercontent.com/mfuu/v2ray/master/sub",
++    "32": "https://raw.githubusercontent.com/Leon406/SubCrawler/main/sub/share/vless",
++    "38": "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt",
++    "39": "https://raw.githubusercontent.com/ALIILAPRO/v2rayNG-Config/main/server.txt",
++    "40": "https://raw.githubusercontent.com/mheidari98/.proxy/main/all",
++    "43": "https://raw.githubusercontent.com/ripaojiedian/freenode/main/sub",
++    "50": "https://raw.githubusercontent.com/Subzio/subzio/main/HYSTERIA2.txt#HYSTERIA2@subzio"
+ }
+diff --git a/config/templates/sbc-1.14.json b/config/templates/sbc-1.14.json
+index f26904d..4226096 100644
+--- a/config/templates/sbc-1.14.json
++++ b/config/templates/sbc-1.14.json
+@@ -197,13 +197,12 @@
+       "tag": "alldeploy",
+       "type": "block",
+       "tags": [
+-        "global",
+-        "openrouter",
+-        "gemini-chat",
++        "gemini-api",
+         "openai",
+         "youtube",
+         "telegram",
+-        "microsoft"
++        "microsoft",
++        "global"
+       ],
+       "blocks": [
+         {
+@@ -316,7 +315,7 @@
+           "geosite-google",
+           "geoip-google"
+         ],
+-        "outbound": "gemini-chat"
++        "outbound": "gemini-api"
+       },
+       {
+         "rule_set": [
+diff --git a/singbox-subscribe/browser/portable.py b/singbox-subscribe/browser/portable.py
+index f62f439..69202e1 100644
+--- a/singbox-subscribe/browser/portable.py
++++ b/singbox-subscribe/browser/portable.py
+@@ -88,8 +88,7 @@ def export_session(service: str, password: str, out_path: Path | None = None,
+     profile = paths.profile_dir(service)
+     if not profile.exists():
+         raise FileNotFoundError(
+-            "Профиль %s не найден — сначала выполните (из папки "
+-            "singbox-subscribe): python browser.py login %s"
++            "Профиль %s не найден — сначала выполните: python browser_login.py %s"
+             % (profile, service)
+         )
+ 
+@@ -206,7 +205,7 @@ def main(argv=None) -> int:
+         print("Ошибка: %s" % exc)
+         return 1
+     print()
+-    print("Проверьте: python browser.py check %s --show" % args.service)
++    print("Проверьте: python browser_check.py %s --show" % args.service)
+     return 0 if n else 1
+ 
+ 
+diff --git a/singbox-subscribe/parsers/vless.py b/singbox-subscribe/parsers/vless.py
+index 8f03175..adb7579 100644
+--- a/singbox-subscribe/parsers/vless.py
++++ b/singbox-subscribe/parsers/vless.py
+@@ -2,8 +2,8 @@ from utils import tool
+ import re
+ from urllib.parse import urlparse, parse_qs, unquote
+ 
+-# Публичный ключ REALITY: 32 байта в base64url = 43 знака (44 с паддингом).
+-# Мусор вроде pbk=enabled ломал sing-box целиком, убивая весь батч:
++#Публичный ключ REALITY: 32 байта в base64url = 43 знака (44 с паддингом).
++# Мусор вроде pbk=enabled ломал sing-box целиком:
+ # FATAL create service: initialize outbound[N]: invalid public_key
+ _PBK_RE = re.compile(r'^[A-Za-z0-9_-]{43}=?$')
+ 
+diff --git a/singbox-subscribe/pipeline/anomaly.py b/singbox-subscribe/pipeline/anomaly.py
+deleted file mode 100644
+index 5ddc2e6..0000000
+--- a/singbox-subscribe/pipeline/anomaly.py
++++ /dev/null
+@@ -1,260 +0,0 @@
+-"""Архив аномальных батчей: конфиг и вывод sing-box в папку логов.
+-
+-ЗАЧЕМ
+------
+-Штатный батч не оставляет следов: собранный конфиг удаляется сразу после
+-прогона, а вывод процесса живёт только в оперативной памяти и исчезает
+-вместе с ним. Пока всё идёт хорошо, это правильно — иначе диск забился бы
+-за сутки.
+-
+-Но когда батч кончается ничем («no_results», 0.1 с, ни одной строки), улик
+-не остаётся ВООБЩЕ: непонятно ни что было в конфиге, ни что сказал sing-box.
+-Именно так выглядел разбор, где батчи умирали за 0.1 секунды, а в логе было
+-только «sing-box не вернул ни одного результата».
+-
+-Поэтому при аномальном исходе конфиг и ПОЛНЫЙ вывод процесса кладутся в:
+-
+-    logs/singbox/<id>/
+-        batch.json     собранный конфиг батча
+-        singbox.log    stdout+stderr процесса целиком, как есть
+-        meta.json      исход, код возврата, время, размер, версия
+-
+-Идентификатор печатается в общем логе рядом с предупреждением, поэтому связь
+-двусторонняя: из warning.log видно, куда идти, а из meta.json — откуда пришло.
+-
+-ЧТО ИМЕННО ХРАНИТСЯ
+--------------------
+-Порог задаётся настройкой singbox.keep_failed_batches:
+-
+-    error      хранить только error   (no_results, config_error, spawn_error)
+-    warning    хранить error и warning (плюс подозрительный partial)
+-    info       хранить всё, включая штатные батчи
+-    off        не хранить ничего
+-
+-ПОЧЕМУ В ОПЕРАТИВКЕ
+--------------------
+-Вывод процесса копится в памяти и уходит на диск ТОЛЬКО при аномалии. Писать
+-каждый батч в файл и удалять при успехе значило бы перезаписывать SSD на
+-каждом прогоне — а батчей за цикл сотни.
+-"""
+-
+-from __future__ import annotations
+-
+-import json
+-import shutil
+-from dataclasses import dataclass, field
+-from datetime import datetime, timezone
+-from pathlib import Path
+-
+-from pipeline.batch import BatchOutcome
+-from pipeline.logging_setup import get_logger
+-
+-LOGGER = get_logger("singbox.archive")
+-
+-#: Папка архива внутри каталога логов.
+-ARCHIVE_DIR_NAME = "singbox"
+-
+-#: Сколько байт вывода процесса держим в памяти на один батч.
+-#:
+-#: Батч на 150 серверов при debug-уровне печатает сотни килобайт. При шести
+-#: воркерах это единицы мегабайт — терпимо. Ограничение нужно на случай
+-#: патологического вывода (цикл в sing-box): без него один батч съест память
+-#: всего процесса.
+-MAX_CAPTURE_BYTES = 4 * 1024 * 1024
+-
+-#: Уровни хранения, от самого тихого к самому подробному.
+-LEVELS = ("off", "error", "warning", "info")
+-
+-
+-@dataclass
+-class AnomalyCapture:
+-    """Накопитель вывода одного батча.
+-
+-    Живёт ровно столько, сколько идёт батч. Строки складываются сюда по мере
+-    чтения, но на диск ничего не пишется — только если исход окажется
+-    аномальным.
+-    """
+-
+-    batch_index: int
+-    size: int
+-    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+-    chunks: list[str] = field(default_factory=list)
+-    bytes_seen: int = 0
+-    truncated: bool = False
+-
+-    def feed(self, line: str) -> None:
+-        """Дописать строку вывода. Хвост сверх лимита отбрасывается."""
+-        if self.bytes_seen >= MAX_CAPTURE_BYTES:
+-            self.truncated = True
+-            return
+-        raw = line if line.endswith("\n") else line + "\n"
+-        self.bytes_seen += len(raw.encode("utf-8", "replace"))
+-        self.chunks.append(raw)
+-
+-    @property
+-    def text(self) -> str:
+-        body = "".join(self.chunks)
+-        if self.truncated:
+-            body += (
+-                "\n[вывод обрезан: превышен лимит %d МБ на батч]\n"
+-                % (MAX_CAPTURE_BYTES // (1024 * 1024))
+-            )
+-        return body
+-
+-
+-def batch_id(index: int, started_at: datetime) -> str:
+-    """Идентификатор батча для связи общего лога с архивом.
+-
+-    Читается человеком и сортируется по времени:
+-    ``b0042-20261108T124750``. Номер батча впереди — по нему из warning.log
+-    сразу видно, какой именно батч сохранён.
+-    """
+-    stamp = started_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
+-    return "b%04d-%s" % (index, stamp)
+-
+-
+-#: Исходы, которые считаются аномальными на уровне "error".
+-_ERROR_OUTCOMES = (
+-    BatchOutcome.NO_RESULTS,
+-    BatchOutcome.CONFIG_ERROR,
+-    BatchOutcome.SPAWN_ERROR,
+-)
+-
+-
+-def outcome_level(outcome: BatchOutcome, *, silent: int, size: int) -> str:
+-    """Каким уровнем заслужил батч: "error", "warning" или "info".
+-
+-    Штатный батч — "info": он не сохраняется, если порог строже. Так значение
+-    ``warning`` в конфиге означает «пиши только то, что заслужило
+-    предупреждение», а ``info`` — «пиши вообще всё».
+-    """
+-    if outcome in _ERROR_OUTCOMES:
+-        return "error"
+-
+-    # Батч отработал, но часть серверов промолчала. Формально не ошибка, но
+-    # на практике именно так начинаются массовые сбои: сначала «молчат
+-    # некоторые», потом «молчат все». Поэтому это warning.
+-    if outcome is BatchOutcome.PARTIAL and silent:
+-        # Мелочь на фоне большого батча предупреждением не считаем: пара
+-        # молчащих серверов из полутора сотен — обычное дело.
+-        if size and silent >= max(5, size // 4):
+-            return "warning"
+-        return "info"
+-
+-    return "info"
+-
+-
+-def should_keep(level: str, threshold: str) -> bool:
+-    """Попадает ли уровень батча в порог хранения."""
+-    if threshold not in LEVELS or threshold == "off":
+-        return False
+-    if level == "off":
+-        return False
+-    return LEVELS.index(level) <= LEVELS.index(threshold)
+-
+-
+-def save_anomaly(
+-    *,
+-    root: Path,
+-    capture: AnomalyCapture,
+-    config_text: str | None,
+-    report,
+-    returncode: int | None,
+-    threshold: str,
+-    limit: int,
+-) -> str | None:
+-    """Сохраняет батч в архив, если он того заслужил.
+-
+-    Возвращает идентификатор сохранённого батча или None. Ошибки записи не
+-    пробрасываются: не суметь сохранить улику — плохо, но уронить из-за этого
+-    проверку хуже.
+-    """
+-    if limit <= 0 or threshold == "off":
+-        return None
+-
+-    level = outcome_level(
+-        report.outcome,
+-        silent=int(getattr(report, "silent", 0) or 0),
+-        size=int(capture.size or 0),
+-    )
+-    if not should_keep(level, threshold):
+-        return None
+-
+-    ident = batch_id(capture.batch_index, capture.started_at)
+-    folder = Path(root) / ARCHIVE_DIR_NAME / ident
+-    try:
+-        folder.mkdir(parents=True, exist_ok=True)
+-
+-        if config_text is not None:
+-            (folder / "batch.json").write_text(config_text, encoding="utf-8")
+-        (folder / "singbox.log").write_text(capture.text, encoding="utf-8")
+-
+-        finished = datetime.now(timezone.utc)
+-        meta = {
+-            "id": ident,
+-            "batch_index": capture.batch_index,
+-            "size": capture.size,
+-            "level": level,
+-            "outcome": report.outcome.value,
+-            "error": (report.error or "")[:500],
+-            "returncode": returncode,
+-            "started_at": capture.started_at.isoformat(),
+-            "finished_at": finished.isoformat(),
+-            "elapsed": round(float(getattr(report, "elapsed", 0.0) or 0.0), 2),
+-            "alive": int(getattr(report, "alive", 0) or 0),
+-            "dead": int(getattr(report, "dead", 0) or 0),
+-            "silent": int(getattr(report, "silent", 0) or 0),
+-            "lines_seen": int(getattr(report, "lines_seen", 0) or 0),
+-            "fatal_lines": list(getattr(report, "fatal_lines", []) or [])[:10],
+-            "output_bytes": capture.bytes_seen,
+-            "output_truncated": capture.truncated,
+-        }
+-        (folder / "meta.json").write_text(
+-            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8",
+-        )
+-    except OSError as exc:
+-        LOGGER.warning("Не удалось сохранить архив батча %s: %s", ident, exc)
+-        return None
+-
+-    prune(root, keep=limit)
+-    return ident
+-
+-
+-def prune(root: Path, *, keep: int) -> None:
+-    """Оставляет последние ``keep`` архивов, остальные удаляет.
+-
+-    Сортировка по имени: идентификатор начинается с номера батча и содержит
+-    время, поэтому лексикографический порядок совпадает с хронологическим.
+-    """
+-    if keep <= 0:
+-        return
+-    base = Path(root) / ARCHIVE_DIR_NAME
+-    try:
+-        folders = sorted((p for p in base.iterdir() if p.is_dir()), key=lambda p: p.name)
+-    except OSError:
+-        return
+-    extra = len(folders) - keep
+-    if extra <= 0:
+-        return
+-    removed = 0
+-    for folder in folders[:extra]:
+-        try:
+-            shutil.rmtree(folder, ignore_errors=True)
+-            removed += 1
+-        except OSError:
+-            pass
+-    if removed:
+-        LOGGER.info("Архив батчей: удалено старых записей %d (лимит %d)", removed, keep)
+-
+-
+-__all__ = [
+-    "ARCHIVE_DIR_NAME",
+-    "AnomalyCapture",
+-    "LEVELS",
+-    "MAX_CAPTURE_BYTES",
+-    "batch_id",
+-    "outcome_level",
+-    "prune",
+-    "save_anomaly",
+-    "should_keep",
+-]
+diff --git a/singbox-subscribe/pipeline/checkers/builtin/browser_service.py b/singbox-subscribe/pipeline/checkers/builtin/browser_service.py
+index 21fd461..b29ecd8 100644
+--- a/singbox-subscribe/pipeline/checkers/builtin/browser_service.py
++++ b/singbox-subscribe/pipeline/checkers/builtin/browser_service.py
+@@ -134,7 +134,7 @@ class BrowserServiceChecker(Checker):
+             # сессии увидит ту же страницу, что и обычный HTTP-запрос.
+             LOGGER.warning(
+                 "Browser service: профиль %s не найден, чекер выключен "
+-                "(нужен python browser.py login %s из папки singbox-subscribe)",
++                "(нужен python browser_login.py %s)",
+                 profile, self.service,
+             )
+             self.enabled = False
+diff --git a/singbox-subscribe/pipeline/offenders.py b/singbox-subscribe/pipeline/offenders.py
+deleted file mode 100644
+index 6ba66e3..0000000
+--- a/singbox-subscribe/pipeline/offenders.py
++++ /dev/null
+@@ -1,141 +0,0 @@
+-"""Кто именно сломал конфиг батча.
+-
+-sing-box на старте валидирует конфиг целиком и печатает номер сломанного
+-outbound'а:
+-
+-    FATAL[0000] decode config at ...: outbounds[33].private_key: json: unknown field
+-    FATAL[0000] create service: initialize outbound[41]: invalid public_key
+-    FATAL[0000] create service: initialize endpoint[3]: invalid public_key
+-
+-Раньше это лечилось догадками: писались локальные проверки «похоже ли
+-значение на ключ», и каждый новый способ сломать конфиг пробивал очередную
+-дырку (сначала pbk=enabled, потом private_key в outbounds). Здесь по-другому:
+-сначала запускаем sing-box и получаем ФАКТИЧЕСКУЮ ошибку с номером, потом
+-вырезаем именно этот outbound и запускаем снова. Не «угадали причину», а
+-«убрали то, на что указал sing-box».
+-
+-Модуль намеренно не знает про батчи и базы: только разбор номера из строки
+-и вырезание элемента по номеру. Всё остальное — в pipeline.singbox.
+-"""
+-
+-from __future__ import annotations
+-
+-import re
+-
+-#: Номер сломанного элемента в тексте FATAL.
+-#:
+-#: Два разных формата, и оба встречаются в одном и том же логе:
+-#:
+-#:   * декодер конфига:  outbounds[33].private_key  ← ОТНОСИТЕЛЬНЫЙ индекс
+-#:     внутри массива outbounds (считая selector/urltest/direct, которые
+-#:     сборщик кладёт первыми), плюс имя поля;
+-#:   * старт сервиса:    initialize outbound[41]    ← АБСОЛЮТНЫЙ индекс того
+-#:     же массива (в отчёте sing-box нумерует outbounds вместе с группами).
+-#:
+-#: Оба формата указывают в ОДИН массив, поэтому работают с ним одинаково.
+-#: Секцию (outbounds/endpoints) берём из текста: у endpoints свой массив.
+-_OFFENDER_RES = (
+-    re.compile(r"outbounds\[(?P<idx>\d+)\]", re.IGNORECASE),
+-    re.compile(r"initialize\s+outbound\[(?P<idx>\d+)\]", re.IGNORECASE),
+-    re.compile(r"endpoints\[(?P<idx>\d+)\]", re.IGNORECASE),
+-    re.compile(r"initialize\s+endpoint\[(?P<idx>\d+)\]", re.IGNORECASE),
+-)
+-
+-_ENDPOINT_RE = re.compile(r"endpoints?\[", re.IGNORECASE)
+-
+-
+-def offender_index(text: str) -> tuple[str, int] | None:
+-    """Возвращает ("outbounds"|"endpoints", индекс) сломанного элемента.
+-
+-    None — если в тексте нет указания на конкретный элемент: тогда причину
+-    по номеру не определить и лечить батч вырезанием нельзя.
+-    """
+-    if not text:
+-        return None
+-    section = "endpoints" if _ENDPOINT_RE.search(text) else "outbounds"
+-    for pattern in _OFFENDER_RES:
+-        match = pattern.search(text)
+-        if match:
+-            try:
+-                idx = int(match.group("idx"))
+-            except (TypeError, ValueError):
+-                continue
+-            if idx >= 0:
+-                return section, idx
+-    return None
+-
+-
+-def _tag_of(item) -> str:
+-    if isinstance(item, dict):
+-        return str(item.get("tag") or "")
+-    return ""
+-
+-
+-def _rebuild_without(items: list, idx: int) -> tuple[list, str] | None:
+-    """Убирает элемент idx и все ссылки на вырезанный тег.
+-
+-    Удалять недостаточно: selector/urltest держат список outbounds по тегам,
+-    и висячая ссылка — это уже другая ошибка запуска («outbound not found»),
+-    то есть батч упал бы снова, но по другой причине, и мы бы чинили не то.
+-
+-    Возвращает (новый список, тег) или None, если номер вне диапазона.
+-    """
+-    if idx < 0 or idx >= len(items):
+-        return None
+-    victim = items[idx]
+-    tag = _tag_of(victim)
+-    kept = [item for pos, item in enumerate(items) if pos != idx]
+-    if tag:
+-        for item in kept:
+-            if not isinstance(item, dict):
+-                continue
+-            children = item.get("outbounds")
+-            if isinstance(children, list) and tag in children:
+-                item["outbounds"] = [child for child in children if child != tag]
+-    return kept, tag
+-
+-
+-def prune_config(config: dict, section: str, idx: int) -> str | None:
+-    """Вырезает сломанный элемент прямо в конфиге. Возвращает его тег.
+-
+-    None — если вырезать нечего (номер вне диапазона или ссылок на массив).
+-    Конфиг правится на месте: он всё равно уже никому не нужен, кроме
+-    этого запуска.
+-    """
+-    if not isinstance(config, dict):
+-        return None
+-    items = config.get(section)
+-    if not isinstance(items, list):
+-        return None
+-    rebuilt = _rebuild_without(items, idx)
+-    if rebuilt is None:
+-        return None
+-    kept, tag = rebuilt
+-    config[section] = kept
+-    return tag
+-
+-
+-def drop_group_children(config: dict, tags: set[str]) -> int:
+-    """Убирает теги из списков selector/urltest. Возвращает число правок.
+-
+-    Нужно после того, как строки-виновники выброшены из батча ДО сборки:
+-    без этого группа ссылалась бы на несуществующий outbound и sing-box
+-    упал бы на «outbound not found».
+-    """
+-    if not tags:
+-        return 0
+-    fixed = 0
+-    for section in ("outbounds", "endpoints"):
+-        items = config.get(section)
+-        if not isinstance(items, list):
+-            continue
+-        for item in items:
+-            if not isinstance(item, dict):
+-                continue
+-            children = item.get("outbounds")
+-            if isinstance(children, list):
+-                pruned = [child for child in children if child not in tags]
+-                if len(pruned) != len(children):
+-                    item["outbounds"] = pruned
+-                    fixed += 1
+-    return fixed
+diff --git a/singbox-subscribe/preflight.py b/singbox-subscribe/preflight.py
+index 8bf5c11..279f20b 100644
+--- a/singbox-subscribe/preflight.py
++++ b/singbox-subscribe/preflight.py
+@@ -541,28 +541,6 @@ def check_github_deploy(settings) -> Check:
+                  "включён, репозиторий %s, токен %s" % (repo, _mask(token)))
+ 
+ 
+-def _dir_owner_hint(path) -> str:
+-    """Чей это каталог — одной строкой. Пусто, если выяснить не удалось.
+-
+-    Нужно ровно затем, чтобы «Permission denied» не заставлял гадать: почти
+-    всегда каталог принадлежит root после запуска через sudo, и человеку
+-    достаточно увидеть это словом, а не догадываться по коду ошибки.
+-    """
+-    try:
+-        import pwd  # только POSIX: на Windows модуля нет
+-    except ImportError:
+-        return ""
+-    try:
+-        stat = path.stat()
+-        owner = pwd.getpwuid(stat.st_uid).pw_name
+-        current = pwd.getpwuid(os.getuid()).pw_name
+-    except Exception:  # noqa: BLE001 — подсказка не стоит падения проверки
+-        return ""
+-    if owner == current:
+-        return ""
+-    return " Каталог принадлежит пользователю %s, а вы — %s." % (owner, current)
+-
+-
+ def check_local_deploy(settings) -> Check:
+     """Локальный деплой: можно ли записать файл туда, куда указано.
+ 
+@@ -595,21 +573,11 @@ def check_local_deploy(settings) -> Check:
+         probe.write_text("", encoding="utf-8")
+         probe.unlink()
+     except Exception as exc:  # noqa: BLE001
+-        owner = _dir_owner_hint(target)
+         return Check(
+             "local_deploy", "Локальный деплой", FAIL,
+             "нет доступа на запись: %s" % exc,
+-            fix="Каталог существует, но принадлежит не тому пользователю, "
+-                "от которого вы запускаете программу.%s\n\n"
+-                "Самый частый случай: репозиторий когда-то клонировали или "
+-                "запускали через sudo — тогда каталоги принадлежат root, а "
+-                "обычный пользователь писать в них не может. Убедиться:\n"
+-                "  ls -ld %s\n\n"
+-                "Вернуть себе владение (Linux/macOS):\n"
+-                "  sudo chown -R $USER:$USER %s\n\n"
+-                "Если это не подходит — укажите другой каталог:\n"
+-                "  deploy:\n    local_path: /путь/куда/есть/доступ"
+-                % (owner, target, target.parent),
++            fix="Дайте права на запись в каталог:\n  %s\n"
++                "или укажите другой deploy.local_path." % target,
+             disable="в config.yaml: deploy.local: false",
+         )
+     return Check("local_deploy", "Локальный деплой", OK, "пишет в %s" % target)
+@@ -842,10 +810,8 @@ def check_browser_service(settings) -> Check:
+             "browser_service", "Браузерная проверка", FAIL,
+             "включена, но профиля %s нет — вход не выполнялся" % service,
+             fix="Выполните вход ОДИН раз (откроется окно браузера, "
+-                "войдите в %s вручную). Команда запускается ИЗ ПАПКИ "
+-                "singbox-subscribe:\n"
+-                "  cd singbox-subscribe\n"
+-                "  python browser.py login %s\n\n"
++                "войдите в %s вручную):\n"
++                "  python browser_login.py %s\n\n"
+                 "Профиль сохранится здесь: %s\n"
+                 "Папка лежит ВНЕ репозитория, cookies в git не попадут."
+                 % (service, service, profile),
+@@ -860,11 +826,9 @@ def check_browser_service(settings) -> Check:
+             "browser_service", "Браузерная проверка", FAIL,
+             "профиль %s есть, но cookies входа в нём нет" % service,
+             fix="Профиль создан, но вход не завершён. Повторите и войдите "
+-                "до конца (из папки singbox-subscribe):\n"
+-                "  python browser.py login %s\n\n"
++                "до конца:\n  python browser_login.py %s\n\n"
+                 "Убедиться вручную, что доступ есть:\n"
+-                "  python browser.py check %s --proxy 127.0.0.1:ПОРТ"
+-                % (service, service),
++                "  python browser_check.py %s" % (service, service),
+             disable="уберите browser_service из "
+                     "singbox.enabled_checkers в config.yaml",
+         )
