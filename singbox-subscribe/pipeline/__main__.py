@@ -134,6 +134,11 @@ def _cmd_queue(args) -> int:
                 removed = await db.clear_queue()
                 print(f"Очередь очищена, удалено записей: {removed}")
                 return 0
+            if getattr(args, "purge", False):
+                removed = await db.purge_queue()
+                print(f"Убрано мёртвых и исключённых: {removed}")
+                _dump((await db.queue_stats()).as_dict())
+                return 0
             _dump(stats.as_dict())
             return 0
         finally:
@@ -301,9 +306,15 @@ def build_parser() -> argparse.ArgumentParser:
     add("checkers", _cmd_checkers, "список проверяющих алгоритмов", with_json=False,
         extra=lambda p: p.add_argument("-v", "--verbose", action="store_true"))
     add("queue", _cmd_queue, "счётчики очереди", with_json=False,
-        extra=lambda p: p.add_argument(
-            "--clear-done", action="store_true",
-            help="удалить обработанные записи очереди",
+        extra=lambda p: (
+            p.add_argument(
+                "--clear-done", action="store_true",
+                help="удалить обработанные записи очереди",
+            ),
+            p.add_argument(
+                "--purge", action="store_true",
+                help="убрать строки мёртвых (stable < порога) и исключённых серверов",
+            ),
         ))
     add("logs", _cmd_logs, "где лежат логи и сколько они занимают", with_json=False)
     # config — единственная команда без --checkers: она про файл настроек,

@@ -96,6 +96,11 @@ CREATE INDEX IF NOT EXISTS idx_result_queue_applied
     ON result_queue(applied, id)
 """
 
+#: Сколько мёртвых/исключённых строк очереди выбрасывать за один claim.
+#: Порция, а не всё сразу: 200 тысяч строк под BEGIN IMMEDIATE держали бы
+#: блокировку записи секундами, и служба записи результатов встала бы.
+CLAIM_PURGE_CHUNK = 2000
+
 #: Сколько дней хранить уже разобранные порции. applied=1 строки нужны
 #: только для разбора ошибок; без чистки таблица растёт всю жизнь службы.
 RESULT_QUEUE_KEEP_DAYS = 3
@@ -359,6 +364,42 @@ class Database:
             return 0
         return await self.enqueue(lines, source=SOURCE_POOL)
 
+    async def purge_queue(self, *, limit: int = 0) -> int:
+        """Убирает из очереди строки, которые проверять уже нечего.
+
+        Условие то же, что у пула проверки: сервер исключён (excluded=1)
+        или мёртв (stable < PURGE_STABLE_BELOW). Без этого очередь жила
+        своей жизнью: сервер банился или умирал, а его строка оставалась в
+        pending и её снова забирали в батч — отсюда прогоны по 50 мёртвых
+        серверов подряд на очереди в 200 тысяч.
+
+        limit=0 — вычистить всё (стартовый проход), иначе порция.
+        """
+        return await self._write(self._purge_queue_sync, int(limit))
+
+    def _purge_queue_sync(self, limit: int, conn=None) -> int:
+        threshold = int(self._purge_below)
+        sql = (
+            "DELETE FROM check_queue WHERE key IN ("
+            "  SELECT q.key FROM check_queue q"
+            "  LEFT JOIN servers s ON s.key = q.key"
+            "  WHERE q.status = 'pending'"
+            "    AND (s.key IS NULL OR s.excluded = 1 OR s.stable < ?)"
+        )
+        params: list[object] = [threshold]
+        if limit > 0:
+            sql += " LIMIT ?"
+            params.append(limit)
+        sql += ")"
+        if conn is not None:
+            # Вызывается изнутри уже открытой транзакции claim_batch:
+            # второе соединение здесь взяло бы вторую блокировку записи.
+            cur = conn.execute(sql, params)
+            return cur.rowcount or 0
+        with self._store._connect() as own:
+            cur = own.execute(sql, params)
+            return cur.rowcount or 0
+
     async def claim_batch(self, size: int) -> list[QueueItem]:
         """Забирает до ``size`` строк из очереди и помечает их как взятые в работу.
 
@@ -373,14 +414,22 @@ class Database:
         with self._store._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # Сначала выбрасываем то, что проверять нечего: сервер
+                # забанили или он умер уже ПОСЛЕ постановки в очередь.
+                # Порция, чтобы не держать блокировку на 200 тысячах строк.
+                self._purge_queue_sync(CLAIM_PURGE_CHUNK, conn)
                 rows = conn.execute(
                     """
-                    SELECT key, line, source, attempts FROM check_queue
-                    WHERE status = ?
-                    ORDER BY attempts ASC, enqueued_at ASC, key ASC
+                    SELECT q.key, q.line, q.source, q.attempts
+                    FROM check_queue q
+                    JOIN servers s ON s.key = q.key
+                    WHERE q.status = ?
+                      AND s.excluded = 0
+                      AND s.stable >= ?
+                    ORDER BY q.attempts ASC, q.enqueued_at ASC, q.key ASC
                     LIMIT ?
                     """,
-                    (QUEUE_PENDING, size),
+                    (QUEUE_PENDING, int(self._purge_below), size),
                 ).fetchall()
                 if not rows:
                     conn.commit()

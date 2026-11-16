@@ -132,6 +132,13 @@ class Pipeline:
                 if requeued:
                     LOGGER.info("В очередь возвращено незавершённых записей: %d", requeued)
 
+            # Очередь живёт в базе и переживает прогоны. За это время серверы
+            # успевают умереть или попасть в бан, а строки остаются pending —
+            # их снова забирают в батч. Чистим на старте целиком.
+            purged = await self.db.purge_queue()
+            if purged:
+                LOGGER.info("Из очереди убрано мёртвых и исключённых: %d", purged)
+
             for checker in self.checkers:
                 try:
                     await checker.setup(self.ctx)

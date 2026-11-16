@@ -76,6 +76,12 @@ async def serve(
         if requeued:
             LOGGER.info("В очередь возвращено незавершённых записей: %d", requeued)
 
+    # Строки умерших и забаненных серверов сами из очереди не уходят:
+    # без чистки батчи набираются из мёртвого пула.
+    purged = await db.purge_queue()
+    if purged:
+        LOGGER.info("Из очереди убрано мёртвых и исключённых: %d", purged)
+
     services = build_services(ctx)
     supervisor = Supervisor(services)
 
