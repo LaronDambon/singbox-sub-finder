@@ -344,7 +344,15 @@ class Database:
                 """,
                 payload,
             )
-            return cur.rowcount
+            added = cur.rowcount or 0
+            # Сразу выбрасываем то, что проверять нечего. Discovery кладёт в
+            # очередь ВСЁ, что нашлось в подписках, — включая серверы, которые
+            # давно мертвы или забанены. Без этого очередь за один цикл
+            # раздувается до 200+ тысяч строк, и батчи набираются из мусора.
+            # Порция не меньше размера вставки: за один проход чистим ровно
+            # то, что только что положили.
+            self._purge_queue_sync(max(1000, len(payload)), conn)
+            return added
 
     async def refill_from_pool(
         self, *, limit: int | None = None, min_stable: int | None = None,
