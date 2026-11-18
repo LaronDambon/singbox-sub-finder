@@ -141,12 +141,18 @@ class ApiServiceChecker(Checker):
                 LOGGER.warning("API service: баны %s не загружены: %s", name, exc)
                 self._banned_keys[name] = set()
 
-        total = sum(c.stats()["entries"] for c in self._cache.values())
+        # Разбивка ПО СЕРВИСАМ, а не одно число: общий счётчик складывает
+        # gemini и openrouter, и по нему нельзя понять, почистился ли кэш
+        # конкретного сервиса — 879 записей выглядели как «ничего не удалили»,
+        # хотя 874 из них были openrouter.
+        per_service = {name: c.stats()["entries"] for name, c in self._cache.items()}
+        total = sum(per_service.values())
         LOGGER.info(
             "API service: сервисы %s, проверка для stable >= %d, параллелизм %d, "
-            "в кэше %d записей",
+            "в кэше %d записей (%s)",
             ", ".join(sorted(self.services)), self._min_stable,
             self._concurrency, total,
+            ", ".join("%s %d" % (n, per_service[n]) for n in sorted(per_service)),
         )
 
     def wants(self, ctx: CheckContext, line: str) -> bool:
