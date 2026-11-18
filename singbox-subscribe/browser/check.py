@@ -78,13 +78,21 @@ def check_service(service_name: str, *, proxy: str | None = None,
         except Exception:  # noqa: BLE001
             final_url = spec.url
 
+        # Порядок как в batch.verdict_from_text: заглушка -> аноним ->
+        # вход -> элементы приложения. Признаков ВХОДА достаточно для ok:
+        # на странице с историей чатов поле ввода подписано иначе, и
+        # «Спросить Gemini» там просто нет.
         if hit_block:
             verdict, reason = VERDICT_BLOCKED, "найдена заглушка: %s" % hit_block
         elif anon_hits and not login_hits:
             verdict = VERDICT_BLOCKED
             reason = "не выполнен вход: %s" % anon_hits[0]
+        elif login_hits:
+            verdict = VERDICT_OK
+            reason = "вход выполнен: %s" % ", ".join((login_hits + ok_hits)[:3])
         elif len(ok_hits) >= spec.ok_threshold:
-            verdict, reason = VERDICT_OK, "приложение отрисовалось (%s)" % ", ".join(ok_hits[:3])
+            verdict = VERDICT_UNKNOWN
+            reason = "нет признаков входа (элементы приложения есть)"
         else:
             verdict = VERDICT_UNKNOWN
             preview = " ".join(text.split())[:120]
