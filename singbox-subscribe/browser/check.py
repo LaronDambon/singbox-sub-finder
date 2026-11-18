@@ -66,6 +66,12 @@ def check_service(service_name: str, *, proxy: str | None = None,
         low = text.lower()
         hit_block = next((m for m in spec.blocked_markers if m.lower() in low), None)
         ok_hits = [m for m in spec.ok_markers if m.lower() in low]
+        # Признаки анонимной страницы: вход в профиль не применился. Без этой
+        # проверки такая страница попадала в "unknown" («ни заглушки, ни
+        # приложения»), и по логу нельзя было понять, что дело не в сервере,
+        # а в сессии браузера.
+        anon_hits = [m for m in getattr(spec, "anon_markers", ()) if m.lower() in low]
+        login_hits = [m for m in getattr(spec, "login_markers", ()) if m.lower() in low]
 
         try:
             final_url = page.url
@@ -74,6 +80,9 @@ def check_service(service_name: str, *, proxy: str | None = None,
 
         if hit_block:
             verdict, reason = VERDICT_BLOCKED, "найдена заглушка: %s" % hit_block
+        elif anon_hits and not login_hits:
+            verdict = VERDICT_BLOCKED
+            reason = "не выполнен вход: %s" % anon_hits[0]
         elif len(ok_hits) >= spec.ok_threshold:
             verdict, reason = VERDICT_OK, "приложение отрисовалось (%s)" % ", ".join(ok_hits[:3])
         else:
