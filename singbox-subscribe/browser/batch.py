@@ -376,6 +376,35 @@ def attach_failure_counter(page):
     return failures
 
 
+#: Сетевые ошибки, которые означают «через этот сервер сервис недоступен».
+#: Их причина — на стороне прокси (сброс, отказ, таймаут, не разрешилось имя),
+#: а не «мы не поняли, что на странице». Поэтому это бан, а не unknown.
+_NETWORK_FAILURES = (
+    "ERR_CONNECTION_RESET",
+    "ERR_CONNECTION_CLOSED",
+    "ERR_CONNECTION_REFUSED",
+    "ERR_CONNECTION_ABORTED",
+    "ERR_CONNECTION_FAILED",
+    "ERR_TUNNEL_CONNECTION_FAILED",
+    "ERR_SOCKS_CONNECTION_FAILED",
+    "ERR_PROXY_CONNECTION_FAILED",
+    "ERR_TIMED_OUT",
+    "ERR_EMPTY_RESPONSE",
+    "ERR_NAME_NOT_RESOLVED",
+    "ERR_ADDRESS_UNREACHABLE",
+    "ERR_NETWORK_CHANGED",
+)
+
+
+def _network_failure_kind(detail: str) -> str:
+    """Код сетевой ошибки из текста Playwright ('' если это не она)."""
+    text = str(detail or "").upper()
+    for code in _NETWORK_FAILURES:
+        if code in text:
+            return code
+    return ""
+
+
 def _probe_once(page, spec, timeout_ms: int):
     """Одна попытка: открыть сервис и прочитать вердикт по тексту страницы.
 
@@ -386,10 +415,13 @@ def _probe_once(page, spec, timeout_ms: int):
     try:
         page.goto(spec.url, wait_until="domcontentloaded", timeout=timeout_ms)
     except Exception as exc:  # noqa: BLE001
-        # Тип исключения Playwright всегда "Error" — без текста причины
-        # вердикт «не открылось» не отличить от таймаута прокси или от
-        # ERR_CONNECTION_RESET, а лечатся они по-разному.
+        # Тип исключения Playwright всегда "Error", поэтому смотрим на текст:
+        # там код сетевой ошибки. Сетевые коды означают, что СЕРВЕР не смог
+        # довезти соединение до сервиса — для отбора это бан, а не «не знаю».
         detail = str(exc).splitlines()[0][:140] if str(exc) else ""
+        kind = _network_failure_kind(detail)
+        if kind:
+            return VERDICT_BLOCKED, "сервер не пускает: %s" % kind
         return (VERDICT_UNKNOWN,
                 "не открылось: %s%s" % (type(exc).__name__,
                                         (": " + detail) if detail else ""))

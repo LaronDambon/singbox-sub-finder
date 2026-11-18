@@ -295,8 +295,9 @@ def refine_lines(service_name: str, lines, *, max_checks: int = 25,
                 timeout_ms=45000, wait_seconds=spec.wait_seconds, cache=cache, log=None)
             res = one.get(line) or {}
             results[line] = res
-            say('Browser [%s] %s (%ss)' % (res.get('verdict'), line[:52],
-                                           res.get('elapsed')))
+            say('Browser [%s] %s (%ss) %s' % (
+                res.get('verdict'), line[:52], res.get('elapsed'),
+                (res.get('reason') or '')[:90]))
             if pause:
                 time.sleep(max(0.0, pause))
     finally:
