@@ -58,6 +58,29 @@ def run_preflight() -> int:
         return 0
 
 
+def _looks_like_pipeline(argv: list[str]) -> bool:
+    """Это ДЕЙСТВИТЕЛЬНО запущенный main.py, а не упоминание в чужой команде.
+
+    Раньше проверка искала подстроку "main.py" в командной строке любого
+    процесса. Из-за этого её обманывала любая команда, где встречалось это
+    слово: "grep main.py", "tail -f main.py", редактор с открытым файлом.
+    Надзорник решал, что pipeline уже работает, и не запускал его — до
+    следующего тика в 30 минут, а то и дольше.
+
+    Теперь смотрим на структуру: первым аргументом интерпретатор Python,
+    а среди остальных — путь, который заканчивается на singbox-subscribe/main.py.
+    """
+    if len(argv) < 2:
+        return False
+    if "python" not in os.path.basename(argv[0]).lower():
+        return False
+    return any(
+        arg.replace("\\", "/").endswith("singbox-subscribe/main.py")
+        or arg.replace("\\", "/").endswith("/main.py")
+        for arg in argv[1:]
+    )
+
+
 def is_main_running() -> bool:
     if sys.platform.startswith("linux") and Path("/proc").exists():
         for entry in os.listdir("/proc"):
@@ -73,7 +96,9 @@ def is_main_running() -> bool:
                 continue
             if not raw:
                 continue
-            if b"main.py" in raw:
+            argv = [part.decode("utf-8", "replace")
+                    for part in raw.split(b"\0") if part]
+            if _looks_like_pipeline(argv):
                 return True
         return False
 
@@ -83,7 +108,14 @@ def is_main_running() -> bool:
         return False
 
     for line in output.splitlines():
-        if "main.py" in line and str(os.getpid()) not in line:
+        if str(os.getpid()) in line:
+            continue
+        # Первое поле — PID, дальше командная строка целиком.
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        argv = parts[1].split()
+        if _looks_like_pipeline(argv):
             return True
     return False
 
