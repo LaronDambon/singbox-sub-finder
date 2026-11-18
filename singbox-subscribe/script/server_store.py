@@ -502,20 +502,20 @@ class ServerStore:
         name = str(prefix or "").strip() or "pass"
         return f"{name}-{_now()}"
 
-    def begin_capabilities_pass(self, pass_mark: str) -> int:
-        """Номерует проход: у ВСЕХ серверов профиль становится «неписаным».
+    def begin_capabilities_pass(self, pass_mark: str,
+                                keys: Sequence[str] | None = None) -> int:
+        """Номерует проход: профиль сервера становится «неписаным».
 
-        Метка прохода (capabilities_pass) — это признак «в этом проходе
-        профиль уже кто-то записал». Пока она не равна метке текущего
-        прохода, первый ответивший чекер считает себя первым и затирает
-        профиль целиком; тем же проходом помечаются те серверы, чьи
-        подписки попали в базу (upsert_lines).
+        Метка прохода (capabilities_pass) — признак «в этом проходе профиль
+        уже кто-то записал». Пока она не равна метке текущего прохода, первый
+        ответивший чекер считает себя первым и затирает профиль целиком;
+        тем же проходом помечаются серверы, чьи подписки попали в базу
+        (upsert_lines).
 
-        Отсюда и побочный эффект: строка, которую в этом проходе не
-        перепроверил НИКТО, сохраняет метку прошлого прохода и при следующей
-        проверке сбрасывается первой же ответившей пробой. Мусорный тег,
-        которого больше не ставит ни один чекер, так исчезает за один круг,
-        а не живёт в базе вечно.
+        keys — метить только эти серверы (батч, который сейчас пойдёт в
+        проверку). Без него метка снимается у ВСЕХ: так делать не надо —
+        это обесценивало профили всего пула разом, включая серверы, которые
+        в этом цикле даже не будут проверены.
 
         Возвращает число затронутых строк.
         """
@@ -523,11 +523,21 @@ class ServerStore:
         if not mark:
             return 0
         with self._connect() as conn:
-            cur = conn.execute(
-                "UPDATE servers SET capabilities_pass = ? WHERE capabilities_pass <> ?",
-                (mark, mark),
-            )
-            return cur.rowcount or 0
+            if keys is None:
+                cur = conn.execute(
+                    "UPDATE servers SET capabilities_pass = ? WHERE capabilities_pass <> ?",
+                    (mark, mark),
+                )
+                return cur.rowcount or 0
+            updated = 0
+            for key in keys:
+                cur = conn.execute(
+                    "UPDATE servers SET capabilities_pass = ? "
+                    "WHERE key = ? AND capabilities_pass <> ?",
+                    (mark, key, mark),
+                )
+                updated += cur.rowcount or 0
+            return updated
 
     # ------------------------------------------------------- теги сервера
     @staticmethod

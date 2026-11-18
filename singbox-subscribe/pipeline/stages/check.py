@@ -150,16 +150,13 @@ class CheckStage:
         self._unknown = 0
         self._enriched = 0
         self.stable_map = await self.db.stable_map()
-        # Номер прохода: снимаем метку у всех серверов, чтобы первый
-        # ответивший по каждому из них снова стал первым писателем.
+        # Номер прохода. Метку НЕ снимаем у всех сразу: профиль сервера
+        # обнуляется ровно тогда, когда его батч пошёл в проверку — см.
+        # _dispatch_loop/_worker. Раньше метка снималась у всего пула на
+        # старте цикла, и профили всех серверов разом становились
+        # «неписаными», хотя проверить их в этом цикле никто и не собирался.
         self._pass = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        try:
-            reset = await self.db.begin_capabilities_pass(self._pass)
-            LOGGER.info("Проход %s: профиль тегов сброшен у %d серверов",
-                        self._pass, reset)
-        except Exception:  # noqa: BLE001 — без метки профили просто копятся
-            LOGGER.exception("Не удалось начать проход тегов, работаю без метки")
-            self._pass = ""
+        LOGGER.info("Проход %s: профиль тегов сбрасывается по батчам", self._pass)
 
         LOGGER.info(
             "Этап проверки: батч до %d серверов, %s, решающие: %s, дополнения: %s",
@@ -207,6 +204,23 @@ class CheckStage:
             "db": stats,
         }
 
+    async def _begin_pass_for(self, items) -> None:
+        """Снимает метку прохода у серверов ЭТОГО батча.
+
+        Профиль обнуляется ровно тогда, когда сервер пошёл в проверку, а не
+        на старте цикла для всего пула. Сервер, до которого очередь не
+        дошла, сохраняет свои теги — и в конфиг попадает с ними, а не
+        пустым.
+        """
+        if not self._pass or not items:
+            return
+        try:
+            await self.db.begin_capabilities_pass(
+                self._pass, keys=[item.key for item in items],
+            )
+        except Exception:  # noqa: BLE001 — без метки профиль просто копится
+            LOGGER.exception("Не удалось начать проход для батча")
+
     # ------------------------------------------------- служба 1 + служба 2
     async def _dispatch_loop(self) -> None:
         """Набирает серверы из базы и гоняет их батчами через sing-box."""
@@ -231,6 +245,7 @@ class CheckStage:
                 await asyncio.sleep(IDLE_SLEEP)
                 continue
 
+            await self._begin_pass_for(items)
             self._batches += 1
             batch_no = self._batches
             lines = [item.line for item in items]
@@ -418,6 +433,7 @@ class CheckStage:
                     return
                 await asyncio.sleep(IDLE_SLEEP)
                 continue
+            await self._begin_pass_for(items)
             await self._process(worker_name, items)
 
     async def _process(self, worker_name: str, items: "Sequence[QueueItem]") -> None:

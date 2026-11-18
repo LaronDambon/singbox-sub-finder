@@ -287,13 +287,16 @@ class Database:
         """Свежая метка прохода (см. ServerStore.new_pass_mark)."""
         return self._store.new_pass_mark(prefix)
 
-    async def begin_capabilities_pass(self, pass_mark: str) -> int:
-        """Начинает проход: снимает у всех серверов признак «профиль записан».
+    async def begin_capabilities_pass(self, pass_mark: str,
+                                      keys: Sequence[str] | None = None) -> int:
+        """Начинает проход: снимает признак «профиль записан».
 
-        После этого первый ответивший по серверу чекер пишет профиль тегов
-        СБРОСОМ, а остальные дописывают. Подробности — в ServerStore.
+        keys — только эти серверы (батч, который сейчас пойдёт в проверку).
+        Без keys метка снимается у всех — так больше не вызывается.
         """
-        return await self._write(self._store.begin_capabilities_pass, pass_mark)
+        return await self._write(
+            self._store.begin_capabilities_pass, pass_mark, keys=keys,
+        )
 
     async def bad_keys(self) -> set[str]:
         """Ключи уже забаненных строк (см. ServerStore.bad_keys)."""
