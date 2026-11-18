@@ -386,7 +386,13 @@ def _probe_once(page, spec, timeout_ms: int):
     try:
         page.goto(spec.url, wait_until="domcontentloaded", timeout=timeout_ms)
     except Exception as exc:  # noqa: BLE001
-        return VERDICT_UNKNOWN, "не открылось: %s" % type(exc).__name__
+        # Тип исключения Playwright всегда "Error" — без текста причины
+        # вердикт «не открылось» не отличить от таймаута прокси или от
+        # ERR_CONNECTION_RESET, а лечатся они по-разному.
+        detail = str(exc).splitlines()[0][:140] if str(exc) else ""
+        return (VERDICT_UNKNOWN,
+                "не открылось: %s%s" % (type(exc).__name__,
+                                        (": " + detail) if detail else ""))
 
     failures = attach_failure_counter(page)
 

@@ -41,9 +41,11 @@ def check_service(service_name: str, *, proxy: str | None = None,
         try:
             page.goto(spec.url, wait_until="domcontentloaded", timeout=60_000)
         except Exception as exc:  # noqa: BLE001
+            detail = str(exc).splitlines()[0][:140] if str(exc) else ""
             return {
                 "service": spec.name, "verdict": VERDICT_UNKNOWN,
-                "reason": "не открылось: %s" % type(exc).__name__,
+                "reason": "не открылось: %s%s" % (
+                    type(exc).__name__, (": " + detail) if detail else ""),
                 "url": spec.url, "elapsed": round(time.time() - started, 1),
                 "cookies": "",
             }
