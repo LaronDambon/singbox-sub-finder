@@ -335,10 +335,18 @@ class ServerStore:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
             self._ensure_ever_pinged_column(conn)
-            # Нормализация накопленных значений: stable не бывает ниже
-            # «мёртвой» отметки (нижний порог - 1).
+            # Нормализация накопленных значений: обычный мёртвый сервер не
+            # бывает ниже «мёртвой» отметки (нижний порог - 1).
+            #
+            # Зона UNPARSABLE_STABLE (-999) — отдельная и НЕ трогается: там
+            # лежат строки, которые нечем проверять. Раньше этот UPDATE
+            # зажимал их до -1 на каждом открытии базы, и метка «это мусор»
+            # стиралась при первом же обращении к базе.
             dead = self._dead_stable()
-            conn.execute("UPDATE servers SET stable = ? WHERE stable < ?", (dead, dead))
+            conn.execute(
+                "UPDATE servers SET stable = ? WHERE stable < ? AND stable > ?",
+                (dead, dead, self.UNPARSABLE_STABLE),
+            )
         self._maybe_migrate_stable_zones()
         self._maybe_migrate_shield()
         self._maybe_migrate_legacy()
