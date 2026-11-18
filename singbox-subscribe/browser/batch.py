@@ -392,6 +392,10 @@ def _probe_once(page, spec, timeout_ms: int):
 
     deadline = time.time() + spec.wait_seconds
     best = (VERDICT_UNKNOWN, "маркеры не появились за %.0f с" % spec.wait_seconds)
+    # Последний прочитанный текст: без него вердикт «маркеры не появились»
+    # ничего не говорит — непонятно, была ли страница пустой, заглушкой
+    # другого образца или вообще не тем, что ждали.
+    last_text = ""
     # Небольшая пауза после ok: заглушка может дорисоваться позже навигации.
     settle_after_ok = 5.0
     ok_seen_at = None
@@ -400,6 +404,8 @@ def _probe_once(page, spec, timeout_ms: int):
             text = page.inner_text("body") or ""
         except Exception:  # noqa: BLE001
             text = ""
+        if text:
+            last_text = text
         verdict, reason = verdict_from_text(spec, text)
         if verdict == VERDICT_BLOCKED:
             return VERDICT_BLOCKED, reason
@@ -420,4 +426,9 @@ def _probe_once(page, spec, timeout_ms: int):
     # Время вышло: если маркеры были, но бэкенд обрывался — сервер негодный.
     if best[0] == VERDICT_OK and failures:
         return (VERDICT_BLOCKED, "бэкенд недоступен: %s" % failures[0][-70:])
+    if best[0] == VERDICT_UNKNOWN:
+        preview = " ".join(last_text.split())[:160]
+        return (VERDICT_UNKNOWN,
+                "маркеры не появились за %.0f с; страница: %s"
+                % (spec.wait_seconds, preview or "(пусто)"))
     return best

@@ -289,7 +289,10 @@ def refine_lines(service_name: str, lines, *, max_checks: int = 25,
                     break
             one = bbatch.check_batch(
                 spec.name, [(line, '127.0.0.1:%d' % port)], workers=1,
-                timeout_ms=28000, wait_seconds=16.0, cache=cache, log=None)
+                # Выдержка берётся из спеки сервиса (Gemini — 25 с): на 16 с
+                # страница через медленный прокси просто не успевала
+                # отрисоваться, и вердикт уходил в unknown.
+                timeout_ms=45000, wait_seconds=spec.wait_seconds, cache=cache, log=None)
             res = one.get(line) or {}
             results[line] = res
             say('Browser [%s] %s (%ss)' % (res.get('verdict'), line[:52],
