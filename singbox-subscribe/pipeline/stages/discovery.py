@@ -88,6 +88,23 @@ class DiscoveryStage:
             len(lines), len(files), duplicates,
         )
 
+        # Уже забаненные строки не разбираем заново. Подписки каждый цикл
+        # отдают одни и те же битые ссылки: без этого фильтра каждая из них
+        # снова проходила через парсер, писала по строке в лог и снова
+        # отправлялась в чс — тысячи записей на круг впустую.
+        try:
+            bad = await db.bad_keys()
+        except Exception:  # noqa: BLE001 — фильтр не важнее поиска
+            bad = set()
+        if bad:
+            from script.downloader import normalize_proxy_key
+
+            before = len(lines)
+            lines = [ln for ln in lines if normalize_proxy_key(ln) not in bad]
+            dropped = before - len(lines)
+            if dropped:
+                logger.info("Поиск: %d ссылок уже в чс — разбор пропущен", dropped)
+
         parsable, unparsable = await self.ctx.run_sync(core_mod.split_parsable_lines, lines)
         if unparsable:
             logger.info(

@@ -314,22 +314,9 @@ class BatchDispatcher:
                     "capabilities": "",
                 })
 
-        # Не возвращаем в очередь бесконечно: сервер, про который sing-box
-        # так и не сказал ни слова, после лимита попыток снимается с проверки.
-        exhausted = [line for line in seen_retry if by_line.get(line, 0) >= self.max_retries]
-        for line in exhausted:
-            seen_retry.pop(line, None)
-        retry = list(seen_retry)
-        if exhausted:
-            stats.dropped += len(exhausted)
-            LOGGER.warning(
-                "Снято с проверки без вердикта после %d попыток: %d серверов "
-                "(sing-box ни разу не ответил про них)",
-                self.max_retries, len(exhausted),
-            )
         # Страховка от массовой потери базы: если в чёрный список уходит почти
         # весь набор, это почти наверняка поломка разбора, а не битые ссылки.
-        # Такие строки не выписываются, а просто возвращаются в очередь.
+        # Такие строки не выписываются, а возвращаются в очередь.
         if len(items) > 1 and len(unparsable) >= len(items) * 0.9:
             LOGGER.error(
                 "НЕ отправляю в чёрный список %d строк из %d: слишком много "
@@ -339,7 +326,28 @@ class BatchDispatcher:
             for line in unparsable:
                 seen_retry.setdefault(line, None)
             unparsable = []
-            retry = list(seen_retry)
+
+        # Лимит попыток считаем ПОСЛЕ страховки, а не до неё.
+        #
+        # Раньше было наоборот, и это давало вечный цикл: строки, которые
+        # страховка вернула в очередь, попадали в seen_retry уже ПОСЛЕ подсчёта
+        # лимита — до него они не доходили никогда и крутились бесконечно.
+        # Ровно так ShadowsocksR-строки и «уходили в чёрный список» каждый
+        # цикл, ни разу туда не попав.
+        exhausted = [line for line in seen_retry if by_line.get(line, 0) >= self.max_retries]
+        for line in exhausted:
+            seen_retry.pop(line, None)
+            # После лимита попыток строка идёт в полноценный чс, а не просто
+            # снимается с проверки: иначе она вернётся из подписки как новая.
+            unparsable.append(line)
+        retry = list(seen_retry)
+        if exhausted:
+            LOGGER.warning(
+                "В чёрный список после %d попыток без вердикта: %d серверов "
+                "(sing-box ни разу не ответил про них)",
+                self.max_retries, len(exhausted),
+            )
+            stats.dropped += len(exhausted)
 
         stats.retry += len(retry)
         stats.unparsable += len(unparsable)

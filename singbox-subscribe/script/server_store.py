@@ -896,14 +896,23 @@ class ServerStore:
                     )
         return {"added": added, "updated": updated, "skipped": skipped}
 
+    #: stable для строк, которые нечем проверять. Резко ниже любого порога:
+    #: такая строка не должна вернуться в проверку ни при каких настройках,
+    #: даже если кто-то сбросит excluded.
+    UNPARSABLE_STABLE = -999
+
     def blacklist_unparsable(self, lines: Iterable[str]) -> int:
         """Отправляет неразбираемые строки в полноценный чс.
 
         Строка, из которой ни один парсер не может собрать узел, не
         проверяется вообще: она лишь занимает слот в батче проверки и засоряет
-        лог. Помечаем её excluded=1 и stable = PURGE_STABLE_BELOW - 1 (умерший
-        сервер) — тогда она выпадает из пула проверки (check_pool, фильтр
-        stable >= PURGE_STABLE_BELOW) и попадает в blacklist.txt.
+        лог. Помечаем её excluded=1 и stable = UNPARSABLE_STABLE (-999) — тогда
+        она выпадает из пула проверки при любом пороге и не возвращается в
+        очередь.
+
+        Раньше здесь стоял PURGE_STABLE_BELOW - 1 (-1): строка формально
+        считалась «умершей», но оставалась в общей зоне мёртвых, и отличить
+        её от сервера, который просто перестал отвечать, было нельзя.
 
         Существующие серверы не теряются: обновляется только флаг/зона,
         строка (line) и страна остаются как были.
@@ -911,7 +920,7 @@ class ServerStore:
         Возвращает количество уникальных ключей, переведённых в чс.
         """
         now = _now()
-        dead = self._dead_stable()
+        dead = self.UNPARSABLE_STABLE
         unique: dict[str, str] = {}
         for raw in lines:
             clean = str(raw).strip()
@@ -937,6 +946,21 @@ class ServerStore:
                 [(dead, now, key) for key in unique],
             )
         return len(unique)
+
+    def bad_keys(self) -> set[str]:
+        """Ключи строк, которые уже признаны негодными.
+
+        Нужно поиску: подписки каждый цикл отдают одни и те же битые ссылки,
+        и разбирать их заново — значит снова писать в лог по строке на
+        каждую и снова отправлять в чс. Список ключей позволяет отбросить
+        их ДО разбора.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT key FROM servers WHERE excluded = 1 OR stable <= ?",
+                (self.UNPARSABLE_STABLE,),
+            ).fetchall()
+        return {str(r["key"]) for r in rows}
 
     def record_results(self, rows: Sequence[dict]) -> None:
         """Записывает результаты проверки пачкой (один commit на batch).

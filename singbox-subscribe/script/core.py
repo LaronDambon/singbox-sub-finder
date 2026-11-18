@@ -292,6 +292,13 @@ def parse_content(content):
     return nodelist
 
 
+#: Протоколы, которые sing-box больше не поддерживает. Разбирать их незачем:
+#: процесс на таком outbound не поднимается вовсе —
+#: "ShadowsocksR is deprecated and removed in sing-box 1.6.0".
+#: Строка уходит в чс ещё на разборе, а не в батч.
+UNSUPPORTED_PROTOCOLS = frozenset({"ssr"})
+
+
 def get_parser(node):
     """Возвращает функцию разбора протокола или None.
 
@@ -301,6 +308,8 @@ def get_parser(node):
     «исключений нет».
     """
     proto = tool.get_protocol(node)
+    if proto in UNSUPPORTED_PROTOCOLS:
+        return None
     excluded = (providers or {}).get('exclude_protocol') or ''
     if excluded:
         eps = excluded.split(',')

@@ -295,6 +295,10 @@ class Database:
         """
         return await self._write(self._store.begin_capabilities_pass, pass_mark)
 
+    async def bad_keys(self) -> set[str]:
+        """Ключи уже забаненных строк (см. ServerStore.bad_keys)."""
+        return await self._run(self._store.bad_keys)
+
     async def blacklist_unparsable(self, lines: Iterable[str]) -> int:
         """Убирает из ротации строки, которые нечем проверять."""
         return await self._write(self._store.blacklist_unparsable, list(lines))
