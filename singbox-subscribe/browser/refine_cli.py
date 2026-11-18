@@ -42,14 +42,23 @@ def main(argv=None) -> int:
     cache = DbVerdictCache(args.service, store=store)
 
     if args.clear_cache:
-        # Чистим только вердикты БРАУЗЕРА по этому сервису. Куки входа лежат
-        # в профиле и не трогаются: это разные вещи.
+        # Чистим ВСЕ вердикты по сервису — и браузерные, и API-шные, и ok, и
+        # ban. Раньше удалялись только строки checked_by='browser', поэтому
+        # «ok» от API оставался и продолжал влиять на отбор.
+        # Куки входа лежат в профиле и не трогаются: это разные вещи.
         with store._connect() as conn:  # noqa: SLF001 — свой же класс
+            before = {
+                (r["verdict"] or "?"): r["n"]
+                for r in conn.execute(
+                    "SELECT verdict, COUNT(*) AS n FROM service_bans "
+                    "WHERE service = ? GROUP BY verdict", (args.service,),
+                )
+            }
             cur = conn.execute(
-                "DELETE FROM service_bans WHERE service = ? AND checked_by = 'browser'",
-                (args.service,),
+                "DELETE FROM service_bans WHERE service = ?", (args.service,),
             )
-            print("Удалено вердиктов браузера: %d" % (cur.rowcount or 0))
+            print("Было: %s" % (before or "пусто"))
+            print("Удалено вердиктов: %d" % (cur.rowcount or 0))
         cache = DbVerdictCache(args.service, store=store)
 
     print("Проверка из-под сессии. Логин не трогаем, чистим только вердикты.")
