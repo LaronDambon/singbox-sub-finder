@@ -599,13 +599,21 @@ class ServerStore:
         сохраняются, свои добавляются/обновляются.
         """
         if reset:
-            # Сбрасываем только свой вид: новый проход сервисов не должен
-            # стирать ISP/город, которые считаются отдельно и надолго.
+            # Сбрасываем только свой вид и только теги ПРОХОДА.
+            #
+            # Вердикты сервисов (gemini-chat, gemini-api) живут по своему TTL
+            # и ставятся медленными транспортами; у них заполнен checked_at.
+            # Раньше сброс удалял ВСЕ сервисные теги ключа, и вердикт браузера
+            # стирался при первом же попадании сервера в батч — сервер снова
+            # оказывался «непроверенным», хотя проверялся час назад.
             conn.execute(
-                "DELETE FROM server_tags WHERE key = ? AND kind = ?", (key, kind),
+                "DELETE FROM server_tags WHERE key = ? AND kind = ? AND checked_at = ''",
+                (key, kind),
             )
 
-        stamp = _now() if checked_at is None else str(checked_at)
+        # Пустая метка = тег ПРОХОДА (reachability и прочее): его снимает
+        # следующий сброс. Непустая = вердикт сервиса со своим TTL.
+        stamp = str(checked_at or "")
 
         merged: dict[str, dict] = {}
         for tag in passed:
@@ -632,16 +640,20 @@ class ServerStore:
                     ping_ms    = COALESCE(excluded.ping_ms, server_tags.ping_ms),
                     passed     = excluded.passed,
                     kind       = excluded.kind,
-                    checked_at = excluded.checked_at
+                    -- Метку времени вердикта не затираем пустой: тег прохода
+                    -- не должен обнулять срок жизни вердикта сервиса.
+                    checked_at = CASE WHEN excluded.checked_at <> ''
+                                      THEN excluded.checked_at
+                                      ELSE server_tags.checked_at END
                 """,
                 (tag, key, values.get("ping_ms"), values.get("passed", 0), kind, stamp),
             )
 
     def tags_for_key(self, key: str) -> list[dict]:
-        """Все теги одного сервера: [{tag, ping_ms, passed}]."""
+        """Все теги одного сервера: [{tag, ping_ms, passed, kind, checked_at}]."""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT tag, ping_ms, passed, kind FROM server_tags "
+                "SELECT tag, ping_ms, passed, kind, checked_at FROM server_tags "
                 "WHERE key = ? ORDER BY kind, tag",
                 (key,),
             ).fetchall()
@@ -1493,10 +1505,20 @@ class ServerStore:
         # задаётся не тегом, а сортировкой по задержке до цели
         # (см. select_by_tag: лучшие — первые N, резерв — следующие M).
         tags_by_key: dict[str, list[str]] = {}
+        # Вердикты сервисов (checked_at != '') годятся только пока свежие:
+        # у них свой TTL, и просроченный вердикт не должен попадать в имя.
+        # Теги прохода (checked_at = '') живут до следующего сброса.
+        try:
+            ttl = float(get_settings().setting("singbox.verdict_ttl_hours", 0) or 0)
+        except Exception:  # noqa: BLE001
+            ttl = 0.0
+        cutoff = _now_shifted(hours=-(ttl or self.VERDICT_TTL_HOURS))
         with self._connect() as conn:
             for trow in conn.execute(
                 "SELECT key, tag FROM server_tags "
-                "WHERE passed = 1 AND kind = 'service' ORDER BY tag"
+                "WHERE passed = 1 AND kind = 'service' "
+                "AND (checked_at = '' OR checked_at >= ?) ORDER BY tag",
+                (cutoff,),
             ):
                 tags_by_key.setdefault(trow["key"], []).append(trow["tag"])
 
