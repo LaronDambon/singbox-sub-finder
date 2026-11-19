@@ -132,8 +132,21 @@ def _capture_enabled() -> bool:
 def start_singbox(config: dict, config_path: Path):
     """Запускает sing-box с батч-конфигом. Возвращает процесс или None."""
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    with config_path.open("w", encoding="utf-8") as fh:
-        json.dump(config, fh, ensure_ascii=False)
+    try:
+        with config_path.open("w", encoding="utf-8") as fh:
+            json.dump(config, fh, ensure_ascii=False)
+    except PermissionError:
+        # Файл остался от запуска под ДРУГИМ пользователем (типичный случай:
+        # пайплайн когда-то гоняли через sudo, и конфиги батчей принадлежат
+        # root). Каталог свой и доступен на запись — значит достаточно убрать
+        # чужой файл и создать заново. Раньше это роняло весь батч
+        # исключением PermissionError.
+        try:
+            config_path.unlink()
+        except OSError:
+            pass
+        with config_path.open("w", encoding="utf-8") as fh:
+            json.dump(config, fh, ensure_ascii=False)
     kwargs = {
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
