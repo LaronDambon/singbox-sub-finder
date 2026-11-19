@@ -58,8 +58,13 @@ async def check_once(ctx, checker, chunk: int) -> int:
     lines = await ctx.db.lines_with_tags(_candidate_tags(checker), limit=chunk)
     if not lines:
         return 0
+    # Карта меток обязательна: чекер отбирает кандидатов по ней
+    # (CheckContext.capabilities_of). Без неё все строки выглядят «без метки»
+    # и отсеиваются, хотя lines_with_tags их только что выбрал по метке.
+    caps = await ctx.db.capabilities_map(lines)
     check_ctx = CheckContext(
-        lines, settings=ctx.settings, db=ctx.db, logger=ctx.logger, pass_mark="",
+        lines, settings=ctx.settings, db=ctx.db, logger=ctx.logger,
+        capabilities_by_line=caps, pass_mark="",
     )
     result = await checker.check(check_ctx)
     rows = []

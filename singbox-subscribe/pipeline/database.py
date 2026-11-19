@@ -298,6 +298,38 @@ class Database:
             self._store.begin_capabilities_pass, pass_mark, keys=keys,
         )
 
+    async def capabilities_map(self, lines) -> dict[str, str]:
+        """Строка прокси -> её метки через запятую (только service).
+
+        Нужно браузерному циклу: чекер отбирает кандидатов по меткам через
+        CheckContext.capabilities_of, а карту ему никто не передавал — из-за
+        этого все кандидаты отсеивались как «без метки».
+        """
+        from script.downloader import normalize_proxy_key
+
+        pairs = {}
+        for raw in lines or []:
+            text = str(raw).strip()
+            if not text:
+                continue
+            key = normalize_proxy_key(text)
+            if key:
+                pairs[key] = text
+        if not pairs:
+            return {}
+        keys = list(pairs)
+        out: dict[str, list[str]] = {k: [] for k in keys}
+        with self._store._connect() as conn:
+            for start in range(0, len(keys), 500):
+                chunk = keys[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                for row in conn.execute(
+                    f"SELECT key, tag FROM server_tags WHERE kind = 'service' "
+                    f"AND key IN ({placeholders})", chunk,
+                ):
+                    out.setdefault(str(row["key"]), []).append(str(row["tag"]))
+        return {pairs[k]: ",".join(sorted(v)) for k, v in out.items()}
+
     async def lines_with_tags(self, tags, *, limit: int | None = None,
                               only_available: bool = True) -> list[str]:
         """Строки серверов, у которых есть любая из меток.
