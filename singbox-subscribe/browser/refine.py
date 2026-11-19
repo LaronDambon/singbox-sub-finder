@@ -176,7 +176,9 @@ def _key_of(line: str) -> str:
 
 def refine_lines(service_name: str, lines, *, max_checks: int = 25,
                  pause: float = DEFAULT_PAUSE, cache=None, logger=None,
-                 budget_seconds: float | None = None) -> dict:
+                 budget_seconds: float | None = None,
+                 timeout_ms: int = 45_000, wait_seconds: float | None = None,
+                 attempts: int | None = None) -> dict:
     """Проверяет ПЕРЕДАННЫЕ строки (а не выборку по тегу из базы).
 
     Нужен конвейеру: этап уже отобрал серверы по метке, и повторять запрос к
@@ -287,12 +289,15 @@ def refine_lines(service_name: str, lines, *, max_checks: int = 25,
                     say('Browser: бюджет исчерпан (%.0f с), остаток уйдёт '
                         'в следующий цикл' % spent)
                     break
+            # Выдержка по умолчанию берётся из спеки сервиса (Gemini — 25 с):
+            # на 16 с страница через медленный прокси не успевала отрисоваться.
+            # Настройка wait_seconds её перекрывает.
             one = bbatch.check_batch(
                 spec.name, [(line, '127.0.0.1:%d' % port)], workers=1,
-                # Выдержка берётся из спеки сервиса (Gemini — 25 с): на 16 с
-                # страница через медленный прокси просто не успевала
-                # отрисоваться, и вердикт уходил в unknown.
-                timeout_ms=45000, wait_seconds=spec.wait_seconds, cache=cache, log=None)
+                timeout_ms=int(timeout_ms),
+                wait_seconds=(spec.wait_seconds if not wait_seconds else float(wait_seconds)),
+                attempts=(attempts or bbatch.DEFAULT_ATTEMPTS),
+                cache=cache, log=None)
             res = one.get(line) or {}
             results[line] = res
             say('Browser [%s] %s (%ss) %s' % (

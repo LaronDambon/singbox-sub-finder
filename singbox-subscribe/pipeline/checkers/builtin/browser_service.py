@@ -121,6 +121,11 @@ class BrowserServiceChecker(Checker):
         # 0 = без ограничения (см. __init__).
         self.max_checks = int(ctx.setting("singbox.checkers.browser_service.max_checks", self.max_checks))
         self.pause = float(ctx.setting("singbox.checkers.browser_service.pause", self.pause))
+        # Таймауты браузера: раньше были зашиты в refine (45 с навигация,
+        # 25 с из спеки на маркеры, 2 захода). Теперь ими управляет config.yaml.
+        self.wait_seconds = float(ctx.setting("singbox.checkers.browser_service.wait_seconds", 0) or 0)
+        self.timeout_ms = int(ctx.setting("singbox.checkers.browser_service.timeout_ms", 45000) or 45000)
+        self.attempts = int(ctx.setting("singbox.checkers.browser_service.attempts", 2) or 2)
         self._enrich_timeout = float(ctx.setting("enrich_timeout", 180))
 
         if not bool(ctx.setting("singbox.checkers.browser_service.enabled", True)):
@@ -228,6 +233,9 @@ class BrowserServiceChecker(Checker):
                 max_checks=0, pause=self.pause,
                 cache=self._cache, logger=LOGGER,
                 budget_seconds=None,
+                timeout_ms=self.timeout_ms,
+                wait_seconds=(self.wait_seconds or None),
+                attempts=self.attempts,
             )
         except Exception as exc:  # noqa: BLE001 — чекер не должен ронять прогон
             LOGGER.error("Browser service: проверка не удалась: %s", exc)

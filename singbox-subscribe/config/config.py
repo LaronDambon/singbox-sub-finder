@@ -447,6 +447,9 @@ _SCHEMA: tuple = (
           " gemini-chat — открывается сам чат в браузере", legacy=("BROWSER_SERVICE_TAG",)),
     Field("singbox.checkers.browser_service", "max_checks", "int", 0, "Лимит проверок за прогон; 0 = без лимита (доводит список до конца)", legacy=("PIPELINE_BROWSER_MAX_CHECKS",)),
     Field("singbox.checkers.browser_service", "pause", "float", 1.0, "Пауза между серверами: заходы последовательные, иначе стена трафика", unit="сек", legacy=("PIPELINE_BROWSER_PAUSE",)),
+    Field("singbox.checkers.browser_service", "wait_seconds", "float", 0.0, "Сколько ждать появления маркеров на странице; 0 = значение из спеки сервиса (Gemini 25 с)", unit="сек", legacy=("PIPELINE_BROWSER_WAIT_SECONDS",)),
+    Field("singbox.checkers.browser_service", "timeout_ms", "int", 45000, "Таймаут навигации браузера (page.goto), мс", legacy=("PIPELINE_BROWSER_TIMEOUT_MS",)),
+    Field("singbox.checkers.browser_service", "attempts", "int", 2, "Сколько заходов на один сервер, прежде чем вынести вердикт", legacy=("PIPELINE_BROWSER_ATTEMPTS",)),
 
     # --------------------- PIPELINE: очередь, этапы, проверки-дополнения
     Field("pipeline", "discovery", "bool", True, "Искать новые серверы из подписок (асинхронно, расширяет базу)", legacy=("PIPELINE_DISCOVERY",)),
