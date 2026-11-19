@@ -134,7 +134,9 @@ class ApiServiceChecker(Checker):
 
         store = ServerStore(get_settings().paths.servers_db_file)
         for name in sorted(self.services):
-            self._cache[name] = DbVerdictCache(name, store=store)
+            # Свой транспорт — свой кэш: вердикты браузера и API больше не
+            # смешиваются, иначе один транспорт выдаёт себя за другой.
+            self._cache[name] = DbVerdictCache(name, store=store, checked_by="api")
             try:
                 self._banned_keys[name] = store.banned_proxy_keys(name)
             except Exception as exc:  # noqa: BLE001 — без банов просто шире отбор

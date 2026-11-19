@@ -156,7 +156,10 @@ class BrowserServiceChecker(Checker):
         # файлом рядом с профилем: это данные о серверах, им место там же, где
         # stable и capabilities. Прежний файловый кэш просто перестаёт
         # читаться, вердикты наберутся заново.
-        self._cache = DbVerdictCache(self.service, store=store)
+        # Только СВОИ вердикты: иначе ok от API-проверки выглядел как
+        # браузерный кэш, проверка пропускалась, а метка [gemini-chat] всё
+        # равно ставилась — без единой реальной проверки браузером.
+        self._cache = DbVerdictCache(self.service, store=store, checked_by="browser")
         stats = self._cache.stats()
         limit = ("без ограничения" if not self.max_checks
                  else "до %d за прогон" % self.max_checks)

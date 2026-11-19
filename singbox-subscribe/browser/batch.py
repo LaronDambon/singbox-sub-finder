@@ -101,11 +101,19 @@ def verdict_from_text(spec, text: str):
         if marker.lower() in low:
             return VERDICT_BLOCKED, "заглушка: %s" % marker
 
-    # Вход не применился: Google отдал анонимную страницу. Живой сервер тут
-    # ни при чём — под аккаунтом пользователя сервис не откроется.
+    # Стена «подозрительный трафик»: Google отдаёт её по репутации адреса.
+    # Соединение при этом работает, сервер довозит запрос — значит это НЕ бан
+    # сервера, а неизвестность. В чёрный список за это не отправляем.
+    traffic = [m for m in getattr(spec, "traffic_markers", ()) if m.lower() in low]
+    if traffic:
+        return VERDICT_UNKNOWN, "стена трафика: %s" % traffic[0]
+
+    # Вход не применился: Google отдал анонимную страницу. Страница открылась,
+    # соединение есть — виновата сессия, а не сервер. Вердикт unknown, чтобы
+    # рабочие серверы не улетали в чёрный список из-за слетевшего логина.
     anon = [m for m in getattr(spec, "anon_markers", ()) if m.lower() in low]
     if anon:
-        return VERDICT_BLOCKED, "не выполнен вход: %s" % anon[0]
+        return VERDICT_UNKNOWN, "не выполнен вход: %s" % anon[0]
 
     hits = [m for m in spec.ok_markers if m.lower() in low]
     login = [m for m in getattr(spec, "login_markers", ()) if m.lower() in low]
@@ -221,7 +229,10 @@ def check_batch(service_name: str, targets, *, workers: int = DEFAULT_WORKERS,
                     line, res = check_one(browser, item)
                     with lock:
                         results[line] = res
-                        if cache is not None and res["verdict"] != VERDICT_UNKNOWN:
+                        # Кэшируем и unknown: у него свой короткий TTL (час).
+                        # Без этого серверы с непонятным исходом проверялись
+                        # заново каждый цикл и занимали все слоты.
+                        if cache is not None:
                             cache.put(line, res)
                         done[0] += 1
                         say("  [%d/%d] %-8s %-5ss %s" % (

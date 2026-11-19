@@ -74,6 +74,7 @@ def check_service(service_name: str, *, proxy: str | None = None,
         # а в сессии браузера.
         anon_hits = [m for m in getattr(spec, "anon_markers", ()) if m.lower() in low]
         login_hits = [m for m in getattr(spec, "login_markers", ()) if m.lower() in low]
+        traffic_hits = [m for m in getattr(spec, "traffic_markers", ()) if m.lower() in low]
 
         try:
             final_url = page.url
@@ -86,8 +87,11 @@ def check_service(service_name: str, *, proxy: str | None = None,
         # «Спросить Gemini» там просто нет.
         if hit_block:
             verdict, reason = VERDICT_BLOCKED, "найдена заглушка: %s" % hit_block
+        elif traffic_hits:
+            verdict = VERDICT_UNKNOWN
+            reason = "стена трафика: %s" % traffic_hits[0]
         elif anon_hits and not login_hits:
-            verdict = VERDICT_BLOCKED
+            verdict = VERDICT_UNKNOWN
             reason = "не выполнен вход: %s" % anon_hits[0]
         elif login_hits:
             verdict = VERDICT_OK

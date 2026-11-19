@@ -54,11 +54,19 @@ class DbVerdictCache:
     #: по-разному: браузер — blocked, API — ban.
     BAN_VERDICTS = ("blocked", "ban")
 
-    def __init__(self, service: str, *, store=None) -> None:
+    def __init__(self, service: str, *, store=None, checked_by: str | None = None) -> None:
+        """checked_by — видеть только вердикты этого транспорта.
+
+        Без него кэш общий: браузер считал своим вердикт API и, пропустив
+        проверку, всё равно ставил метку [gemini-chat]. В итоге метка стояла
+        у 53 серверов, а браузерных вердиктов было 2. Теперь браузер видит
+        только browser, API — только api.
+        """
         from config.settings import get_settings
         from script.server_store import ServerStore
 
         self.service = str(service)
+        self.checked_by = str(checked_by) if checked_by else None
         self._store = store or ServerStore(get_settings().paths.servers_db_file)
 
     # ------------------------------------------------------------------ чтение
@@ -73,11 +81,13 @@ class DbVerdictCache:
         with self._store._connect() as conn:  # noqa: SLF001 — свой же класс
             self._store._ensure_service_bans_table(conn)  # noqa: SLF001
             out = {}
-            for r in conn.execute(
-                "SELECT proxy_key, verdict, reason, kind, last_checked, ban "
-                "FROM service_bans WHERE service = ? AND proxy_key != ''",
-                (self.service,),
-            ):
+            query = ("SELECT proxy_key, verdict, reason, kind, last_checked, ban "
+                     "FROM service_bans WHERE service = ? AND proxy_key != ''")
+            params: list = [self.service]
+            if self.checked_by:
+                query += " AND checked_by = ?"
+                params.append(self.checked_by)
+            for r in conn.execute(query, params):
                 out[r["proxy_key"]] = {
                     "verdict": r["verdict"] or ("blocked" if r["ban"] else ""),
                     "reason": r["reason"] or "",
