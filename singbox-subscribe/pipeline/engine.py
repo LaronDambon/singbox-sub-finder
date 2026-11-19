@@ -90,7 +90,14 @@ class Pipeline:
             settings=self.settings, db=self.db, checkers=self.checkers, logger=self.logger,
         )
         self.discovery = DiscoveryStage(self.ctx)
-        self.check_stage = CheckStage(self.ctx, self.checkers)
+        # Браузерная проверка идёт СВОИМ циклом (см. pipeline/browser_worker.py):
+        # внутри батча она держала _enrich по 20-60 с на сервер и тормозила
+        # весь конвейер. Из списка чекеров батча её убираем.
+        self.browser_checker = next(
+            (c for c in self.checkers if getattr(c, "name", "") == "browser_service"), None,
+        )
+        batch_checkers = [c for c in self.checkers if c is not self.browser_checker]
+        self.check_stage = CheckStage(self.ctx, batch_checkers)
         self.export_stage = ExportStage(self.ctx)
         self.report: dict[str, Any] = {}
 
@@ -195,6 +202,24 @@ class Pipeline:
                     self._publish_loop(), name="pipeline.publish",
                 )
 
+            # Браузер: отдельная задача, свой темп. Она не ждёт батчи и не
+            # задерживает их: сервер без метки [gemini-chat] просто не попадёт
+            # в конфиг этого прогона, а на следующем — попадёт.
+            browser_task: asyncio.Task | None = None
+            if self.browser_checker is not None:
+                from pipeline.browser_worker import BrowserWorker
+
+                worker = BrowserWorker(
+                    self.ctx, self.browser_checker,
+                    chunk=int(self.ctx.setting(
+                        "singbox.checkers.browser_service.chunk", 5) or 5),
+                    interval=float(self.ctx.setting(
+                        "singbox.checkers.browser_service.interval", 20) or 20),
+                )
+                browser_task = asyncio.create_task(
+                    worker.run(), name="pipeline.browser",
+                )
+
             try:
                 if check_task is not None:
                     drained = await self._drain()
@@ -213,6 +238,10 @@ class Pipeline:
                     publish_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await publish_task
+                if browser_task is not None:
+                    browser_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await browser_task
 
             # --- финальный экспорт -------------------------------------------
             # Последний проход уже ПОСЛЕ проверки: в нём попадают результаты,

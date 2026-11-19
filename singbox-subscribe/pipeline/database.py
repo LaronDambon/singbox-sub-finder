@@ -298,6 +298,33 @@ class Database:
             self._store.begin_capabilities_pass, pass_mark, keys=keys,
         )
 
+    async def lines_with_tags(self, tags, *, limit: int | None = None,
+                              only_available: bool = True) -> list[str]:
+        """Строки серверов, у которых есть любая из меток.
+
+        Нужно браузерной проверке: она идёт СВОИМ циклом и сама выбирает,
+        кого взять следующим, не дожидаясь батча основного конвейера.
+        """
+        names = [str(t) for t in (tags or []) if str(t).strip()]
+        if not names:
+            return []
+        placeholders = ",".join("?" for _ in names)
+        query = (
+            "SELECT DISTINCT s.line FROM servers s "
+            "JOIN server_tags t ON t.key = s.key "
+            f"WHERE t.tag IN ({placeholders}) AND s.line != '' AND s.excluded = 0"
+        )
+        params: list = list(names)
+        if only_available:
+            query += " AND s.available = 1"
+        query += " ORDER BY s.stable DESC, s.ping_ms IS NULL, s.ping_ms ASC, s.key ASC"
+        if limit:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        with self._store._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [str(r["line"]) for r in rows]
+
     async def bad_keys(self) -> set[str]:
         """Ключи уже забаненных строк (см. ServerStore.bad_keys)."""
         return await self._run(self._store.bad_keys)

@@ -450,6 +450,8 @@ _SCHEMA: tuple = (
     Field("singbox.checkers.browser_service", "wait_seconds", "float", 0.0, "Сколько ждать появления маркеров на странице; 0 = значение из спеки сервиса (Gemini 25 с)", unit="сек", legacy=("PIPELINE_BROWSER_WAIT_SECONDS",)),
     Field("singbox.checkers.browser_service", "timeout_ms", "int", 45000, "Таймаут навигации браузера (page.goto), мс", legacy=("PIPELINE_BROWSER_TIMEOUT_MS",)),
     Field("singbox.checkers.browser_service", "attempts", "int", 2, "Сколько заходов на один сервер, прежде чем вынести вердикт", legacy=("PIPELINE_BROWSER_ATTEMPTS",)),
+    Field("singbox.checkers.browser_service", "chunk", "int", 5, "Сколько серверов браузер берёт за один заход (свой цикл, параллельно проверке)", legacy=("PIPELINE_BROWSER_CHUNK",)),
+    Field("singbox.checkers.browser_service", "interval", "float", 20.0, "Пауза между заходами браузерного цикла", unit="сек", legacy=("PIPELINE_BROWSER_INTERVAL",)),
 
     # --------------------- PIPELINE: очередь, этапы, проверки-дополнения
     Field("pipeline", "discovery", "bool", True, "Искать новые серверы из подписок (асинхронно, расширяет базу)", legacy=("PIPELINE_DISCOVERY",)),
