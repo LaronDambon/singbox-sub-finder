@@ -331,7 +331,8 @@ class Database:
         return {pairs[k]: ",".join(sorted(v)) for k, v in out.items()}
 
     async def lines_with_tags(self, tags, *, limit: int | None = None,
-                              only_available: bool = True) -> list[str]:
+                              only_available: bool = True,
+                              exclude_banned_service: str | None = None) -> list[str]:
         """Строки серверов, у которых есть любая из меток.
 
         Нужно браузерной проверке: она идёт СВОИМ циклом и сама выбирает,
@@ -349,6 +350,13 @@ class Database:
         params: list = list(names)
         if only_available:
             query += " AND s.available = 1"
+        if exclude_banned_service:
+            # Забаненные этим сервисом не предлагаем вовсе. Иначе они снова и
+            # снова попадали в порцию, чекер их отсеивал, и цикл писал
+            # «нет серверов с меткой», хотя очередь кандидатов не пуста.
+            query += (" AND s.key NOT IN (SELECT proxy_key FROM service_bans "
+                      "WHERE service = ? AND ban = 1)")
+            params.append(str(exclude_banned_service))
         query += " ORDER BY s.stable DESC, s.ping_ms IS NULL, s.ping_ms ASC, s.key ASC"
         if limit:
             query += " LIMIT ?"

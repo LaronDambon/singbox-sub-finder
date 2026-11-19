@@ -55,8 +55,30 @@ async def check_once(ctx, checker, chunk: int) -> int:
     """Один заход: взять порцию кандидатов, проверить, записать метки."""
     from pipeline.stages.check import _key_of
 
-    lines = await ctx.db.lines_with_tags(_candidate_tags(checker), limit=chunk)
+    service = str(getattr(checker, "service", "") or "")
+    # Берём с запасом: часть кандидатов отсеется по свежему вердикту в кэше
+    # (проверять только что проверенное незачем), и нам всё равно нужно
+    # набрать ровно chunk.
+    candidates = await ctx.db.lines_with_tags(
+        _candidate_tags(checker), limit=chunk * 6,
+        exclude_banned_service=service or None,
+    )
+    if not candidates:
+        return 0
+
+    cache = getattr(checker, "_cache", None)
+    lines = []
+    for line in candidates:
+        if cache is not None and cache.get(line) is not None:
+            continue          # свежий вердикт — не перепроверяем
+        lines.append(line)
+        if len(lines) >= chunk:
+            break
     if not lines:
+        LOGGER.info(
+            "Браузер (отдельный процесс): все %d кандидатов с меткой имеют "
+            "свежий вердикт — проверять нечего", len(candidates),
+        )
         return 0
     # Карта меток обязательна: чекер отбирает кандидатов по ней
     # (CheckContext.capabilities_of). Без неё все строки выглядят «без метки»
