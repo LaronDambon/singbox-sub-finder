@@ -181,7 +181,10 @@ def main(argv=None) -> int:
 
     parser = argparse.ArgumentParser(prog="python -m pipeline.browser_worker")
     parser.add_argument("--once", action="store_true", help="один заход и выход")
+    parser.add_argument("--loop", action="store_true",
+                        help="крутить цикл постоянно (запускается из start.py)")
     parser.add_argument("--chunk", type=int, default=DEFAULT_CHUNK)
+    parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
     args = parser.parse_args(argv)
 
     from config.settings import init_settings
@@ -209,8 +212,23 @@ def main(argv=None) -> int:
             if not getattr(checker, "enabled", True):
                 LOGGER.info("Браузерная проверка выключена — выходим")
                 return 0
-            await check_once(ctx, checker, args.chunk)
-            return 0
+            if not args.loop:
+                await check_once(ctx, checker, args.chunk)
+                return 0
+
+            # Постоянный цикл: свой темп, не зависит от прогона pipeline.
+            LOGGER.info(
+                "Браузерный цикл запущен: порция %d, пауза %.0f с",
+                args.chunk, args.interval,
+            )
+            while True:
+                try:
+                    await check_once(ctx, checker, args.chunk)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — цикл не должен падать
+                    LOGGER.exception("Браузерный цикл: заход не удался")
+                await asyncio.sleep(max(5.0, float(args.interval)))
         finally:
             await db.close()
 

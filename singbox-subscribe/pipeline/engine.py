@@ -202,23 +202,10 @@ class Pipeline:
                     self._publish_loop(), name="pipeline.publish",
                 )
 
-            # Браузер: отдельная задача, свой темп. Она не ждёт батчи и не
-            # задерживает их: сервер без метки [gemini-chat] просто не попадёт
-            # в конфиг этого прогона, а на следующем — попадёт.
-            browser_task: asyncio.Task | None = None
-            if self.browser_checker is not None:
-                from pipeline.browser_worker import BrowserWorker
-
-                worker = BrowserWorker(
-                    self.ctx, self.browser_checker,
-                    chunk=int(self.ctx.setting(
-                        "singbox.checkers.browser_service.chunk", 5) or 5),
-                    interval=float(self.ctx.setting(
-                        "singbox.checkers.browser_service.interval", 20) or 20),
-                )
-                browser_task = asyncio.create_task(
-                    worker.run(), name="pipeline.browser",
-                )
+            # Браузерная проверка больше НЕ живёт внутри прогона: прогон
+            # заканчивается за 15-20 минут, а браузер успевает проверить
+            # единицы. Она запускается отдельным долгоживущим процессом из
+            # start.py (python -m pipeline.browser_worker --loop).
 
             try:
                 if check_task is not None:
@@ -238,10 +225,7 @@ class Pipeline:
                     publish_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await publish_task
-                if browser_task is not None:
-                    browser_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await browser_task
+
 
             # --- финальный экспорт -------------------------------------------
             # Последний проход уже ПОСЛЕ проверки: в нём попадают результаты,

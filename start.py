@@ -120,6 +120,21 @@ def is_main_running() -> bool:
     return False
 
 
+def start_module(module: str, args: list[str], name: str) -> subprocess.Popen:
+    """Запускает python -m <module> отдельным процессом.
+
+    Нужен браузерной проверке: она живёт СВОИМ циклом и не должна
+    останавливаться вместе с прогоном pipeline.
+    """
+    print(f"[{name}] starting: python -m {module} {' '.join(args)}")
+    return subprocess.Popen(
+        [sys.executable, "-u", "-m", module] + list(args),
+        cwd=str(PACKAGE),
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+    )
+
+
 def start_process(script_path: Path, name: str) -> subprocess.Popen:
     print(f"[{name}] starting: {script_path}")
     return subprocess.Popen(
@@ -145,6 +160,12 @@ def main() -> int:
         return 1
 
     api_process = start_process(API_SCRIPT, "API")
+    # Браузерная проверка — СВОЙ долгоживущий цикл. Раньше она была задачей
+    # внутри прогона pipeline и умирала вместе с ним: прогон заканчивался за
+    # 16 минут, а браузер успевал проверить пять серверов из сотен.
+    browser_process = start_module(
+        "pipeline.browser_worker", ["--loop"], "browser",
+    )
     main_process = None
 
     if not is_main_running():
@@ -159,6 +180,12 @@ def main() -> int:
             if api_process.poll() is not None:
                 print("[API] process exited unexpectedly; restarting API.")
                 api_process = start_process(API_SCRIPT, "API")
+
+            if browser_process.poll() is not None:
+                print("[browser] процесс завершился; перезапускаю.")
+                browser_process = start_module(
+                    "pipeline.browser_worker", ["--loop"], "browser",
+                )
 
             if time.monotonic() - last_check < CHECK_INTERVAL_SECONDS:
                 continue
@@ -177,7 +204,8 @@ def main() -> int:
     except KeyboardInterrupt:
         print("[Scheduler] received shutdown signal; terminating child processes.")
     finally:
-        for proc, name in ((api_process, "API"), (main_process, "main.py")):
+        for proc, name in ((api_process, "API"), (browser_process, "browser"),
+                           (main_process, "main.py")):
             if proc is not None and proc.poll() is None:
                 try:
                     proc.terminate()
