@@ -167,7 +167,8 @@ class BrowserServiceChecker(Checker):
 
         store = ServerStore(get_settings().paths.servers_db_file)
         try:
-            self._banned_keys = store.banned_proxy_keys(self.service)
+            # Отказы по этой метке (passed=0) — их не перепроверяем до истечения TTL.
+            self._banned_keys = store.banned_proxy_keys(self.tag)
         except Exception as exc:  # noqa: BLE001 — без банов просто шире отбор
             LOGGER.warning("Browser service: баны не загружены: %s", exc)
 
@@ -178,7 +179,9 @@ class BrowserServiceChecker(Checker):
         # Только СВОИ вердикты: иначе ok от API-проверки выглядел как
         # браузерный кэш, проверка пропускалась, а метка [gemini-chat] всё
         # равно ставилась — без единой реальной проверки браузером.
-        self._cache = DbVerdictCache(self.service, store=store, checked_by="browser")
+        # Метка — она же имя вердикта в server_tags. Своя метка = свои
+        # вердикты: API-шные (gemini-api) сюда больше не попадают.
+        self._cache = DbVerdictCache(self.tag, store=store)
         stats = self._cache.stats()
         limit = ("без ограничения" if not self.max_checks
                  else "до %d за прогон" % self.max_checks)

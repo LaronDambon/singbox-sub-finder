@@ -113,6 +113,10 @@ CREATE TABLE IF NOT EXISTS server_tags (
     -- Отбор сервисов смотрит только на 'service', поэтому ISP-теги не
     -- могут случайно попасть в группу.
     kind     TEXT    NOT NULL DEFAULT 'service',
+    -- Когда тег поставлен/подтверждён. Нужен для срока жизни вердикта:
+    -- сервисные метки (gemini-chat, gemini-api) перепроверяются по TTL,
+    -- гео-метки не перепроверяются вовсе.
+    checked_at TEXT  NOT NULL DEFAULT '',
     PRIMARY KEY (tag, key)
 );
 -- Обратный поиск: "все теги сервера X" (экспорт whitelist).
@@ -353,6 +357,10 @@ class ServerStore:
         self._maybe_migrate_gemini_tags()
         self._maybe_migrate_tags()
         self._ensure_tag_kind_column()
+        self._ensure_tag_checked_at_column()
+        # Вердикты сервисов переехали в server_tags: переносим старые и
+        # удаляем service_bans.
+        self._drop_service_bans()
 
     # ------------------------------------------------------------------ util
     def _connect(self) -> sqlite3.Connection:
@@ -575,9 +583,11 @@ class ServerStore:
         key: str,
         *,
         passed: Iterable[str] = (),
+        failed: Iterable[str] = (),
         pings: Mapping[str, int] | None = None,
         reset: bool = False,
         kind: str = "service",
+        checked_at: str | None = None,
     ) -> None:
         """Пишет теги сервера в server_tags.
 
@@ -595,11 +605,19 @@ class ServerStore:
                 "DELETE FROM server_tags WHERE key = ? AND kind = ?", (key, kind),
             )
 
+        stamp = _now() if checked_at is None else str(checked_at)
+
         merged: dict[str, dict] = {}
         for tag in passed:
             name = str(tag or "").strip()
             if name:
                 merged.setdefault(name, {})["passed"] = 1
+        for tag in failed:
+            name = str(tag or "").strip()
+            if name:
+                # Проверено и НЕ работает. Это тоже вердикт, и он тоже
+                # записывается — иначе сервер проверялся бы бесконечно.
+                merged.setdefault(name, {})["passed"] = 0
         for tag, ms in (pings or {}).items():
             name = str(tag or "").strip()
             if name:
@@ -608,14 +626,15 @@ class ServerStore:
         for tag, values in merged.items():
             conn.execute(
                 """
-                INSERT INTO server_tags (tag, key, ping_ms, passed, kind)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO server_tags (tag, key, ping_ms, passed, kind, checked_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(tag, key) DO UPDATE SET
-                    ping_ms = COALESCE(excluded.ping_ms, server_tags.ping_ms),
-                    passed  = MAX(server_tags.passed, excluded.passed),
-                    kind    = excluded.kind
+                    ping_ms    = COALESCE(excluded.ping_ms, server_tags.ping_ms),
+                    passed     = excluded.passed,
+                    kind       = excluded.kind,
+                    checked_at = excluded.checked_at
                 """,
-                (tag, key, values.get("ping_ms"), values.get("passed", 0), kind),
+                (tag, key, values.get("ping_ms"), values.get("passed", 0), kind, stamp),
             )
 
     def tags_for_key(self, key: str) -> list[dict]:
@@ -663,6 +682,15 @@ class ServerStore:
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [str(r["line"]) for r in rows]
+
+    def _ensure_tag_checked_at_column(self) -> None:
+        """Добавляет checked_at в старую server_tags."""
+        with self._connect() as conn:
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(server_tags)")}
+            if "checked_at" not in cols:
+                conn.execute(
+                    "ALTER TABLE server_tags ADD COLUMN checked_at TEXT NOT NULL DEFAULT ''"
+                )
 
     def _ensure_tag_kind_column(self) -> None:
         """Добавляет колонку kind в старую server_tags (без неё база старая)."""
@@ -1161,141 +1189,155 @@ class ServerStore:
                 (int(get_settings().core.purge_stable_below),),
             ).fetchall()
 
-    # ------------------------------------------- service_bans: баны сервисов
-    #: Сколько часов держится бан сервиса, прежде чем пару опросят заново.
-    BAN_TTL_HOURS = 12
+    # ------------------------------- вердикты сервисов: ТЕГИ, не отдельная таблица
+    #
+    # Раньше вердикты жили в service_bans с ключом (exit_ip, service). Ключ
+    # оказался фиктивным: браузер выходной IP не узнавал и подставлял вместо
+    # него обрезанный ключ строки, поэтому «бан по IP» не работал, а PK
+    # (exit_ip, service) склеивал разные строки с общим префиксом.
+    #
+    # Теперь вердикт — это обычный тег в server_tags, ровно как gemini-api:
+    #   tag='gemini-chat', key=normalize_proxy_key(line), passed=1 -> работает
+    #   tag='gemini-chat', key=..., passed=0 -> проверено, не работает
+    #   строки нет -> не проверяли
+    # Ключ — хэш конкретного конфига, поэтому вердикт строго персональный.
+    # Отдельной таблицы больше нет: она удаляется при миграции.
 
-    def _ensure_service_bans_table(self, conn) -> None:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS service_bans (
-                exit_ip      TEXT NOT NULL,
-                service      TEXT NOT NULL,
-                ban          INTEGER,
-                reason       TEXT DEFAULT '',
-                proxy_key    TEXT DEFAULT '',
-                first_seen   TEXT,
-                last_checked TEXT,
-                checked_by   TEXT DEFAULT '',
-                verdict      TEXT DEFAULT '',
-                kind         TEXT DEFAULT '',
-                PRIMARY KEY (exit_ip, service)
-            )
-            """
-        )
-        # Базы, созданные раньше, новых колонок не имеют — добавляем на месте.
-        existing = {r[1] for r in conn.execute("PRAGMA table_info(service_bans)")}
-        for col, ddl in (
-            ("checked_by", "TEXT DEFAULT ''"),
-            ("verdict", "TEXT DEFAULT ''"),
-            ("kind", "TEXT DEFAULT ''"),
-        ):
-            if col not in existing:
-                conn.execute("ALTER TABLE service_bans ADD COLUMN %s %s" % (col, ddl))
+    #: Сколько часов живёт вердикт сервиса, прежде чем его перепроверят.
+    VERDICT_TTL_HOURS = 6.0
+
+    #: Имя сервиса в старой service_bans -> метка в server_tags.
+    _OLD_SERVICE_TAG = {"gemini": "gemini-api"}
+
+    def _drop_service_bans(self) -> None:
+        """Переносит старые вердикты в server_tags и удаляет таблицу.
+
+        Переносим, а не выбрасываем: в service_bans лежали сотни вердиктов
+        API-проверки, и терять их незачем. Ключ там proxy_key — это ровно
+        normalize_proxy_key, тот же хэш конфига, что и в server_tags.
+        Годным был и last_checked, поэтому TTL после переезда соблюдается.
+        """
+        with self._connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_bans'"
+            ).fetchone()
+            if not exists:
+                return
+            moved = 0
+            for r in conn.execute(
+                "SELECT service, proxy_key, ban, verdict, last_checked "
+                "FROM service_bans WHERE proxy_key != ''"
+            ):
+                service = str(r["service"] or "").strip()
+                key = str(r["proxy_key"] or "").strip()
+                if not service or not key:
+                    continue
+                verdict = str(r["verdict"] or "").strip().lower()
+                if verdict in ("unknown", "unstable", ""):
+                    continue          # не вердикт — пусть проверят заново
+                tag = self._OLD_SERVICE_TAG.get(service, service)
+                passed = 0 if (int(r["ban"] or 0) or verdict in ("ban", "blocked")) else 1
+                conn.execute(
+                    """
+                    INSERT INTO server_tags (tag, key, ping_ms, passed, kind, checked_at)
+                    VALUES (?, ?, NULL, ?, 'service', ?)
+                    ON CONFLICT(tag, key) DO UPDATE SET
+                        passed = excluded.passed,
+                        checked_at = excluded.checked_at
+                    """,
+                    (tag, key, passed, str(r["last_checked"] or _now())),
+                )
+                moved += 1
+            conn.execute("DROP TABLE IF EXISTS service_bans")
+            if moved:
+                _LOGGER_MIGRATED = moved  # для отладки, в лог не лезем из стора
 
     def record_service_bans(self, rows) -> int:
-        """Пишет вердикты (exit_ip, service) -> ban и профиль проверки.
+        """Пишет вердикты сервисов ТЕГАМИ в server_tags.
 
-        rows: [{exit_ip, service, ban, reason, proxy_key,
-                checked_by, verdict, kind}].
-        upsert по паре (exit_ip, service): свежий вердикт затирает старый.
+        Имя сохранено ради совместимости: так зовёт API-транспорт
+        (script/service_check.py). rows: [{service, ban, proxy_key, verdict}].
+        Вместо service_bans пишем tag=service, passed=0 при ban=1 и 1 иначе.
         """
         if not rows:
             return 0
         now = _now()
         written = 0
         with self._connect() as conn:
-            self._ensure_service_bans_table(conn)
             for r in rows:
-                ip = str(r.get("exit_ip") or "").strip()
-                service = str(r.get("service") or "").strip()
-                if not ip or not service:
+                tag = str(r.get("service") or "").strip()
+                key = str(r.get("proxy_key") or "").strip()
+                verdict = str(r.get("verdict") or "").strip().lower()
+                if not tag or not key:
                     continue
+                # unknown/unstable — не вердикт: сервер не доказал ни то, ни
+                # другое. Такую строку не пишем, чтобы её проверили снова.
+                if verdict in ("unknown", "unstable", ""):
+                    continue
+                passed = 0 if (int(r.get("ban") or 0) or verdict in ("ban", "blocked")) else 1
                 conn.execute(
                     """
-                    INSERT INTO service_bans (
-                        exit_ip, service, ban, reason, proxy_key,
-                        first_seen, last_checked, checked_by, verdict, kind
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(exit_ip, service) DO UPDATE SET
-                        ban = excluded.ban,
-                        reason = excluded.reason,
-                        proxy_key = excluded.proxy_key,
-                        last_checked = excluded.last_checked,
-                        checked_by = excluded.checked_by,
-                        verdict = excluded.verdict,
-                        kind = excluded.kind
+                    INSERT INTO server_tags (tag, key, ping_ms, passed, kind, checked_at)
+                    VALUES (?, ?, NULL, ?, 'service', ?)
+                    ON CONFLICT(tag, key) DO UPDATE SET
+                        passed = excluded.passed,
+                        checked_at = excluded.checked_at
                     """,
-                    (ip, service, int(r.get("ban") or 0), str(r.get("reason") or ""),
-                     str(r.get("proxy_key") or ""), now, now,
-                     str(r.get("checked_by") or ""), str(r.get("verdict") or ""),
-                     str(r.get("kind") or "")),
+                    (tag, key, passed, now),
                 )
                 written += 1
         return written
 
     def banned_ips(self, service: str, *, ttl_hours=None) -> set:
-        """Exit-IP с ДЕЙСТВУЮЩИМ баном сервиса (свежим, не старше TTL)."""
-        if ttl_hours is None:
-            ttl_hours = self.BAN_TTL_HOURS
-        query = "SELECT exit_ip FROM service_bans WHERE service = ? AND ban = 1"
-        params = [service]
-        if ttl_hours > 0:
-            query += " AND last_checked >= ?"
-            params.append(_now_shifted(hours=-ttl_hours))
-        with self._connect() as conn:
-            self._ensure_service_bans_table(conn)
-            return {row["exit_ip"] for row in conn.execute(query, params)}
+        """Оставлено ради совместимости: банов по IP больше нет.
 
-    def banned_proxy_keys(self, service: str, *, ttl_hours=None) -> set:
-        """Ключи прокси с действующим баном — фильтр пула ДО проверки."""
+        Вердикт привязан к хэшу конфига, а не к адресу — один и тот же IP с
+        разными параметрами это разные конфиги.
+        """
+        return set()
+
+    def banned_proxy_keys(self, tag: str, *, ttl_hours=None) -> set:
+        """Ключи конфигов с ДЕЙСТВУЮЩИМ отказом сервиса (не старше TTL)."""
         if ttl_hours is None:
-            ttl_hours = self.BAN_TTL_HOURS
-        query = ("SELECT proxy_key FROM service_bans"
-                 " WHERE service = ? AND ban = 1 AND proxy_key != ''")
-        params = [service]
+            ttl_hours = self.VERDICT_TTL_HOURS
+        query = ("SELECT key FROM server_tags WHERE tag = ? AND passed = 0 "
+                 "AND checked_at != ''")
+        params: list = [str(tag)]
         if ttl_hours > 0:
-            query += " AND last_checked >= ?"
+            query += " AND checked_at >= ?"
             params.append(_now_shifted(hours=-ttl_hours))
         with self._connect() as conn:
-            self._ensure_service_bans_table(conn)
-            return {row["proxy_key"] for row in conn.execute(query, params)}
+            return {row["key"] for row in conn.execute(query, params)}
 
     def service_report(self) -> dict:
-        """Сводка по сервисам: сколько exit-IP/прокси ok/ban/unknown."""
+        """Сводка по сервисным меткам: сколько ok и отказов."""
         with self._connect() as conn:
-            self._ensure_service_bans_table(conn)
             out = {}
             for row in conn.execute(
                 """
-                SELECT service,
-                       SUM(ban = 1), SUM(ban = 0), SUM(ban IS NULL),
-                       COUNT(DISTINCT proxy_key) FILTER (WHERE ban = 0),
-                       MAX(last_checked)
-                FROM service_bans GROUP BY service
+                SELECT tag, SUM(passed = 0), SUM(passed = 1), MAX(checked_at)
+                FROM server_tags WHERE kind = 'service' GROUP BY tag
                 """
             ):
-                out[row["service"]] = {
-                    "banned_ips": row[1] or 0, "ok_ips": row[2] or 0,
-                    "unknown": row[3] or 0, "ok_proxies": row[4] or 0,
-                    "last_checked": row[5],
+                out[row["tag"]] = {
+                    "failed": row[1] or 0, "ok": row[2] or 0,
+                    "last_checked": row[3],
                 }
             return out
 
-    def service_working_rows(self, service: str) -> list:
-        """Строки базы для серверов, УСПЕШНО прошедших сервис (ban=0)."""
+    def service_working_rows(self, tag: str) -> list:
+        """Строки серверов, УСПЕШНО прошедших сервис (passed=1)."""
         with self._connect() as conn:
-            self._ensure_service_bans_table(conn)
             return conn.execute(
                 """
                 SELECT s.key, s.line, s.ping_ms, s.available, s.stable,
-                       b.exit_ip, b.last_checked AS checked
-                FROM service_bans b
-                JOIN servers s ON s.key = b.proxy_key
-                WHERE b.service = ? AND b.ban = 0
-                ORDER BY s.stable DESC, b.last_checked DESC, s.key
+                       t.checked_at AS checked
+                FROM server_tags t
+                JOIN servers s ON s.key = t.key
+                WHERE t.tag = ? AND t.passed = 1 AND t.kind = 'service'
+                ORDER BY s.stable DESC, t.checked_at DESC, s.key
                 """,
-                (service,),
+                (tag,),
             ).fetchall()
 
     def service_working_lines(self, service: str) -> list:

@@ -136,9 +136,10 @@ class ApiServiceChecker(Checker):
         for name in sorted(self.services):
             # Свой транспорт — свой кэш: вердикты браузера и API больше не
             # смешиваются, иначе один транспорт выдаёт себя за другой.
-            self._cache[name] = DbVerdictCache(name, store=store, checked_by="api")
+            tag = self.tag_of(name)
+            self._cache[name] = DbVerdictCache(tag, store=store)
             try:
-                self._banned_keys[name] = store.banned_proxy_keys(name)
+                self._banned_keys[name] = store.banned_proxy_keys(tag)
             except Exception as exc:  # noqa: BLE001 — без банов просто шире отбор
                 LOGGER.warning("API service: баны %s не загружены: %s", name, exc)
                 self._banned_keys[name] = set()

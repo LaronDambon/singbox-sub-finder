@@ -1,195 +1,128 @@
-"""Кэш вердиктов сервиса — В БАЗЕ, а не в файле рядом с профилем.
+"""Кэш вердиктов сервиса — ТЕГИ в server_tags, без отдельной таблицы.
 
-Зачем переносить. Вердикты (кто отвечал, кто нет) — это данные о серверах,
-такие же, как stable и capabilities, и место им в servers.db. Файл рядом с
-профилем браузера был плох тремя вещами:
+Раньше вердикты жили в service_bans с ключом (exit_ip, service). Ключ был
+фиктивным: браузер выходной IP не узнавал и подставлял обрезанный ключ
+строки, поэтому «бан по IP» не работал, а PK склеивал разные конфиги с
+общим префиксом.
 
-  * жил вне репозитория, поэтому его не видели ни отчёты, ни SQL-запросы;
-  * не переживал смену BROWSER_SESSIONS_DIR (профиль переехал — кэш потерялся);
-  * не давал выбрать «кого проверять следующим» запросом.
+Теперь вердикт — обычный тег, как gemini-api:
 
-Таблица — service_bans: она уже хранит (exit_ip, service) -> ban, и её
-дополняют колонки checked_by / verdict / kind. Дублирующей сущности не заводим.
+    tag=<метка сервиса>, key=normalize_proxy_key(line)
+    passed=1   -> проверено, работает
+    passed=0   -> проверено, не работает
+    строки нет -> не проверяли
 
-Сроки жизни прежние: здоровье сервера меняется быстро, репутация IP — нет.
+Ключ — хэш конкретного конфига, поэтому вердикт строго персональный: две
+строки с разными параметрами это два разных вердикта, даже если адрес один.
 """
 
 from __future__ import annotations
 
 import time
-
-#: Сколько часов вердикт считается свежим. Здоровье сервера меняется быстро,
-#: поэтому ok живёт час: замерено на умирающем сервере — он был «рабочим» в
-#: 12:20, а к 13:07 не открывал уже ничего.
-TTL_HOURS_BY_VERDICT = {
-    "ok": 1.0,
-    "blocked": 6.0,
-    "unstable": 1.0,
-    "unknown": 1.0,
-}
-
-#: Долгий срок для стены «подозрительный трафик»: это не случайность, а
-#: репутация адреса в закрытой базе Google.
-SORRY_TTL_HOURS = 24 * 30
-
-
-def _now_iso() -> str:
-    from script.server_store import _now
-
-    return _now()
+from datetime import datetime, timezone
 
 
 class DbVerdictCache:
-    """Кэш вердиктов в servers.db. Интерфейс как у прежнего файлового.
+    """Вердикты сервиса поверх server_tags. Интерфейс прежний.
 
-    Один класс на ОБА транспорта проверки сервиса: браузерный
-    (browser/batch.py) и API-шный (script/reachability_check.py). Словарь
-    вердиктов общий, отличается только пометка checked_by («browser» или
-    «api») — по ней в отчёте видно происхождение вердикта, а ключ и сроки
-    жизни у них одни и те же.
+    Один класс на ОБА транспорта: браузерный и API-шный. Различаются они
+    МЕТКОЙ (gemini-chat / gemini-api), поэтому смешивать вердикты больше
+    нечему — у каждого своя строка в таблице.
     """
 
-    #: Вердикты, которые означают «сервис отказал» и превращаются в ban=1.
-    #: Список, а не одно слово, потому что транспорты называют отказ
-    #: по-разному: браузер — blocked, API — ban.
+    #: Вердикты, которые означают «сервис отказал» -> passed=0.
     BAN_VERDICTS = ("blocked", "ban")
 
-    def __init__(self, service: str, *, store=None, checked_by: str | None = None) -> None:
-        """checked_by — видеть только вердикты этого транспорта.
-
-        Без него кэш общий: браузер считал своим вердикт API и, пропустив
-        проверку, всё равно ставил метку [gemini-chat]. В итоге метка стояла
-        у 53 серверов, а браузерных вердиктов было 2. Теперь браузер видит
-        только browser, API — только api.
-        """
+    def __init__(self, tag: str, *, store=None, ttl_hours: float | None = None) -> None:
         from config.settings import get_settings
         from script.server_store import ServerStore
 
-        self.service = str(service)
-        self.checked_by = str(checked_by) if checked_by else None
+        self.tag = str(tag)
+        #: Имя сервиса для отчётов — совпадает с меткой.
+        self.service = self.tag
         self._store = store or ServerStore(get_settings().paths.servers_db_file)
+        if ttl_hours is None:
+            try:
+                ttl_hours = float(
+                    get_settings().setting("singbox.verdict_ttl_hours", 0) or 0
+                )
+            except Exception:  # noqa: BLE001 — без настройки берём значение модуля
+                ttl_hours = 0.0
+        self.ttl_hours = float(ttl_hours or ServerStore.VERDICT_TTL_HOURS)
 
     # ------------------------------------------------------------------ чтение
-    def _ttl_seconds(self, verdict: str, kind: str) -> float:
-        if kind == "sorry":
-            return SORRY_TTL_HOURS * 3600.0
-        hours = TTL_HOURS_BY_VERDICT.get(str(verdict or ""), 6.0)
-        return hours * 3600.0
-
     def _rows(self) -> dict:
-        """{proxy_key: (verdict, reason, kind, last_checked)} по сервису."""
+        """{proxy_key: (passed, checked_at)} по этой метке."""
         with self._store._connect() as conn:  # noqa: SLF001 — свой же класс
-            self._store._ensure_service_bans_table(conn)  # noqa: SLF001
             out = {}
-            query = ("SELECT proxy_key, verdict, reason, kind, last_checked, ban "
-                     "FROM service_bans WHERE service = ? AND proxy_key != ''")
-            params: list = [self.service]
-            if self.checked_by:
-                query += " AND checked_by = ?"
-                params.append(self.checked_by)
-            for r in conn.execute(query, params):
-                out[r["proxy_key"]] = {
-                    "verdict": r["verdict"] or ("blocked" if r["ban"] else ""),
-                    "reason": r["reason"] or "",
-                    "kind": r["kind"] or "",
-                    "at": r["last_checked"] or "",
-                }
+            for r in conn.execute(
+                "SELECT key, passed, checked_at FROM server_tags WHERE tag = ?",
+                (self.tag,),
+            ):
+                out[str(r["key"])] = (int(r["passed"] or 0), str(r["checked_at"] or ""))
             return out
 
-    def get(self, line: str) -> dict | None:
-        """Свежий вердикт для строки прокси или None.
-
-        Принимает СТРОКУ ПРОКСИ (как прежний файловый кэш): ключ считается
-        внутри, чтобы вызывающий код не менялся.
-        """
-        key = self.key_for(line)
-        entry = self._rows().get(key)
-        if not entry:
-            return None
-        verdict = entry.get("verdict") or ""
-        if not verdict:
-            return None
-        # Возраст считаем от last_checked. Кривая метка времени — считаем
-        # вердикт устаревшим, а не «свежим навечно».
+    def _age_hours(self, stamp: str) -> float | None:
         try:
-            from datetime import datetime, timezone
-
-            ts = datetime.fromisoformat(str(entry["at"]).replace("Z", "+00:00"))
+            ts = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
-            age = time.time() - ts.timestamp()
-        except Exception:  # noqa: BLE001
+            return (time.time() - ts.timestamp()) / 3600.0
+        except Exception:  # noqa: BLE001 — кривая метка = устаревший вердикт
             return None
-        if age > self._ttl_seconds(verdict, entry.get("kind") or ""):
+
+    def get(self, line: str) -> dict | None:
+        """Свежий вердикт для строки прокси или None."""
+        entry = self._rows().get(self.key_for(line))
+        if not entry:
+            return None
+        passed, stamp = entry
+        age = self._age_hours(stamp)
+        if age is None or age > self.ttl_hours:
             return None
         return {
-            "verdict": verdict,
-            "reason": entry.get("reason") or "",
-            "kind": entry.get("kind") or "",
-            "age_hours": round(age / 3600.0, 1),
+            "verdict": "ok" if passed else "blocked",
+            "reason": "",
+            "age_hours": round(age, 1),
         }
 
     def known_keys(self) -> set:
-        """Ключи, про которые есть ЛЮБАЯ запись (в том числе устаревшая).
-
-        Нужно, чтобы отличить «новый, никогда не проверялся» от «проверялся
-        давно»: первые идут в проверку первыми.
-        """
+        """Ключи, про которые есть ЛЮБАЯ запись (в том числе устаревшая)."""
         return set(self._rows())
 
     def known_ok(self) -> set:
-        """Ключи, подтверждённые как рабочие (verdict=ok, любой давности).
-
-        Именно этим отличается «метка заслужена» от «метка осталась с прошлого
-        раза»: сверяем с базой, а не с догадкой.
-        """
-        return {
-            k for k, v in self._rows().items()
-            if (v.get("verdict") or "") == "ok"
-        }
+        """Ключи, подтверждённые как рабочие (passed=1, любой давности)."""
+        return {k for k, (passed, _stamp) in self._rows().items() if passed}
 
     def has_any(self, line: str) -> bool:
-        """Есть ли ЛЮБАЯ запись (в том числе устаревшая).
-
-        Нужно для порядка проверок: серверы без записи — неисследованная
-        территория, их проверяем первыми.
-        """
         return self.key_for(line) in self._rows()
 
     # ------------------------------------------------------------------ запись
     def put(self, line: str, result: dict) -> None:
-        """Запоминает вердикт. Значения cookies тут не бывают по построению."""
-        reason = result.get("reason") or ""
-        verdict = result.get("verdict") or ""
-        kind = "sorry" if "unusual traffic" in reason.lower() else ""
-        # ban=1 только для настоящего отказа. Отказ бывает и без кода ошибки:
-        # API отвечает 200 и телом «регион не поддерживается», поэтому
-        # смотрим на ВЕРДИКТ, а не на статус.
-        ban = 1 if verdict in self.BAN_VERDICTS else 0
+        """Запоминает вердикт тегом. unknown/unstable не пишем вовсе."""
+        verdict = str(result.get("verdict") or "").strip().lower()
+        if verdict != "ok" and verdict not in self.BAN_VERDICTS:
+            # unknown/unstable: сервер не доказал ни то, ни другое — пусть
+            # его проверят ещё раз, а не считают забаненным.
+            return
+        passed = 0 if verdict in self.BAN_VERDICTS else 1
         self._store.record_service_bans([{
+            "service": self.tag,
             "proxy_key": self.key_for(line),
-            "service": self.service,
-            "exit_ip": result.get("exit_ip") or self.key_for(line)[:60],
-            "ban": ban,
-            "reason": reason,
-            "checked_by": result.get("checked_by") or "browser",
+            "ban": 0 if passed else 1,
             "verdict": verdict,
-            "kind": kind,
         }])
 
     # ------------------------------------------------------------------ прочее
     @staticmethod
     def key_for(line: str) -> str:
-        """Ключ прокси без учёта имени и тэга."""
+        """Ключ прокси без учёта имени и тэга — хэш конкретного конфига."""
         from script.downloader import normalize_proxy_key
 
         return normalize_proxy_key(line) or str(line).strip()
 
     def stats(self) -> dict:
-        rows = self._rows()
-        from collections import Counter
-
-        return {
-            "entries": len(rows),
-            "verdicts": dict(Counter(v.get("verdict") or "?" for v in rows.values())),
-        }
+        verdicts = {"ok": 0, "blocked": 0}
+        for passed, _stamp in self._rows().values():
+            verdicts["ok" if passed else "blocked"] += 1
+        return {"entries": len(self._rows()), "verdicts": verdicts}

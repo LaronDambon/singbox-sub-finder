@@ -67,7 +67,9 @@ async def check_once(ctx, checker, chunk: int) -> int:
     # набрать ровно chunk.
     candidates = await ctx.db.lines_with_tags(
         _candidate_tags(checker), limit=chunk * 6,
-        exclude_banned_service=service or None,
+        # Исключаем конфиги с действующим отказом: вердикт живёт тегом
+        # gemini-chat с passed=0, отдельной таблицы банов больше нет.
+        exclude_banned_service=getattr(checker, "tag", None) or None,
     )
     if not candidates:
         return 0

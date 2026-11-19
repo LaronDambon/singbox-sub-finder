@@ -46,18 +46,20 @@ def main(argv=None) -> int:
         # ban. Раньше удалялись только строки checked_by='browser', поэтому
         # «ok» от API оставался и продолжал влиять на отбор.
         # Куки входа лежат в профиле и не трогаются: это разные вещи.
+        from config.settings import get_settings as _gs
+
+        tag = str(_gs().setting("singbox.checkers.browser_service.tag", "") or "")
+        tag = tag or args.service
         with store._connect() as conn:  # noqa: SLF001 — свой же класс
             before = {
-                (r["verdict"] or "?"): r["n"]
+                ("ok" if r["passed"] else "failed"): r["n"]
                 for r in conn.execute(
-                    "SELECT verdict, COUNT(*) AS n FROM service_bans "
-                    "WHERE service = ? GROUP BY verdict", (args.service,),
+                    "SELECT passed, COUNT(*) AS n FROM server_tags "
+                    "WHERE tag = ? GROUP BY passed", (tag,),
                 )
             }
-            cur = conn.execute(
-                "DELETE FROM service_bans WHERE service = ?", (args.service,),
-            )
-            print("Было: %s" % (before or "пусто"))
+            cur = conn.execute("DELETE FROM server_tags WHERE tag = ?", (tag,))
+            print("Метка: %s. Было: %s" % (tag, before or "пусто"))
             print("Удалено вердиктов: %d" % (cur.rowcount or 0))
         cache = DbVerdictCache(args.service, store=store)
 

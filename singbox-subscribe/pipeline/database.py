@@ -356,12 +356,15 @@ class Database:
         if only_available:
             query += " AND s.available = 1"
         if exclude_banned_service:
-            # Забаненные этим сервисом не предлагаем вовсе. Иначе они снова и
-            # снова попадали в порцию, чекер их отсеивал, и цикл писал
-            # «нет серверов с меткой», хотя очередь кандидатов не пуста.
-            query += (" AND s.key NOT IN (SELECT proxy_key FROM service_bans "
-                      "WHERE service = ? AND ban = 1)")
-            params.append(str(exclude_banned_service))
+            # Отказы по этой метке не предлагаем до истечения TTL: иначе они
+            # снова и снова попадали в порцию, чекер их отсеивал, и цикл
+            # писал «нет серверов с меткой», хотя кандидаты есть.
+            from script.server_store import _now_shifted
+
+            ttl = float(getattr(self._store, "VERDICT_TTL_HOURS", 6.0) or 6.0)
+            query += (" AND s.key NOT IN (SELECT key FROM server_tags "
+                      "WHERE tag = ? AND passed = 0 AND checked_at >= ?)")
+            params.extend([str(exclude_banned_service), _now_shifted(hours=-ttl)])
         query += " ORDER BY s.stable DESC, s.ping_ms IS NULL, s.ping_ms ASC, s.key ASC"
         if limit:
             query += " LIMIT ?"
