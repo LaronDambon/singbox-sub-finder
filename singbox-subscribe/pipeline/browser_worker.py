@@ -44,6 +44,12 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _candidate_tags(checker) -> list[str]:
+    """Метки, по которым браузер выбирает серверы (пусто = все живые)."""
+    # candidate_tags задаёт пользователь в config.yaml. Пустой кортеж здесь
+    # означает "all" — смотреть все живые серверы, а не только с меткой API.
+    custom = getattr(checker, "candidate_tags", None)
+    if custom is not None:
+        return list(custom)
     tags = list(getattr(checker, "accept_tags", ()) or ())
     tag = getattr(checker, "tag", "")
     if tag and tag not in tags:
@@ -68,9 +74,18 @@ async def check_once(ctx, checker, chunk: int) -> int:
 
     cache = getattr(checker, "_cache", None)
     lines = []
+    seen_endpoints = set()
     for line in candidates:
+        # Один сервер может лежать в базе десятком строк: они отличаются
+        # только параметрами после '?', а выход у них один и тот же
+        # (vless://uuid@188.114.98.112:80?...). Проверять такой сервер
+        # несколько раз бессмысленно — вердикт будет тот же.
+        endpoint = line.split("?", 1)[0]
+        if endpoint in seen_endpoints:
+            continue
         if cache is not None and cache.get(line) is not None:
             continue          # свежий вердикт — не перепроверяем
+        seen_endpoints.add(endpoint)
         lines.append(line)
         if len(lines) >= chunk:
             break

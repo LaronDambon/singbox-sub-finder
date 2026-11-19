@@ -300,8 +300,12 @@ def refine_lines(service_name: str, lines, *, max_checks: int = 25,
                 cache=cache, log=None)
             res = one.get(line) or {}
             results[line] = res
+            # В лог — ЭНДПОИНТ, а не первые 52 символа строки: у одного
+            # сервера в базе бывает десяток строк, отличающихся только
+            # параметрами после '?', и в обрезанном виде они выглядели как
+            # «одно и то же проверяют по кругу».
             say('Browser [%s] %s (%ss) %s' % (
-                res.get('verdict'), line[:52], res.get('elapsed'),
+                res.get('verdict'), line.split('?', 1)[0][:64], res.get('elapsed'),
                 (res.get('reason') or '')[:90]))
             if pause:
                 time.sleep(max(0.0, pause))

@@ -120,6 +120,20 @@ class BrowserServiceChecker(Checker):
         self.tag = str(ctx.setting("singbox.checkers.browser_service.tag", self.tag) or self.tag)
         # 0 = без ограничения (см. __init__).
         self.max_checks = int(ctx.setting("singbox.checkers.browser_service.max_checks", self.max_checks))
+        # Каких серверов вообще касается браузерная проверка. По умолчанию —
+        # те, где API Gemini уже ответил (gemini-api): это дешёвый и осмысленный
+        # предфильтр. "all" — все живые серверы, без меток.
+        raw_tags = str(ctx.setting("singbox.checkers.browser_service.candidate_tags", "") or "")
+        if raw_tags.strip():
+            names = [t.strip() for t in raw_tags.replace(";", ",").split(",") if t.strip()]
+            if any(n.lower() in ("all", "*") for n in names):
+                self.candidate_tags = ()
+                self.accept_tags = ()
+            else:
+                self.candidate_tags = tuple(names)
+                self.accept_tags = tuple(names)
+        else:
+            self.candidate_tags = tuple(self.accept_tags)
         self.pause = float(ctx.setting("singbox.checkers.browser_service.pause", self.pause))
         # Таймауты браузера: раньше были зашиты в refine (45 с навигация,
         # 25 с из спеки на маркеры, 2 захода). Теперь ими управляет config.yaml.
@@ -202,7 +216,8 @@ class BrowserServiceChecker(Checker):
         tags = {t.strip().lower() for t in (caps(line) or "").split(",") if t.strip()}
         wanted = {str(t).strip().lower() for t in self.accept_tags}
         wanted.add(self.tag.strip().lower())
-        if not (tags & wanted):
+        # Пустой набор меток = смотрим всех живых (candidate_tags: all).
+        if wanted and not (tags & wanted):
             return False
         # Уже забанен сервисом и бан не истёк — второй раз не платим.
         return _key_of(line) not in self._banned_keys

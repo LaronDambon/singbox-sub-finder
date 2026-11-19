@@ -340,14 +340,19 @@ class Database:
         """
         names = [str(t) for t in (tags or []) if str(t).strip()]
         if not names:
-            return []
-        placeholders = ",".join("?" for _ in names)
-        query = (
-            "SELECT DISTINCT s.line FROM servers s "
-            "JOIN server_tags t ON t.key = s.key "
-            f"WHERE t.tag IN ({placeholders}) AND s.line != '' AND s.excluded = 0"
-        )
-        params: list = list(names)
+            # Пустой список меток = ВСЕ живые серверы. Нужно браузерной
+            # проверке, когда ей разрешено смотреть шире одной метки.
+            query = ("SELECT s.line FROM servers s "
+                     "WHERE s.line != '' AND s.excluded = 0")
+            params: list = []
+        else:
+            placeholders = ",".join("?" for _ in names)
+            query = (
+                "SELECT DISTINCT s.line FROM servers s "
+                "JOIN server_tags t ON t.key = s.key "
+                f"WHERE t.tag IN ({placeholders}) AND s.line != '' AND s.excluded = 0"
+            )
+            params = list(names)
         if only_available:
             query += " AND s.available = 1"
         if exclude_banned_service:
